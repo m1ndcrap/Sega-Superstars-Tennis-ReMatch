@@ -14,4 +14,4 @@ https://github.com/rexglue/rexglue-sdk
 3. Run .exe and enjoy!
 
 # Build
-Follow the instructions here [ReXGlue Wiki](https://github.com/rexglue/rexglue-sdk/wiki)
+Follow the instructions here [ReXGlue](https://github.com/rexglue/rexglue-sdk/wiki/Guide-%E2%80%90-Getting-Started)
