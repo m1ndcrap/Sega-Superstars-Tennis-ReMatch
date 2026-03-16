@@ -7,3 +7,4 @@ generated/*
 
 out/*
 !out/.gitkeep
+sst_rematch.exe
