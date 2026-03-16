@@ -3,3 +3,7 @@ assets/*
 
 generated/*
 !generated/.gitkeep
+!generated/rexglue.cmake
+
+out/*
+!out/.gitkeep
