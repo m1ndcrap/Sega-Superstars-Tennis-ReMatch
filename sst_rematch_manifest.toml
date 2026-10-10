@@ -1,0 +1,9 @@
+[project]
+name = "sst_rematch"
+sdk_version = "0.10.0"
+game_root = "assets"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated/default"
+includes = ["config/sst_rematch_func.toml"]

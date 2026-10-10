@@ -1,6 +1,5 @@
 # sst_rematch - ReXGlue Recompiled Project
 #
-# This file is yours to edit. 'rexglue migrate' will NOT overwrite it.
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
@@ -23,5 +22,9 @@ else()
     add_executable(sst_rematch ${SSTREMATCH_SOURCES})
 endif()
 
-rexglue_setup_target(sst_rematch)
+rexglue_setup_target(sst_rematch GPU_PLUGINS xenos)
 
+if(TARGET imgui)
+    target_include_directories(sst_rematch PRIVATE
+        $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()

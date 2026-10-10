@@ -7,4 +7,10 @@ generated/*
 
 out/*
 !out/.gitkeep
+logs/
 sst_rematch.exe
+
+ShaderCache.zip
+default_xex.zip
+find_shader_keys.py
+shader_key_report.txt

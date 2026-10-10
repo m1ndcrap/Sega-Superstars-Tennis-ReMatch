@@ -1,0 +1,17 @@
+{
+  "OutputFoldersPerTargetSystem": {
+    "Local Machine": [
+      "out\\build\\win-amd64-debug",
+      "out\\build\\win-amd64-release",
+      "out\\build\\win-amd64-relwithdebinfo"
+    ]
+  },
+  "ExpandedNodes": [
+    "",
+    "\\assets",
+    "\\generated",
+    "\\src"
+  ],
+  "SelectedNode": "\\src\\hooks.cpp",
+  "PreviewInSolutionExplorer": false
+}
