@@ -1,10 +1,11 @@
-# XenosRecomp translator (vendored)
+# XenosRecomp translator
 
 Source: https://github.com/hedge-dev/XenosRecomp at 990d03b28a27b50277ee5d8d942e1c5f873869d1 (MIT, see LICENSE.md).
 
-Only the Xenos microcode -> HLSL translator is vendored (`shader_recompiler.*`, `shader*.h`, `constant_table.h`, `shader_common.h`). The offline tool's `main.cpp`, DXC wrapper and cache writer are not used: sst_rematch translates and compiles at runtime (src/gpu/native/shader_cache.cpp), with DXC loaded from `dxcompiler.dll`.
+Only the Xenos microcode -> HLSL translator is used (`shader_recompiler.*`, `shader*.h`, `constant_table.h`, `shader_common.h`). The tool's `main.cpp`, DXC wrapper and cache writer are not used: sst_rematch translates and compiles at runtime (src/gpu/native/shader_cache.cpp), with DXC loaded from `dxcompiler.dll`.
 
 Local changes (built with `SST_RECOMP`, same as `xenosrecomp-sst.patch` in the repo root):
+
 - `shader_recompiler.cpp`: extra interpolators NORMAL0, TANGENT0, BINORMAL0, POSITION1 that Sega Superstars Tennis passes between stages.
 - `shader_recompiler.cpp`: relative constant addressing (`c[a0+n]`, `c[aL+n]`, e.g. skinning palettes) reads a raw view of the constant buffer (`SST_CONST_REL`, bound at b3 / b4 space4); the const slot of each operand follows Xenia's `src_const_is_addressed`. Upstream asserted on 83 of the game's shaders and mis-indexed in release builds.
 - `shader_recompiler.cpp`: vertex-shader exports with no matching interpolator are written to a scratch variable instead of asserting.

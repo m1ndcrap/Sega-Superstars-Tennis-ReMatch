@@ -1,41 +1,49 @@
 // sst_rematch - native D3D12 renderer (exe side)
-//
-// Runs on the game's render thread, driven by hooks on the Xbox D3D functions
-// (src/gpu/d3d_trace.cpp is the single hook site). Active only when the "sst"
-// GPU plugin is loaded (--gpu_plugin=sst); otherwise every entry point is a
-// cheap no-op and the game renders through the emulated Xenos backend.
-//
-// Increment A (current): frame hand-off to the plugin + shader pipeline
-// (XenosRecomp translation and DXC compilation of every shader the game
-// creates, with a disk cache). The frame is still a clear.
 
 #pragma once
 
 #include <cstdint>
 
-namespace rex {
-class Runtime;
+namespace rex
+{
+  class Runtime;
 }
-struct PPCContext;
 
-namespace sst::native {
+namespace sst::native
+{
 
-// Startup / shutdown (main thread, from the app's OnPostSetup / OnShutdown).
-void Initialize(rex::Runtime* runtime);
-void Shutdown();
+  // Startup / shutdown (main thread, from the app's OnPostSetup / OnShutdown)
+  void Initialize(rex::Runtime *runtime);
+  void Shutdown();
 
-// True once Initialize found the sst plugin and the D3D12 device.
-bool Active();
+  // True once Initialize found the sst plugin and the D3D12 device
+  bool Active();
 
-// --- hook entry points (game threads) --------------------------------------------
-// Create{Vertex,Pixel}Shader: `container` is the guest address of the shader
-// container (r3 before the call), `object` the returned shader object.
-void OnCreateShader(const uint8_t* base, uint32_t container, uint32_t object);
+  // Guest registers captured before a hooked call (r3.. are clobbered by it)
+  struct HookArgs
+  {
+    uint32_t r3, r4, r5, r6, r7, r8;
+    double f1;
+  };
 
-// Clear(dev, count, rects, flags, color, z, stencil).
-void OnClear(uint32_t flags, uint32_t color, float z, uint32_t stencil);
+  // hook entry points (game threads)
+  // Create{Vertex,Pixel}Shader: `container` is the guest address of the shader container (r3 before the call), `object` the returned shader object.
+  void OnCreateShader(const uint8_t *base, uint32_t container, uint32_t object);
 
-// Swap: the frame is complete.
-void OnSwap();
+  // SetStreamSource(dev, stream, vb, offset, stride)
+  void OnSetStreamSource(const HookArgs &a);
 
-}  // namespace sst::native
+  // DrawIndexedVertices(dev, prim, base_vertex, start_index, index_count)
+  // DrawVertices(dev, prim, start_vertex, vertex_count)
+  // DrawVerticesUP(dev, prim, vertex_count, data, stride)
+  void OnDrawIndexed(const uint8_t *base, const HookArgs &a);
+  void OnDraw(const uint8_t *base, const HookArgs &a);
+  void OnDrawUP(const uint8_t *base, const HookArgs &a);
+
+  // Clear(dev, count, rects, flags, color, z, stencil).
+  void OnClear(const uint8_t *base, const HookArgs &a);
+
+  // Swap: the frame is complete.
+  void OnSwap();
+
+}

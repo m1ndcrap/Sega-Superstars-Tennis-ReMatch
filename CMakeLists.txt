@@ -19,7 +19,11 @@ if(WIN32)
     # Native D3D12 renderer (active with --gpu_plugin=sst)
     list(APPEND SSTREMATCH_SOURCES
         src/gpu/native/native.cpp
+        src/gpu/native/renderer.cpp
         src/gpu/native/shader_cache.cpp
+        src/gpu/native/vertex_format.cpp
+        src/gpu/native/memexport.cpp
+        src/gpu/native/xenos_ucode_tables.cpp
     )
 else()
     list(APPEND SSTREMATCH_SOURCES src/gpu/native/native_stub.cpp)

@@ -1,9 +1,4 @@
-// sst_rematch - prefix header for the vendored XenosRecomp translator.
-//
-// Upstream compiles shader_recompiler.cpp with its pch.h, which also pulls in
-// DXC, smol-v, zstd and xxHash for the offline tool. The translator itself only
-// needs the standard library, fmt and the byteSwap / be<T> helpers below
-// (copied from upstream pch.h).
+// sst_rematch - prefix header for the vendored XenosRecomp translator
 
 #pragma once
 
@@ -21,7 +16,8 @@
 #include <fmt/core.h>
 
 template <typename T>
-static T byteSwap(T value) {
+static T byteSwap(T value)
+{
   if constexpr (sizeof(T) == 1)
     return value;
   else if constexpr (sizeof(T) == 2)
@@ -36,10 +32,12 @@ static T byteSwap(T value) {
 }
 
 template <typename T>
-struct be {
+struct be
+{
   T value;
 
-  T get() const {
+  T get() const
+  {
     if constexpr (std::is_enum_v<T>)
       return T(byteSwap(std::underlying_type_t<T>(value)));
     else
