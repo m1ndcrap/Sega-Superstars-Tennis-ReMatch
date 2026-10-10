@@ -39,7 +39,7 @@ index 1c74034..b15f722 100644
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..0875df1 100644
+index 698a418..297e5a4 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -115,7 +115,14 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
@@ -58,3 +58,122 @@ index 698a418..0875df1 100644
  };
  
  static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+@@ -449,6 +456,40 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+             std::string regFormatted;
+ 
++#ifdef SST_RECOMP
++            // Relative constant addressing (c[a0 + n] / c[aL + n]), e.g. bone
++            // palettes. Which "const slot" an operand uses follows Xenia
++            // (src_const_is_addressed): slot 0 unless an earlier source is a
++            // constant. The address indexes the whole register file, so read
++            // it through the raw view of the constant buffer.
++            bool sstRelative = false;
++            if (!select)
++            {
++                bool slot1 = false;
++                switch (operand)
++                {
++                case VECTOR_1:
++                    slot1 = !instr.src1Select;
++                    break;
++                case VECTOR_2:
++                case SCALAR_0:
++                case SCALAR_1:
++                case SCALAR_CONSTANT_0:
++                    slot1 = !(instr.src1Select && instr.src2Select);
++                    break;
++                default:
++                    break;
++                }
++                sstRelative = slot1 ? instr.const1Relative : instr.const0Relative;
++            }
++
++            if (sstRelative)
++            {
++                regFormatted = fmt::format("SST_CONST_REL({} + {})", reg,
++                    instr.constAddressRegisterRelative ? "a0" : "aL");
++            }
++            else
++#endif
+             if (select)
+             {
+                 regFormatted = fmt::format("r{}", reg);
+@@ -471,18 +512,28 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+                     #endif
+                         {
+                             regFormatted = fmt::format("{}({}{})", constantName,
+-                                reg - findResult->second->registerIndex, instr.const0Relative ? (instr.constAddressRegisterRelative ? " + a0" : " + aL") : "");
++                                reg - findResult->second->registerIndex,
++#ifdef SST_RECOMP
++                                // relative operands were handled above
++                                "");
++#else
++                                instr.const0Relative ? (instr.constAddressRegisterRelative ? " + a0" : " + aL") : "");
++#endif
+                         }
+                     }
+                     else
+                     {
++#ifndef SST_RECOMP // the flags may belong to the other constant operand
+                         assert(!instr.const0Relative && !instr.const1Relative);
++#endif
+                         regFormatted = constantName;
+                     }
+                 }
+                 else
+                 {
++#ifndef SST_RECOMP // the flags may belong to the other constant operand
+                     assert(!instr.const0Relative && !instr.const1Relative);
++#endif
+                     regFormatted = fmt::format("c{}", reg);
+                 }
+             }
+@@ -626,6 +677,15 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             default:
+             {
+                 auto findResult = interpolators.find(instr.vectorDest);
++#ifdef SST_RECOMP
++                // An export with no matching interpolator: keep the write but
++                // discard it.
++                if (findResult == interpolators.end())
++                {
++                    exportRegister = "sstUnusedExport";
++                    break;
++                }
++#endif
+                 assert(findResult != interpolators.end());
+                 exportRegister = findResult->second;
+                 break;
+@@ -1187,8 +1247,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++#ifdef SST_RECOMP
++    println("#define SST_CONST_REL(INDEX) vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + clamp(int(INDEX), 0, 255) * 16, 0x10)",
++        isPixelShader ? "Pixel" : "Vertex");
++#endif
+     out += "\n#else\n\n";
+ 
++#ifdef SST_RECOMP
++    // Raw view of the same constants (the host binds the same buffer to
++    // b3/b4 space4) for relative addressing.
++    println("cbuffer {0}ShaderConstantsRaw : register(b{1}, space4) {{ float4 g_{0}ShaderConstantsRaw[256]; }};",
++        isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 4 : 3);
++    println("#define SST_CONST_REL(INDEX) g_{}ShaderConstantsRaw[clamp(int(INDEX), 0, 255)]",
++        isPixelShader ? "Pixel" : "Vertex");
++    out += "\n";
++#endif
+     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
+     out += "{\n";
+ 
+@@ -1479,6 +1552,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++#ifdef SST_RECOMP
++    out += "\tfloat4 sstUnusedExport = 0.0;\n";
++#endif
+     out += "\tint a0 = 0;\n";
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
