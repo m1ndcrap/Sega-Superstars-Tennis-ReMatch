@@ -14,3 +14,5 @@ ShaderCache.zip
 default_xex.zip
 find_shader_keys.py
 shader_key_report.txt
+.vs/
+*.res
