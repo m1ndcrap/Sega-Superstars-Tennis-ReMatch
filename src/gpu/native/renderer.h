@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "gpu/native/memexport.h"
+#include "gpu/native/texture_cache.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -82,6 +83,8 @@ namespace sst::native
     {
       uint8_t *cpu = nullptr;
       D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+      ID3D12Resource *resource = nullptr;
+      uint64_t offset = 0;
     };
 
     bool CreateRootSignature();
@@ -106,6 +109,18 @@ namespace sst::native
     void CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0);
     void CheckVsPositions(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, const float *host, uint32_t host_inputs);
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t slot) const;
+
+    // Textures: fills the SharedConstants descriptor indices (sc[0..63]) for the samplers the shaders fetch from
+    struct TextureUsage
+    {
+      uint32_t mask = 0;
+      TextureFetchUse uses[32];
+    };
+
+    const TextureUsage &GetTextureUsage(const ShaderEntry *entry);
+    void BindTextures(const uint8_t *base, uint32_t dev, const ShaderEntry *vs_entry, const ShaderEntry *ps_entry, uint32_t *sc);
+    std::unique_ptr<TextureCache> textures_;
+    std::unordered_map<const ShaderEntry *, TextureUsage> texture_usage_;
 
     ID3D12PipelineState *GetPipeline(const struct PipelineKey &key, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const ShaderVariant *vs, const ShaderVariant *ps);
 
@@ -275,6 +290,8 @@ namespace sst::native
       uint64_t shader_rebinds = 0, shader_rebinds_logged = 0, computed_fetch_draws = 0, fetch_remapped = 0;
       uint64_t clears = 0, clear_logged = 0, sample_logged = 0, depth_only = 0, shaders_from_objects = 0, skip_shader_logged = 0;
       uint64_t upload_bytes = 0;
+      uint64_t textured_draws = 0, texture_placeholders = 0, shadow_placeholders = 0;
+      uint64_t scissored_draws = 0, scissor_logged = 0;
       uint64_t pipelines_created = 0, pipelines_failed = 0;
       std::unordered_map<uint32_t, uint64_t> prims;          // xenos prim -> draws
       std::unordered_map<uint32_t, uint64_t> clear_flags;    // flags -> count

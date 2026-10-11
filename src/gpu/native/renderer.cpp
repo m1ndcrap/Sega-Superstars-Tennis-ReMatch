@@ -3,6 +3,7 @@
 #include "gpu/native/renderer.h"
 
 #include "gpu/native/shader_cache.h"
+#include "gpu/native/texture_cache.h"
 #include "gpu/native/vertex_format.h"
 
 #include <rex/cvar.h>
@@ -67,6 +68,10 @@ REXCVAR_DEFINE_INT32(sst_native_capture_frame, 0, "SST",
                      "shader run on the CPU. -1 = every frame, logging only disagreements "
                      "(slow)");
 
+REXCVAR_DEFINE_BOOL(sst_native_scissor, true, "SST",
+                    "Native renderer: apply the game's scissor rectangle (menus clip panels "
+                    "with it)");
+
 REXCVAR_DEFINE_STRING(sst_native_rt, "auto", "SST",
                       "Native renderer: which render targets draw into the output until render "
                       "targets are emulated: auto (viewport covers 1280x720), all, or a size as "
@@ -101,9 +106,14 @@ namespace sst::native
     };
 
     // Placeholder descriptor indices (heap slots)
-
     constexpr uint32_t kPlaceholder2D = 0, kPlaceholder3D = 1, kPlaceholderCube = 2;
-    constexpr uint32_t kSrvHeapSize = 16, kSamplerHeapSize = 16;
+
+    // Black 3D: stands in for the stacked shadow map (sampled as 3D) until render targets are emulated - depth 0 reads as "lit" in the game's shadow test
+    constexpr uint32_t kPlaceholder3DBlack = 3;
+
+    // Heap slots below these are placeholders / default samplers; the rest belong to the texture cache
+    constexpr uint32_t kSrvHeapSize = 65536, kSamplerHeapSize = 2048;
+    constexpr uint32_t kSrvReserved = 16, kSamplerReserved = 16;
 
     // F9 capture: stream-output buffer (data, then one 16-byte counter per draw)
     constexpr size_t kSoDataBytes = 48u << 20; // 3M vertices
@@ -179,6 +189,7 @@ namespace sst::native
     constexpr uint32_t kDevVSConstants = 0x780, kDevPSConstants = 0x1780, kDevBools = 0x2780;
     constexpr uint32_t kDevIndices = 0x3094, kDevRT0 = 0x3098, kDevDepth = 0x30A8;
     constexpr uint32_t kDevPS = 0x3194, kDevVS = 0x3198;
+    constexpr uint32_t kDevScissorTL = 0x28C4, kDevScissorBR = 0x28C8; // PA_SC_WINDOW_SCISSOR_*
 
     // Fetch constants: slot j (2 dwords) at +0x480 + 8j. Textures use 3 slots each (sampler i = slots 3i..3i+2); vertex stream s is slot 95 - s
     constexpr uint32_t kDevFetchConstants = 0x480;
@@ -233,7 +244,6 @@ namespace sst::native
         return D3D12_BLEND_BLEND_FACTOR;
 
       case 13:
-
       case 15:
         return D3D12_BLEND_INV_BLEND_FACTOR;
 
@@ -287,6 +297,7 @@ namespace sst::native
 
   }
 
+  // Everything that selects a pipeline. POD so it can be hashed bytewise
   struct PipelineKey
   {
     const ShaderVariant *vs;
@@ -398,6 +409,8 @@ namespace sst::native
       return false;
     }
 
+    textures_ = std::make_unique<TextureCache>();
+    textures_->Initialize(device_, physical_membase, srv_heap_.Get(), kSrvReserved, kSrvHeapSize - kSrvReserved, sampler_heap_.Get(), kSamplerReserved, kSamplerHeapSize - kSamplerReserved);
     return true;
   }
 
@@ -513,13 +526,14 @@ namespace sst::native
         {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, D3D12_SRV_DIMENSION_TEXTURE2D, kPlaceholder2D},
         {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 1, D3D12_SRV_DIMENSION_TEXTURE3D, kPlaceholder3D},
         {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6, D3D12_SRV_DIMENSION_TEXTURECUBE, kPlaceholderCube},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 1, D3D12_SRV_DIMENSION_TEXTURE3D, kPlaceholder3DBlack},
     };
 
-    // One upload buffer: 8 subresources, 512 bytes each (aligned for copies)
+    // One upload buffer: 9 subresources, 512 bytes each (aligned for copies); the last one is black
     D3D12_HEAP_PROPERTIES upload_heap = {D3D12_HEAP_TYPE_UPLOAD};
     D3D12_RESOURCE_DESC bd = {};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = 8 * 512;
+    bd.Width = 9 * 512;
     bd.Height = 1;
     bd.DepthOrArraySize = 1;
     bd.MipLevels = 1;
@@ -533,6 +547,7 @@ namespace sst::native
     uint8_t *mapped = nullptr;
     staging->Map(0, nullptr, reinterpret_cast<void **>(&mapped));
     std::memset(mapped, 0xFF, 8 * 512);
+    std::memset(mapped + 8 * 512, 0, 512);
 
     // Zero buffer for missing vertex inputs (also upload heap; never written)
     bd.Width = 256;
@@ -611,7 +626,7 @@ namespace sst::native
       sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
       sd.Texture2D.MipLevels = 1;
 
-      for (uint32_t i = 3; i < kSrvHeapSize; ++i)
+      for (uint32_t i = 4; i < kSrvReserved; ++i)
       {
         D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
         h.ptr += size_t(i) * srv_size;
@@ -625,7 +640,7 @@ namespace sst::native
     smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     smp.MaxLOD = D3D12_FLOAT32_MAX;
 
-    for (uint32_t i = 0; i < kSamplerHeapSize; ++i)
+    for (uint32_t i = 0; i < kSamplerReserved; ++i)
     {
       D3D12_CPU_DESCRIPTOR_HANDLE h = sampler_heap_->GetCPUDescriptorHandleForHeapStart();
       h.ptr += size_t(i) * sampler_size;
@@ -651,6 +666,11 @@ namespace sst::native
 
     event_ = nullptr;
     pipelines_.clear();
+
+    if (textures_)
+      textures_->Shutdown();
+
+    textures_.reset();
     list_.Reset();
 
     for (auto &f : frames_)
@@ -704,7 +724,7 @@ namespace sst::native
         {
           f.offset = start + size;
           stats_.upload_bytes += size;
-          return {p.cpu + start, p.gpu + start};
+          return {p.cpu + start, p.gpu + start, p.resource.Get(), start};
         }
 
         ++f.page;
@@ -762,7 +782,7 @@ namespace sst::native
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
     list_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
 
-    // Start each frame defined (the game clears explicitly too).
+    // Start each frame defined (the game clears explicitly too)
     static constexpr float kBlack[4] = {0, 0, 0, 1};
     list_->ClearRenderTargetView(rtv, kBlack, 0, nullptr);
     list_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, last_depth_clear_, 0, 0, nullptr);
@@ -781,6 +801,7 @@ namespace sst::native
         REXLOG_INFO("[sst-native] capture: recording frame {}", submitted_ + 1);
     }
 
+    textures_->BeginFrame(submitted_ + 1, fence_->GetCompletedValue(), fence_value_ + 1);
     ID3D12DescriptorHeap *heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
     list_->SetDescriptorHeaps(2, heaps);
     list_->SetGraphicsRootSignature(root_signature_.Get());
@@ -826,6 +847,7 @@ namespace sst::native
         }
       }
     }
+
     stats_.late_checked += late_checks_.size();
     late_checks_.clear();
     auto to_src = Transition(outputs_[target_].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -921,6 +943,7 @@ namespace sst::native
 
     if (rt0)
     {
+      // In auto mode the viewport isn't reliable at clear time (it is often still the previous target's), so use what draws taught us about this render target, and the viewport only for targets not drawn to yet
       bool selected;
 
       if (REXCVAR_GET(sst_native_rt) == "auto" && main_rts_.count(rt0))
@@ -934,6 +957,7 @@ namespace sst::native
         return;
     }
 
+    // Xbox D3DCLEAR_TARGET0..3 = 0x10..0x80 (the D3D clear helper masks 0xF0 out before handling depth / stencil); the low bits are depth / stencil
     if ((flags & 0xF0) && rt0)
     {
       const float c[4] = {float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f, float(color & 0xFF) / 255.0f, float((color >> 24) & 0xFF) / 255.0f};
@@ -971,7 +995,7 @@ namespace sst::native
     d.VS = {vs->dxil.data(), vs->dxil.size()};
 
     if (ps)
-      d.PS = {ps->dxil.data(), ps->dxil.size()};
+      d.PS = {ps->dxil.data(), ps->dxil.size()}; // null: depth-only
 
     const uint32_t b = key.blend;
     D3D12_RENDER_TARGET_BLEND_DESC &rt = d.BlendState.RenderTarget[0];
@@ -1012,9 +1036,11 @@ namespace sst::native
     {
       failed_pipelines_.insert(hash);
       ++stats_.pipelines_failed;
+
       if (stats_.pipelines_failed <= 10)
       {
         std::string inputs;
+
         for (const auto &e : layout)
           inputs += fmt::format(" {}{}:{}@{}+{}", e.SemanticName, e.SemanticIndex, int(e.Format), e.InputSlot, e.AlignedByteOffset);
 
@@ -1039,12 +1065,12 @@ namespace sst::native
     if (!PlausibleAddress(object))
       return shaders_->FindObject(object);
 
-    // The object's copy of the container's virtual part identifies the shader. Objects are reused by address: if a new shader was created at the same address by a path the Create hooks don't see, the cached binding would run the old shader (seen as GPU / CPU disagreements and random mesh spikes).
+    // The object's copy of the container's virtual part identifies the shader. Objects are reused by address: if a new shader was created at the same address by a path the Create hooks don't see, the cached binding would run the old shader (seen as GPU / CPU disagreements and spikes)
     const uint32_t vcopy = object + (vertex ? 0x368 : 0x28);
     const uint32_t vsize = be32(base, vcopy + 4);
     const uint64_t vhash = vsize && vsize < 0x10000 ? XXH3_64bits(GuestPtr(base, vcopy), vsize) : 0;
 
-    // The microcode can change under an unchanged header (variants sharing their constant / input layout): when the object's microcode pointer changes, compare the live microcode with the bound entry's (skipping the vertex fetches D3D patches at bind).
+    // The microcode can change under an unchanged header (variants sharing their constant / input layout): when the object's microcode pointer changes, compare the live microcode with the bound entry's (skipping the vertex fetches D3D patches at bind)
     const uint32_t ucode_ptr = be32(base, object + (vertex ? 0x20 : 0x18));
 
     auto microcode_matches = [&](const ShaderEntry *e) -> bool
@@ -1111,6 +1137,8 @@ namespace sst::native
           REXLOG_WARN("[sst-native] {} shader object {:08X}: same header but different microcode "
                       "(was {:016X}); rebuilding it from the object",
                       vertex ? "vertex" : "pixel", object, e->hash);
+
+        // Fall through to the rebuild
       }
       else
       {
@@ -1131,6 +1159,8 @@ namespace sst::native
 
         it->second = vhash;
         object_ucode_[object] = ucode_ptr;
+
+        // Fall through: rebuild from the object (or find the matching container)
       }
     }
     else
@@ -1162,7 +1192,7 @@ namespace sst::native
     return e;
   }
 
-  // Everything the CPU interpreter needs to run the bound vertex shader: the live microcode (vertex fetches patched at bind) and the VS state from the device mirror plus the shader's own literal constants. Returns why it failed, or nullptr.
+  // Everything the CPU interpreter needs to run the bound vertex shader: the live microcode (vertex fetches patched at bind) and the VS state from the device mirror plus the shader's own literal constants. Returns why it failed, or nullptr
   const char *Renderer::LoadVsState(const uint8_t *base, uint32_t dev, uint32_t vs_obj, const ShaderEntry *vs_entry, std::vector<uint32_t> &ucode, float *constants, uint32_t bools[8], uint32_t fetch[192], uint32_t loops[32], uint32_t *literals_out)
   {
     const std::vector<uint8_t> &ct = vs_entry->container;
@@ -1208,6 +1238,7 @@ namespace sst::native
         fetch[i] = be32(base, dev + kDevFetchConstants + 4 * i);
     }
 
+    // Literal constants defined by the shader itself (HLSL `def`, e.g. c255 = (0, 1, 3, 0) in both morph shaders): D3D loads them into the constant file when the shader is bound, so the device's mirror doesn't have them. Container definition table: float4 entries {u16 register, u16 float count, u32 offset into the physical part}, 0-terminated; then int4 (loop constant) entries {u16 register (8992 + 4 * loop), u16 count, count x u32}, 0-terminated
     std::memset(loops, 0, 32 * sizeof(uint32_t));
     uint32_t literals = 0;
     const uint32_t virtual_size = ct32(4);
@@ -1311,8 +1342,9 @@ namespace sst::native
     if (!exported)
       return;
 
-    // On-screen jumps: compare with this mesh's previous frame. A vertex that moves far on screen while the rest of the mesh barely moves is a spike (camera cuts move everything, so they don't count).
+    // On-screen jumps: compare with this mesh's previous frame. A vertex that moves far on screen while the rest of the mesh barely moves is a spike (camera cuts move everything, so they don't count)
     {
+      // The same mesh can be drawn several times a frame - shadow, main pass: compare like with like through the occurrence number
       const uint64_t base_key = vs_entry->hash ^ (uint64_t(stream0) << 24) ^ (uint64_t(first_vertex) << 52) ^ vertex_count;
       const uint64_t hkey = base_key ^ (uint64_t(clip_occurrence_[base_key]++) << 40);
       ClipHistory &h = clip_history_[hkey];
@@ -1412,6 +1444,7 @@ namespace sst::native
     ++e.flagged;
     ++stats_.check_flagged;
 
+    // Detail: only once a key has also been seen sane (i.e. intermittent)
     if (e.flagged < e.checked && stats_.check_logged < 40)
     {
       ++stats_.check_logged;
@@ -1435,6 +1468,7 @@ namespace sst::native
     }
   }
 
+  // Morph consumers (faces): compare each vertex position with the same draw's previous frame. Faces move a little per frame; a vertex that suddenly jumps far compared with the mesh size is a spike. Logs what it jumped to and when the morph output it reads was last written
   void Renderer::CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0)
   {
     // Was the morph output changed between the morph and this draw?
@@ -1577,7 +1611,7 @@ namespace sst::native
     }
   }
 
-  // On the console the GPU runs these shaders and writes their eM# exports to memory; the visible mesh draw then fetches those vertices. Here the shader is interpreted on the CPU (memexport.h) with the device's current state, writing guest memory directly before the dependent draw is recorded.
+  // On the console the GPU runs these shaders and writes their eM# exports to memory; the visible mesh draw then fetches those vertices. Here the shader is interpreted on the CPU (memexport.h) with the device's current state, writing guest memory directly before the dependent draw is recorded
   void Renderer::RunMemexport(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry)
   {
     ++stats_.memexport_draws;
@@ -1612,7 +1646,7 @@ namespace sst::native
 
     const uint32_t dwords = uint32_t(memexport_ucode_.size());
 
-    // Vertex indices
+    // Vertex indices (r0.x of each invocation)
     memexport_indices_.resize(call.count);
 
     if (call.indexed)
@@ -1773,7 +1807,7 @@ namespace sst::native
 
     if (stream_count == 1 && streams[0].format >= 36 && streams[0].format <= 38 && uint64_t(streams[0].begin) + streams[0].size <= 0x20000000u)
     {
-      // (Values read as 8in32-swapped floats, the endian this game uses.
+      // Values read as 8in32-swapped floats, the endian this game uses
       const uint8_t *out = physical_membase_ + streams[0].begin;
       uint32_t bad = 0, first_bad = UINT32_MAX;
       float first_value = 0;
@@ -1842,7 +1876,7 @@ namespace sst::native
 
     const uint32_t dev = call.device;
 
-    // Memory-export (morph) passes: no rendering, they write vertices a later draw reads. Run them whatever the render target.
+    // Memory-export (morph) passes: no rendering, they write vertices a later draw reads. Run them whatever the render target
     const uint32_t vs_obj = be32(base, dev + kDevVS), ps_obj = be32(base, dev + kDevPS);
     ShaderEntry *vs_entry = ResolveShader(base, vs_obj, true);
 
@@ -1935,7 +1969,7 @@ namespace sst::native
       return;
     }
 
-    // Shaders
+    // Shaders. Objects the Create*Shader hooks didn't see are rebuilt from the object itself (container copy + microcode)
     ShaderEntry *ps_entry = ps_obj ? ResolveShader(base, ps_obj, false) : nullptr;
 
     if (!vs_entry || vs_entry->memexport || (ps_obj && !ps_entry))
@@ -1952,8 +1986,7 @@ namespace sst::native
       return;
     }
 
-    // Vertex inputs, from the vertex shader's *live* fetch instructions: the Xbox D3D patches format / offset / stride / fetch constant / swizzle into the microcode when it binds the declaration (draw-time flush), so this is exactly what the GPU would fetch. Each input is decoded on the
-    // CPU (DecodeElement) into 4 x 32 bits; swizzle changes the patch made relative to the original instruction become the component order.
+    // Vertex inputs, from the vertex shader's *live* fetch instructions: the Xbox D3D patches format / offset / stride / fetch constant / swizzle into the microcode when it binds the declaration (draw-time flush), so this is exactly what the GPU would fetch. Each input is decoded on the CPU (DecodeElement) into 4 x 32 bits; swizzle changes the patch made relative to the original instruction become the component order
     const uint32_t live_ucode = ToVirtual(be32(base, vs_obj + 0x20));
 
     if (!PlausibleAddress(live_ucode) || vs_entry->container.size() < 16)
@@ -1998,7 +2031,7 @@ namespace sst::native
       uint32_t fetch_addr; // instruction index of the controlling full vfetch
     };
 
-    // Shaders whose full vfetches don't fetch with the plain vertex index (r0.x)
+    // Shaders whose full vfetches don't fetch with the plain vertex index (r0.x) - e.g. particle quads reading one record per 4 vertices - get their element indices from running the shader on the CPU
     bool computed_fetch = false;
     uint32_t full_fetch_addr = 0;
     std::vector<HostElement> host_elements;
@@ -2011,7 +2044,7 @@ namespace sst::native
     uint32_t layout_words = 0;
     int full_stream = -1; // the last full vfetch (mini fetches share its constant)
 
-    // live fetch instructions
+    // The live fetch instructions. D3D's bind-time patch rewrites whole vfetch instructions - destination register included - and may assign the declaration's elements to the fetch slots in a different order than the container lists them. So each input is matched to the live instruction that writes the same register as the original instruction did, not to the one at the same address
     struct LiveFetch
     {
       uint32_t addr, l0, l1, l2; // live (patched)
@@ -2105,7 +2138,7 @@ namespace sst::native
 
       const uint32_t l0 = match->l0, l1 = match->l1, l2 = match->l2;
 
-      // Its full fetch (a mini fetch uses the last full fetch before it).
+      // Its full fetch (a mini fetch uses the last full fetch before it)
       const LiveFetch *full = nullptr;
 
       if ((l0 & 0x1F) == 0 && !((l1 >> 30) & 1))
@@ -2125,7 +2158,7 @@ namespace sst::native
         full_stream = stream_index(slot, (full->l2 & 0xFF) * 4);
         full_fetch_addr = full->addr;
 
-        // Source register bits 5-10 (+ relative bit 11), source swizzle 30-31.
+        // Source register bits 5-10 (+ relative bit 11), source swizzle 30-31
         if (((full->l0 >> 5) & 0x7F) != 0 || ((full->l0 >> 30) & 3) != 0)
           computed_fetch = true;
       }
@@ -2138,7 +2171,7 @@ namespace sst::native
       h.stream = -1;
       h.fetch_addr = 0;
 
-      if ((l0 & 0x1F) == 0)
+      if ((l0 & 0x1F) == 0) // vertex fetch opcode
       {
         const int32_t offset = int32_t(l2 << 1) >> 9; // bits 8-30, signed, in dwords
         FetchElement &f = h.fetch;
@@ -2147,6 +2180,8 @@ namespace sst::native
         f.normalized = !((l1 >> 13) & 1);
         f.no_zero = (l1 >> 14) & 1;
         f.exp_adjust = int32_t(l1 << 2) >> 26;
+
+        // The shader was translated from the original instruction: destination i reads input component o_i there, and hardware component l_i after the patch, so input component o_i must hold hardware component l_i
         bool conflict = false;
         uint8_t set = 0;
 
@@ -2157,6 +2192,7 @@ namespace sst::native
           if (o >= 4)
             continue; // the shader doesn't read the input for this destination
 
+          // Patched destination 6 (invalid) / 7 (keep: the register's previous value, zero for a fetch into a fresh register) read as 0
           const uint8_t hw = uint8_t(l >= 6 ? 4 : l);
 
           if ((set >> o) & 1)
@@ -2236,7 +2272,7 @@ namespace sst::native
     const bool alpha_test = (colorcontrol >> 3) & 1;
     const uint32_t alpha_func = colorcontrol & 7;
 
-    if (alpha_test && alpha_func == 0)
+    if (alpha_test && alpha_func == 0) // NEVER
     {
       ++stats_.skip_cull;
       return;
@@ -2245,7 +2281,7 @@ namespace sst::native
     if (alpha_test && alpha_func != 7)
       ps_spec |= sst::xenos::kSpecAlphaTest;
 
-    if ((mode & 3) == 3)
+    if ((mode & 3) == 3) // both faces culled
     {
       ++stats_.skip_cull;
       return;
@@ -2445,6 +2481,7 @@ namespace sst::native
 
           return;
         }
+
         for (const auto &[mb, me] : memexport_ranges_)
         {
           if (phys < me && phys + size > mb)
@@ -2771,6 +2808,7 @@ namespace sst::native
         sc[48 + i] = 0; // sampler
       }
 
+      BindTextures(base, dev, vs_entry, ps ? ps_entry : nullptr, sc);
       const uint32_t vs_bools = be32(base, dev + kDevBools);
       const uint32_t ps_bools = be32(base, dev + kDevBools + 16);
       sc[64] = (vs_bools & 0xFFFF) | (ps_bools << 16);
@@ -2779,10 +2817,10 @@ namespace sst::native
       float alpha_ref = RegF(base, dev, RB_ALPHA_REF);
       std::memcpy(&sc[68], &alpha_ref, 4);
 
-      // g_VertexIndexBase: SV_VertexID + this = the Xenos vertex index (r0.x).
+      // g_VertexIndexBase: SV_VertexID + this = the Xenos vertex index (r0.x)
       sc[69] = first_vertex;
 
-      // Viewport (needed for the half-pixel offset too).
+      // Viewport (needed for the half-pixel offset too)
       const uint32_t vte = Reg(base, dev, PA_CL_VTE_CNTL);
 
       float xs = RegF(base, dev, PA_CL_VPORT_XSCALE), xo = RegF(base, dev, PA_CL_VPORT_XOFFSET);
@@ -2821,6 +2859,37 @@ namespace sst::native
       cap_half_y = half_y;
       std::memcpy(shared.cpu, sc, sizeof(sc));
       list_->RSSetViewports(1, &vp);
+
+      // Scissor: SetScissorRect (sub_822FD8D8) keeps PA_SC_WINDOW_SCISSOR_TL/BR at dev+0x28C4/+0x28C8 (x | y << 16): the viewport rectangle, intersected with the scissor rectangle when scissor testing is on (dev+0x2E50)
+      {
+        D3D12_RECT rect = {0, 0, LONG(width_), LONG(height_)};
+
+        if (REXCVAR_GET(sst_native_scissor))
+        {
+          const uint32_t tl = be32(base, dev + kDevScissorTL), br = be32(base, dev + kDevScissorBR);
+          const LONG x0 = LONG(tl & 0x7FFF), y0 = LONG((tl >> 16) & 0x7FFF);
+          const LONG x1 = LONG(br & 0x7FFF), y1 = LONG((br >> 16) & 0x7FFF);
+
+          if (x1 > x0 && y1 > y0)
+          {
+            rect = {std::min(x0, LONG(width_)), std::min(y0, LONG(height_)), std::min(x1, LONG(width_)), std::min(y1, LONG(height_))};
+            const bool partial = x0 > 0 || y0 > 0 || x1 < LONG(width_) || y1 < LONG(height_);
+
+            if (partial)
+            {
+              ++stats_.scissored_draws;
+
+              if (LogOnce(0xE000000000000000ull | (uint64_t(tl) << 32 | br) >> 4) && stats_.scissor_logged < 16)
+              {
+                ++stats_.scissor_logged;
+                REXLOG_INFO("[sst-native] scissor {}x{}-{}x{} (prim {}, {} vertices)", x0, y0, x1, y1, call.prim, call.count);
+              }
+            }
+          }
+        }
+
+        list_->RSSetScissorRects(1, &rect);
+      }
     }
 
     const float blend_factor[4] = {RegF(base, dev, RB_BLEND_RED), RegF(base, dev, RB_BLEND_RED + 1), RegF(base, dev, RB_BLEND_RED + 2), RegF(base, dev, RB_BLEND_RED + 3)};
@@ -2869,6 +2938,7 @@ namespace sst::native
       CaptureDraw(base, call, vs_obj, vs_entry, vs, layout, key.layout_hash, first_vertex, vertex_count, fetch_stream_count ? uint32_t(resolved[0].src - physical_membase_) : 0, reads_morph, cap_half_x, cap_half_y);
   }
 
+  // F9 capture: GPU vertex positions (stream output) vs the CPU. For one frame, every drawn draw is drawn a second time as a point list into a stream-output buffer with a pipeline that has no rasterizer, capturing SV_Position exactly as the GPU computed it from the translated shader. The original microcode is run on the CPU over the same vertices; at the end of the frame both are compared. Disagreeing draws are translation (or GPU input) bugs; agreeing draws with vertices far outside the view are data
   bool Renderer::EnsureCaptureResources()
   {
     if (so_buffer_)
@@ -3149,10 +3219,133 @@ namespace sst::native
     so_readback_->Unmap(0, &none);
   }
 
+  // textures
+  const Renderer::TextureUsage &Renderer::GetTextureUsage(const ShaderEntry *entry)
+  {
+    auto [it, fresh] = texture_usage_.try_emplace(entry);
+
+    if (!fresh)
+      return it->second;
+
+    TextureUsage &u = it->second;
+    const std::vector<uint8_t> &ct = entry->container;
+
+    auto ct32 = [&](size_t at) -> uint32_t
+    {
+      return at + 4 <= ct.size() ? (uint32_t(ct[at]) << 24) | (uint32_t(ct[at + 1]) << 16) | (uint32_t(ct[at + 2]) << 8) | ct[at + 3] : 0;
+    };
+
+    const uint32_t vsz = ct32(4), shader_off = ct32(0x18);
+    const uint32_t phys_off = ct32(shader_off), bytes = ct32(size_t(shader_off) + 4);
+
+    if (!bytes || size_t(vsz) + phys_off + bytes > ct.size())
+      return u;
+
+    std::vector<uint32_t> ucode(bytes / 4);
+
+    for (size_t i = 0; i < ucode.size(); ++i)
+      ucode[i] = ct32(size_t(vsz) + phys_off + 4 * i);
+
+    u.mask = TextureFetchUsage(ucode.data(), uint32_t(ucode.size()), u.uses);
+
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+      if (!((u.mask >> i) & 1))
+        continue;
+
+      if (i >= 16 && LogOnce(0xD000000000000000ull ^ entry->hash))
+        REXLOG_WARN("[sst-native] shader {:016X} samples fetch constant {} (>= 16, not bound)", entry->hash, i);
+
+      if (u.uses[i].mixed_dimensions && LogOnce(0xD100000000000000ull ^ entry->hash))
+        REXLOG_WARN("[sst-native] shader {:016X} samples fetch constant {} with several "
+                    "dimensions",
+                    entry->hash, i);
+    }
+
+    return u;
+  }
+
+  void Renderer::BindTextures(const uint8_t *base, uint32_t dev, const ShaderEntry *vs_entry, const ShaderEntry *ps_entry, uint32_t *sc)
+  {
+    if (!textures_)
+      return;
+
+    const TextureCache::AllocateFn allocate = [this](size_t size)
+    {
+      const Upload u = Allocate(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+      return TextureCache::UploadSpace{u.cpu, u.resource, u.offset};
+    };
+
+    bool textured = false, placeholder = false;
+
+    for (const ShaderEntry *e : {vs_entry, ps_entry})
+    {
+      if (!e)
+        continue;
+
+      const TextureUsage &u = GetTextureUsage(e);
+
+      for (uint32_t i = 0; i < 16; ++i)
+      {
+        if (!((u.mask >> i) & 1))
+          continue;
+
+        const TextureFetchUse &use = u.uses[i];
+        uint32_t fetch[6];
+
+        for (uint32_t k = 0; k < 6; ++k)
+          fetch[k] = be32(base, dev + kDevFetchConstants + 24 * i + 4 * k);
+
+        const uint32_t dimension = use.dimension ? use.dimension - 1u : 1u;
+        const uint32_t slot = textures_->GetTexture(list_.Get(), allocate, fetch, dimension);
+
+        if (slot != TextureCache::kNone)
+        {
+          textured = true;
+
+          if (dimension == 2)
+            sc[16 + i] = slot;
+          else if (dimension == 3)
+            sc[32 + i] = slot;
+          else
+            sc[i] = slot;
+        }
+        else
+        {
+          placeholder = true;
+
+          // Stacked texture sampled as 3D: the shadow map array (not rendered yet)
+          const bool stacked = ((fetch[5] >> 9) & 3) == 1 && ((fetch[1] >> 10) & 1);
+
+          if (dimension == 2 && stacked)
+          {
+            sc[16 + i] = kPlaceholder3DBlack;
+            ++stats_.shadow_placeholders;
+          }
+        }
+
+        sc[48 + i] = textures_->GetSampler(fetch, use);
+      }
+    }
+
+    if (textured)
+      ++stats_.textured_draws;
+
+    if (placeholder)
+      ++stats_.texture_placeholders;
+  }
+
   // stats
   void Renderer::LogStats(uint64_t frame)
   {
     auto &s = stats_;
+
+    if (textures_)
+      REXLOG_INFO("[sst-native] {}; draws with textures {} (placeholders {}, shadow map "
+                  "stand-ins {}); scissored draws {}",
+                  textures_->StatusLine(), s.textured_draws, s.texture_placeholders,
+                  s.shadow_placeholders, s.scissored_draws);
+
     REXLOG_INFO("[sst-native] frame {}: {} draws, {} drawn ({} depth-only); skipped: shader {} "
                 "pending {} fetch {} prim {} rt {} pipeline {} data {} cull {} memexport-target {}; {} clears; "
                 "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB",

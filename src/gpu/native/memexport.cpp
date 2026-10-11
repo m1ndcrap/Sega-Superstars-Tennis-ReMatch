@@ -64,36 +64,26 @@ namespace sst::native
       const uint32_t f = AsUint(value);
       const uint32_t sign = (f >> 16) & 0x8000u;
       const uint32_t abs = f & 0x7FFFFFFFu;
-
       if (abs >= 0x7F800000u)
         return uint16_t(sign | (abs > 0x7F800000u ? 0x7E00u : 0x7C00u));
-
       if (abs >= 0x477FF000u)
         return uint16_t(sign | 0x7C00u); // overflow -> inf
-
       if (abs < 0x38800000u)
-      {
-        // subnormal / zero
+      { // subnormal / zero
         if (abs < 0x33000000u)
           return uint16_t(sign);
-
         const uint32_t mant = (abs & 0x7FFFFFu) | 0x800000u;
         const uint32_t shift = 126u - (abs >> 23);
         uint32_t h = mant >> (shift + 1);
         const uint32_t rem = mant & ((1u << (shift + 1)) - 1), half = 1u << shift;
-
         if (rem > half || (rem == half && (h & 1)))
           ++h;
-
         return uint16_t(sign | h);
       }
-
       uint32_t h = ((abs - 0x38000000u) >> 13);
       const uint32_t rem = abs & 0x1FFFu;
-
       if (rem > 0x1000u || (rem == 0x1000u && (h & 1)))
         ++h;
-
       return uint16_t(sign | h);
     }
 
@@ -103,18 +93,14 @@ namespace sst::native
       {
       case 1: // 8in16
         return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
-
       case 2: // 8in32
         return __builtin_bswap32(v);
-
       case 3: // 16in32
         return (v << 16) | (v >> 16);
-
       default:
         return v;
       }
     }
-
     // xenos::Endian128 on a 4-dword element
     void Swap128(uint32_t v[4], uint32_t endian)
     {
@@ -450,7 +436,7 @@ namespace sst::native
       }
     }
 
-    // One lane of a scalar operation: returns the new previous-scalar value
+    // One lane of a scalar operation: returns the new previous-scalar value.
     inline float ScalarOp(S op, const float so[2], float ps, bool &pred, int32_t &a0)
     {
       switch (op)
@@ -708,22 +694,19 @@ namespace sst::native
           : ucode_(ucode), dwords_(dwords), c_(c), membase_(membase), stats_(stats),
             temps_(size_t(kTempCount) * 4 * kLanes), clear_floats_(size_t(temp_count) * 4 * kLanes) {}
 
-      // Runs `lanes` (<= kLanes) vertices sharing control flow. positions: if set, receives the position export (xyzw) of each lane.
+      // Runs 'lanes' (<= kLanes) vertices sharing control flow
+      // positions: if set, receives the position export (xyzw) of each lane
       void Run(const uint32_t *vertex_indices, uint32_t lanes, float *positions = nullptr)
       {
         lanes_ = lanes;
         positions_ = positions;
-
         if (positions)
           for (uint32_t i = 0; i < 4 * lanes; ++i)
             positions[i] = std::nanf("");
-
         std::fill(temps_.begin(), temps_.begin() + clear_floats_, 0.0f);
-
         for (uint32_t l = 0; l < lanes; ++l)
           T(0, 0)
-
-        [l] = float(vertex_indices[l]);
+          [l] = float(vertex_indices[l]);
         std::memset(ps_, 0, sizeof(ps_));
         std::memset(a0_, 0, sizeof(a0_));
         std::memset(pred_, 0, sizeof(pred_));
@@ -798,7 +781,7 @@ namespace sst::native
       uint32_t vfetch_address_[kLanes];
       State state_;
 
-      // Memory export: eA (raw bits) and eM0-4 per lane; which eM# were written.
+      // Memory export: eA (raw bits) and eM0-4 per lane; which eM# were written
       uint32_t address_[4][kLanes];
       bool address_valid_ = false;
       float data_[5][4][kLanes];
@@ -882,7 +865,8 @@ namespace sst::native
               }
             }
           }
-          // An *End exec ends the shader even when its condition skipped it.
+
+          // An *End exec ends the shader even when its condition skipped it
           if (ucode::DoesControlFlowOpcodeEndShader(op))
             return;
         }
@@ -890,11 +874,13 @@ namespace sst::native
         case Op::kLoopStart:
         {
           const auto &ls = *reinterpret_cast<const ucode::ControlFlowLoopStartInstruction *>(&ci);
+
           if (state_.loop_depth >= 4)
           {
             cf_next = ls.address();
             break;
           }
+
           xenos::LoopConstant lc;
           lc.value = c_.loop_constants ? c_.loop_constants[ls.loop_id() & 31] : 0;
           const uint32_t d = state_.loop_depth;
@@ -972,18 +958,19 @@ namespace sst::native
       float vr[4][kLanes];
       float sr[kLanes];
 
+      // Gathers source operand `src` (1-3) of every lane into out[comp][lane], components in the order given by `comps` (already swizzled by the caller when it needs a subset).
       auto gather = [&](uint32_t src, bool scalar_const_op, float (*out)[kLanes], const uint32_t *comps, uint32_t ncomps, uint32_t need = 0xF)
       {
         const uint32_t reg = instr.src_reg(src);
         const uint32_t neg = uint32_t(instr.src_negate(src)) << 31;
 
-        // Two-operand scalar ops (c#.w with r#.x) always read a constant here: src3_sel is then part of the temp register number.
+        // Two-operand scalar ops (c#.w with r#.x) always read a constant here: src3_sel is then part of the temp register number
         if (!scalar_const_op && instr.src_is_temp(src))
         {
-          const uint32_t t = TempIndex(ucode::AluInstruction::src_temp_reg(reg), ucode::AluInstruction::is_src_temp_relative(reg));
+          const uint32_t t = TempIndex(ucode::AluInstruction::src_temp_reg(reg),
+                                       ucode::AluInstruction::is_src_temp_relative(reg));
           const bool absolute = ucode::AluInstruction::is_src_temp_value_absolute(reg);
           const uint32_t abs_mask = ~(uint32_t(absolute) << 31);
-
           for (uint32_t j = 0; j < ncomps; ++j)
           {
             if (!((need >> j) & 1))
@@ -992,31 +979,23 @@ namespace sst::native
             for (uint32_t l = 0; l < L; ++l)
               out[j][l] = AsFloat((AsUint(FlushDenormal(p[l])) & abs_mask) ^ neg);
           }
-
           return;
         }
-
         const bool addressed = instr.src_const_is_addressed(src);
-
         if (addressed && instr.is_const_address_register_relative())
         {
           for (uint32_t l = 0; l < L; ++l)
           {
             const float *c = FloatConstant(int32_t(reg) + a0_[l]);
-
             for (uint32_t j = 0; j < ncomps; ++j)
               out[j][l] = AsFloat(AsUint(FlushDenormal(c[comps[j]])) ^ neg);
           }
-
           return;
         }
-
         const float *c = FloatConstant(int32_t(reg) + (addressed ? state_.LoopAddress() : 0));
-
         for (uint32_t j = 0; j < ncomps; ++j)
         {
           const float v = AsFloat(AsUint(FlushDenormal(c[comps[j]])) ^ neg);
-
           for (uint32_t l = 0; l < L; ++l)
             out[j][l] = v;
         }
@@ -1026,13 +1005,14 @@ namespace sst::native
       const V vop = instr.vector_opcode();
       const ucode::AluVectorOpcodeInfo &vinfo = ucode::GetAluVectorOpcodeInfo(vop);
       const uint32_t vmask = instr.GetVectorOpResultWriteMask();
+
       if (vmask || vinfo.changed_state)
       {
         // Component-wise operations only need the written components
-        const bool componentwise = !vinfo.changed_state &&
-                                   (vop == V::kAdd || vop == V::kMul || vop == V::kMad || vop == V::kMax || vop == V::kMin);
+        const bool componentwise = !vinfo.changed_state && (vop == V::kAdd || vop == V::kMul || vop == V::kMad || vop == V::kMax || vop == V::kMin);
         const uint32_t need = componentwise ? vmask : 0xF;
         float ops[3][4][kLanes];
+
         for (uint32_t i = 0; i < 3; ++i)
         {
           if (!vinfo.operand_components_used[i])
@@ -1106,8 +1086,7 @@ namespace sst::native
       else if (sinfo.operand_count == 1)
       {
         const uint32_t n = sinfo.single_operand_is_two_component ? 2 : 1;
-        const uint32_t comps[2] = {ucode::AluInstruction::GetSwizzledComponentIndex(swz, 3),
-                                   ucode::AluInstruction::GetSwizzledComponentIndex(swz, 0)};
+        const uint32_t comps[2] = {ucode::AluInstruction::GetSwizzledComponentIndex(swz, 3), ucode::AluInstruction::GetSwizzledComponentIndex(swz, 0)};
         gather(3, false, so, comps, n);
       }
       else if (sinfo.operand_count == 2)
@@ -1116,11 +1095,11 @@ namespace sst::native
         const uint32_t c_comp = ucode::AluInstruction::GetSwizzledComponentIndex(swz, 3);
         gather(3, true, so, &c_comp, 1);
         const uint32_t neg = uint32_t(instr.src_negate(3)) << 31;
-        const float *p = T(instr.scalar_const_reg_op_src_temp_reg() & (kTempCount - 1),
-                           ucode::AluInstruction::GetSwizzledComponentIndex(swz, 0));
+        const float *p = T(instr.scalar_const_reg_op_src_temp_reg() & (kTempCount - 1), ucode::AluInstruction::GetSwizzledComponentIndex(swz, 0));
         for (uint32_t l = 0; l < L; ++l)
           so[1][l] = AsFloat(AsUint(FlushDenormal(p[l])) ^ neg);
       }
+
       if (sop != S::kRetainPrev)
       {
         for (uint32_t l = 0; l < L; ++l)
@@ -1129,6 +1108,7 @@ namespace sst::native
           ps_[l] = ScalarOp(sop, s, ps_[l], pred_[l], a0_[l]);
         }
       }
+
       for (uint32_t l = 0; l < L; ++l)
         sr[l] = instr.scalar_clamp() ? Saturate(ps_[l]) : ps_[l];
       if (instr.vector_clamp())
@@ -1174,7 +1154,6 @@ namespace sst::native
               for (uint32_t l = 0; l < L; ++l)
                 positions_[4 * l + j] = value(j, l);
         }
-
         // Interpolators / point size: not needed
         return;
       }
@@ -1252,6 +1231,7 @@ namespace sst::native
       e.exp_adjust = instr.exp_adjust();
       e.out = FetchElement::Out::kFloat;
       const uint32_t bytes = DeclFormatSize(e.format);
+
       // 32-bit float formats: plain swapped dwords (the common case here)
       uint32_t float_words = 0;
 
@@ -1275,8 +1255,10 @@ namespace sst::native
           break;
         }
       }
+
       const bool valid = bytes && (fc0 & 3) == 3;
       float result[4][kLanes];
+
       for (uint32_t l = 0; l < L; ++l)
       {
         const uint64_t first = uint64_t(uint32_t(int32_t(vfetch_address_[l]) + instr.offset())) * 4;
@@ -1342,7 +1324,7 @@ namespace sst::native
         const bool swap_rb = (format_info >> 19) & 1;
         if ((format == 36 || format == 37 || format == 38) && endian <= 3 && !swap_rb)
         {
-          // 32-bit float formats (what this game uses): no packing
+          // 32-bit float formats (what this game uses): no packing.
           const uint32_t n = format == 36 ? 1 : format == 37 ? 2
                                                              : 4;
           for (uint32_t k = 0; k < 5; ++k)
@@ -1391,7 +1373,6 @@ namespace sst::native
         }
       }
     }
-
   }
 
   // Persistent worker threads: a job is split into parts that the workers and the calling thread take in turn
@@ -1413,7 +1394,7 @@ namespace sst::native
       for (auto &t : threads)
         t.join();
     }
-
+    // Runs fn(0..parts-1) on the workers and the caller; returns when all are done
     void Run(uint32_t parts, const std::function<void(uint32_t)> &fn)
     {
       {
@@ -1510,7 +1491,6 @@ namespace sst::native
 
     // Vertices are independent and write disjoint elements: large draws are split across the worker threads (parts of 8 batches)
     constexpr uint32_t kPartVertices = 8 * kLanes;
-
     if (pool_ && !per_vertex && count >= 2 * kPartVertices)
     {
       const uint32_t parts = (count + kPartVertices - 1) / kPartVertices;
@@ -1549,7 +1529,10 @@ namespace sst::native
     return true;
   }
 
-  bool MemexportRunner::RunFetchIndices(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, std::unordered_map<uint32_t, std::vector<int32_t>> *records)
+  bool MemexportRunner::RunFetchIndices(
+      const uint32_t *ucode, uint32_t dwords, const VsConstants &constants,
+      const uint32_t *vertex_indices, uint32_t count,
+      std::unordered_map<uint32_t, std::vector<int32_t>> *records)
   {
     if (!ucode || dwords < 3 || !constants.float_constants || !constants.bool_constants ||
         !constants.fetch_constants || !membase_ || !records)
@@ -1569,7 +1552,9 @@ namespace sst::native
     return true;
   }
 
-  bool MemexportRunner::RunPositions(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, float *positions, MemexportStats *stats)
+  bool MemexportRunner::RunPositions(const uint32_t *ucode, uint32_t dwords,
+                                     const VsConstants &constants, const uint32_t *vertex_indices,
+                                     uint32_t count, float *positions, MemexportStats *stats)
   {
     if (!ucode || dwords < 3 || !constants.float_constants || !constants.bool_constants ||
         !constants.fetch_constants || !membase_)
@@ -1655,6 +1640,60 @@ namespace sst::native
       }
     }
     return n;
+  }
+
+  uint32_t TextureFetchUsage(const uint32_t *ucode, uint32_t dwords, TextureFetchUse uses[32])
+  {
+    using Op = ucode::ControlFlowOpcode;
+    using FOp = ucode::FetchOpcode;
+    for (uint32_t i = 0; i < 32; ++i)
+      uses[i] = TextureFetchUse{};
+    uint32_t mask = 0;
+    uint32_t cf_end = 2 * (dwords / 3);
+    for (uint32_t cf = 0; cf < cf_end; ++cf)
+    {
+      ucode::ControlFlowInstruction ci;
+      if (!ReadCf(ucode, dwords, cf, &ci))
+        break;
+      const Op op = ci.opcode();
+      if (op != Op::kExec && op != Op::kExecEnd && op != Op::kCondExec && op != Op::kCondExecEnd &&
+          op != Op::kCondExecPred && op != Op::kCondExecPredEnd && op != Op::kCondExecPredClean &&
+          op != Op::kCondExecPredCleanEnd)
+        continue;
+      const auto &e = *reinterpret_cast<const ucode::ControlFlowExecInstruction *>(&ci);
+      cf_end = std::min(cf_end, 2 * e.address());
+      for (uint32_t i = 0; i < e.count() && 3 * size_t(e.address() + i) + 3 <= dwords; ++i)
+      {
+        if (!((e.sequence() >> (2 * i)) & 1))
+          continue;
+        const uint32_t *ins = &ucode[3 * (e.address() + i)];
+        const auto &t = *reinterpret_cast<const ucode::TextureFetchInstruction *>(ins);
+        const FOp fop = t.opcode();
+        if (fop != FOp::kTextureFetch && fop != FOp::kGetTextureWeights &&
+            fop != FOp::kGetTextureComputedLod && fop != FOp::kGetTextureGradients)
+          continue;
+        const uint32_t index = t.fetch_constant_index() & 31;
+        TextureFetchUse &u = uses[index];
+        const uint8_t dim = uint8_t(uint32_t(t.dimension()) + 1);
+        if (!u.dimension)
+        {
+          u.dimension = dim;
+          u.mag_filter = uint8_t(t.mag_filter());
+          u.min_filter = uint8_t(t.min_filter());
+          u.mip_filter = uint8_t(t.mip_filter());
+          u.aniso_filter = uint8_t(t.aniso_filter());
+          u.lod_bias = t.lod_bias();
+          u.unnormalized = t.unnormalized_coordinates();
+        }
+        else if (u.dimension != dim)
+        {
+          u.mixed_dimensions = true;
+        }
+        ++u.count;
+        mask |= 1u << index;
+      }
+    }
+    return mask;
   }
 
   uint32_t MemexportElementSize(uint32_t format)

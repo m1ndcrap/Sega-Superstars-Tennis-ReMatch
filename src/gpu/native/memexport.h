@@ -11,7 +11,6 @@
 
 namespace sst::native
 {
-
   // Vertex shader state the interpreter reads (all host-endian)
   struct VsConstants
   {
@@ -66,6 +65,18 @@ namespace sst::native
 
   // Fetch constant slots (0-95) the shader's vertex fetches read
   uint32_t VertexFetchSlots(const uint32_t *ucode, uint32_t dwords, uint32_t *slots, uint32_t max);
+
+  // Texture fetch constants (0-31) the shader's texture fetches read, with the first fetch's dimension (xenos::FetchOpDimension + 1; 0 = unused) and filter overrides (xenos::TextureFilter / AnisoFilter values; kUseFetchConst = 3 / 7 when the fetch constant decides).
+  struct TextureFetchUse
+  {
+    uint8_t dimension = 0;
+    uint8_t mag_filter = 3, min_filter = 3, mip_filter = 3, aniso_filter = 7;
+    bool unnormalized = false, mixed_dimensions = false;
+    uint16_t count = 0;
+    float lod_bias = 0;
+  };
+
+  uint32_t TextureFetchUsage(const uint32_t *ucode, uint32_t dwords, TextureFetchUse uses[32]);
 
   // Element size in bytes of a memexport stream format (xenos::ColorFormat), 0 if unsupported
   uint32_t MemexportElementSize(uint32_t format);
