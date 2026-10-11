@@ -47,6 +47,18 @@ namespace sst::native
     uint32_t count = 0;       // index or vertex count
     uint32_t up_data = 0;     // DrawVerticesUP: guest address of stream 0 data
     uint32_t up_stride = 0;
+    bool immediate = false; // BeginVertices/EndVertices (game's immediate-mode helpers)
+  };
+
+  struct ResolveCall
+  {
+    uint32_t device = 0, flags = 0;
+    uint32_t src_rect = 0;    // guest D3DRECT* (x1, y1, x2, y2) or 0
+    uint32_t dst_texture = 0; // guest texture object (fetch constant at +0x1C)
+    uint32_t dst_point = 0;   // guest D3DPOINT* or 0
+    uint32_t level = 0, slice = 0;
+    uint32_t clear_color = 0; // guest D3DVECTOR4* or 0
+    float clear_z = 0;
   };
 
   class Renderer
@@ -64,6 +76,9 @@ namespace sst::native
     void Clear(const uint8_t *base, uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil);
     void Draw(const uint8_t *base, const DrawCall &call);
     void EndFrame(); // Swap
+    void Resolve(const uint8_t *base, const ResolveCall &call);
+    // Render-target trace (--sst_native_rt_trace / F10): one frame's sequence of passes, clears, resolves and other events, logged at the frame's end
+    void TraceEvent(const uint8_t *base, uint32_t device, const std::string &what);
     void LogStats(uint64_t frame);
     uint64_t frames() const { return submitted_; }
 
@@ -155,11 +170,9 @@ namespace sst::native
     void CreateTimestampQueries();
     void ReadGpuTime(uint32_t slot);
     void LogProfile();
-
     // Constant files uploaded this frame, by content (XXH3 of the guest bytes)
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> constant_cache_;
     D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const uint8_t *guest);
-
     // Geometry cache: decoded vertex / converted index data in one video memory pool (bump allocated; when full, everything is re-stored on next use)
     struct GeoEntry
     {
@@ -187,11 +200,9 @@ namespace sst::native
     void BeginFrame();
     void WaitFence(uint64_t value);
     ShaderEntry *ResolveShader(const uint8_t *base, uint32_t object, bool vertex);
-
     // Memory-export (morph) draws: run on the CPU, writing guest memory
     void RunMemexport(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry);
     void RecordMemexportRanges(const uint8_t *base, uint32_t dev);
-
     // Background memexport jobs not yet collected (oldest first)
     struct PendingMemexport
     {
@@ -207,7 +218,6 @@ namespace sst::native
     void WaitMemexports(uint32_t begin, uint32_t end);
     void CollectMemexports(bool all);
     void FinishMemexport(const PendingMemexport &p);
-
     const char *LoadVsState(const uint8_t *base, uint32_t dev, uint32_t vs_obj, const ShaderEntry *vs_entry, std::vector<uint32_t> &ucode, float *constants, uint32_t bools[8], uint32_t fetch[192], uint32_t loops[32], uint32_t *literals);
     bool ComputeFetchRecords(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count);
     std::unordered_map<uint32_t, std::vector<int32_t>> fetch_records_;
@@ -218,6 +228,80 @@ namespace sst::native
     void CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0);
     void CheckVsPositions(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, const float *host, uint32_t host_inputs);
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t slot) const;
+
+    // Render targets (milestone 4): every guest render-target surface (colour or depth) is a host texture at its logical size (max of the surface size and the viewports drawn with; the main scene's 640x736 tile surface is drawn as one 1280x736 image). Resolves copy them into host textures registered with the texture cache under the destination's guest address; the frame shown is the last full-size resolve (the game's front buffer copy)
+    struct HostRT
+    {
+      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; // RTV / DSV format
+      uint32_t width = 0, height = 0;
+      bool depth = false;
+      uint32_t view = 0; // RTV or DSV index in rt_rtv_heap_ / rt_dsv_heap_
+      uint32_t srv = 0;  // shader-visible SRV slot (resolve source)
+      D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+      uint32_t guest_format = 0;
+    };
+
+    struct ResolvedTexture
+    {
+      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      uint32_t width = 0, height = 0, slices = 1;
+      bool volume = false;
+      uint32_t guest_format = 0;
+      std::vector<uint32_t> rtvs; // per slice
+      uint32_t srv = 0;           // identity view (presenting)
+      bool rb_swapped = false;    // stored red/blue swapped (ARGB-style destination)
+      D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    };
+
+    bool RenderTargetsEnabled() const;
+    HostRT *GetHostRT(const uint8_t *base, uint32_t surface, bool depth, uint32_t min_width, uint32_t min_height);
+    void SetRTState(HostRT &rt, D3D12_RESOURCE_STATES state);
+    D3D12_CPU_DESCRIPTOR_HANDLE RtRtv(uint32_t index) const;
+    D3D12_CPU_DESCRIPTOR_HANDLE RtDsv(uint32_t index) const;
+    uint32_t AllocateRtSrv();
+    D3D12_GPU_DESCRIPTOR_HANDLE SrvGpu(uint32_t slot) const;
+    ResolvedTexture *GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume);
+    bool CreateBlitResources();
+    ID3D12PipelineState *GetBlitPipeline(DXGI_FORMAT format);
+    // Copies src_srv texels (src_x, src_y)+ into `rtv` at dst rect (draws a triangle; the caller handles states). Restores the draw root signature
+    void Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb = false);
+    void RestoreDrawState();
+    void PresentRenderTargets();
+    std::unordered_map<uint32_t, HostRT> color_rts_, depth_rts_;
+    std::unordered_map<uint32_t, std::unique_ptr<ResolvedTexture>> resolved_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rt_rtv_heap_, rt_dsv_heap_;
+    uint32_t rt_rtv_next_ = 0, rt_dsv_next_ = 0, rt_srv_next_ = 0, dsv_size_ = 0, srv_size_ = 0;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> blit_root_;
+    std::vector<uint8_t> blit_vs_, blit_ps_;
+    std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> blit_pipelines_;
+    uint32_t present_page_ = 0; // page of this frame's front-buffer resolve (0: none)
+    HostRT *last_color_rt_ = nullptr;
+    uint64_t bound_targets_ = 0; // (rtv, dsv) pair bound for draws, 0 = rebind
+    // Replaced targets, released once the GPU has passed this fence value
+    std::vector<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>> retired_rts_;
+
+    struct RtTrace
+    {
+      bool requested = false, active = false;
+      uint64_t frame = 0;
+      std::vector<std::string> lines;
+      uint64_t pass_key = 0;
+      bool has_pass = false;
+      std::string pass_head;
+      uint32_t pass_draws = 0, pass_morph = 0, pass_index = 0;
+      std::unordered_map<uint32_t, uint32_t> pass_prims;
+      std::vector<std::string> pass_textures;
+      std::unordered_set<uint64_t> pass_texture_keys, pass_ps, surfaces_logged;
+    } rt_trace_;
+
+    void TraceBeginFrame();
+    void TraceState(const uint8_t *base, uint32_t dev); // opens a new pass if the state changed
+    void TraceClosePass();
+    void TraceDraw(const uint8_t *base, uint32_t dev, const DrawCall &call, bool morph);
+    std::string DescribeSurface(const uint8_t *base, uint32_t surface);
+    std::string DescribeTexture(const uint32_t fetch[6]);
 
     // Textures: fills the SharedConstants descriptor indices (sc[0..63]) for the samplers the shaders fetch from
     struct TextureUsage
@@ -264,7 +348,6 @@ namespace sst::native
 
     // Guest physical ranges written by memexport draws that were *not* run on the CPU this frame (--sst_native_memexport=false or failure); draws fetching vertices from them are skipped
     std::vector<std::pair<uint32_t, uint32_t>> memexport_ranges_;
-
     // Ranges the CPU memexport wrote this / last frame (diagnostics)
     std::vector<std::pair<uint32_t, uint32_t>> memexport_written_, memexport_written_prev_;
 
@@ -277,7 +360,6 @@ namespace sst::native
     // CPU memexport
     std::unique_ptr<MemexportRunner> memexport_;
     MemexportStats memexport_stats_;
-
     struct MemexportCacheEntry
     {
       uint64_t input_hash = 0, output_hash = 0;
@@ -298,7 +380,6 @@ namespace sst::native
     };
 
     std::unordered_map<uint64_t, CheckEntry> check_entries_;
-
     // Morph consumer jump check
     struct MorphHistory
     {
@@ -355,7 +436,6 @@ namespace sst::native
     const float *capture_host_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D12Resource> so_buffer_, so_readback_, so_zero_;
     std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> so_pipelines_;
-
     struct MorphWrite
     {
       uint64_t frame = 0, draw = 0;
@@ -366,7 +446,6 @@ namespace sst::native
 
     std::unordered_map<uint32_t, MorphWrite> morph_writes_;
     uint64_t draw_seq_ = 0;
-
     // Shader object address -> hash of its container copy at the last bind
     std::unordered_map<uint32_t, uint64_t> object_vhash_;
     std::unordered_map<uint32_t, uint32_t> object_ucode_; // microcode pointer at the last bind
@@ -409,6 +488,8 @@ namespace sst::native
       uint64_t upload_bytes = 0;
       uint64_t textured_draws = 0, texture_placeholders = 0, shadow_placeholders = 0;
       uint64_t constants_uploaded = 0, constants_reused = 0;
+      uint64_t resolves = 0, resolves_logged = 0;
+      uint64_t resolves_done = 0, resolves_skipped = 0, rects_converted = 0, host_rts = 0, presented_from_resolve = 0;
       uint64_t geo_vertex_hits = 0, geo_index_hits = 0, geo_stores = 0, geo_store_bytes = 0, geo_dynamic = 0, geo_flushes = 0;
       uint64_t scissored_draws = 0, scissor_logged = 0;
       uint64_t pipelines_created = 0, pipelines_failed = 0, pipelines_from_cache = 0, skip_pipeline_pending = 0;

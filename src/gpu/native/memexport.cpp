@@ -34,11 +34,8 @@ namespace sst::native
 
   namespace
   {
-    // 64
-    constexpr uint32_t kTempCount = xenos::kMaxShaderTempRegisters;
-
-    // control flow instructions per invocation
-    constexpr uint32_t kMaxCfSteps = 4096;
+    constexpr uint32_t kTempCount = xenos::kMaxShaderTempRegisters; // 64
+    constexpr uint32_t kMaxCfSteps = 4096;                          // control flow instructions per invocation
     constexpr uint32_t kGuestPhysicalSize = 0x20000000u;
 
     float AsFloat(uint32_t v)
@@ -62,10 +59,7 @@ namespace sst::native
       return AsFloat(bits);
     }
 
-    float Saturate(float v)
-    {
-      return std::min(1.0f, std::max(0.0f, v));
-    }
+    float Saturate(float v) { return std::min(1.0f, std::max(0.0f, v)); }
 
     // Float -> IEEE half (round to nearest even), as Xenia's memexport does (standard half, not the Xbox extended range).
     uint16_t FloatToHalf(float value)
@@ -77,11 +71,9 @@ namespace sst::native
       if (abs >= 0x7F800000u)
         return uint16_t(sign | (abs > 0x7F800000u ? 0x7E00u : 0x7C00u));
 
-      // overflow -> inf
       if (abs >= 0x477FF000u)
-        return uint16_t(sign | 0x7C00u);
+        return uint16_t(sign | 0x7C00u); // overflow -> inf
 
-      // subnormal / zero
       if (abs < 0x38800000u)
       {
         if (abs < 0x33000000u)
@@ -111,16 +103,13 @@ namespace sst::native
     {
       switch (endian)
       {
-      case 1:
-        // 8in16
+      case 1: // 8in16
         return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
 
-      case 2:
-        // 8in32
+      case 2: // 8in32
         return __builtin_bswap32(v);
 
-      case 3:
-        // 16in32
+      case 3: // 16in32
         return (v << 16) | (v >> 16);
 
       default:
@@ -141,8 +130,7 @@ namespace sst::native
 
         break;
 
-      case 4:
-        // 8in64
+      case 4: // 8in64
         for (int i = 0; i < 4; i += 2)
         {
           const uint32_t a = __builtin_bswap32(v[i]), b = __builtin_bswap32(v[i + 1]);
@@ -152,9 +140,8 @@ namespace sst::native
 
         break;
 
-      case 5:
+      case 5: // 8in128
       {
-        // 8in128
         const uint32_t a = __builtin_bswap32(v[0]), b = __builtin_bswap32(v[1]), c = __builtin_bswap32(v[2]), d = __builtin_bswap32(v[3]);
         v[0] = d, v[1] = c, v[2] = b, v[3] = a;
         break;
@@ -170,9 +157,8 @@ namespace sst::native
     {
       float v[4] = {in[0], in[1], in[2], in[3]};
 
-      // red / blue swap
       if ((format_info >> 19) & 1)
-        std::swap(v[0], v[2]);
+        std::swap(v[0], v[2]); // red / blue swap
 
       const bool is_signed = (format_info >> 16) & 1;
       const bool is_norm = !((format_info >> 17) & 1);
@@ -185,74 +171,61 @@ namespace sst::native
 
       switch (format)
       {
-      case 2:
-        // k_8
+      case 2: // k_8
         widths[0] = 8, n = 1;
         break;
 
-      case 3:
-        // k_1_5_5_5
+      case 3: // k_1_5_5_5
         widths[0] = 5, widths[1] = 5, widths[2] = 5, widths[3] = 1, n = 4;
         break;
 
-      case 4:
-        // k_5_6_5
+      case 4: // k_5_6_5
         widths[0] = 5, widths[1] = 6, widths[2] = 5, n = 3;
         break;
 
-      case 5:
-        // k_6_5_5
+      case 5: // k_6_5_5
         widths[0] = 6, widths[1] = 5, widths[2] = 5, n = 3;
         break;
 
       case 6:
       case 14:
-      case 50:
-        // k_8_8_8_8 (+_A, AS_16)
+      case 50: // k_8_8_8_8 (+_A, AS_16)
         widths[0] = widths[1] = widths[2] = widths[3] = 8, n = 4;
         break;
 
       case 7:
-      case 54:
-        // k_2_10_10_10
+      case 54: // k_2_10_10_10
         widths[0] = widths[1] = widths[2] = 10, widths[3] = 2, n = 4;
         break;
 
-      case 10:
-        // k_8_8
+      case 10: // k_8_8
         widths[0] = widths[1] = 8, n = 2;
         break;
 
-      case 15:
-        // k_4_4_4_4
+      case 15: // k_4_4_4_4
         widths[0] = widths[1] = widths[2] = widths[3] = 4, n = 4;
         break;
 
       case 16:
-      case 55:
-        // k_10_11_11
+      case 55: // k_10_11_11
         widths[0] = widths[1] = 11, widths[2] = 10, n = 3;
         break;
 
       case 17:
-      case 56:
-        // k_11_11_10
+      case 56: // k_11_11_10
         widths[0] = 10, widths[1] = widths[2] = 11, n = 3;
         break;
 
-      case 24:
-        // k_16
+      case 24: // k_16
         widths[0] = 16, n = 1;
         break;
 
-      case 25:
-        // k_16_16
+      case 25: // k_16_16
         widths[0] = widths[1] = 16, n = 2;
         break;
 
-      case 26:
+      case 26: // k_16_16_16_16
       {
-        // k_16_16_16_16
         for (int i = 0; i < 4; ++i)
         {
           float f = std::isnan(v[i]) ? 0.0f : v[i];
@@ -283,34 +256,28 @@ namespace sst::native
         return 8;
       }
 
-      case 30:
-        // k_16_FLOAT
+      case 30: // k_16_FLOAT
         out[0] = FloatToHalf(v[0]);
         return 2;
 
-      case 31:
-        // k_16_16_FLOAT
+      case 31: // k_16_16_FLOAT
         out[0] = FloatToHalf(v[0]) | (uint32_t(FloatToHalf(v[1])) << 16);
         return 4;
 
-      case 32:
-        // k_16_16_16_16_FLOAT
+      case 32: // k_16_16_16_16_FLOAT
         out[0] = FloatToHalf(v[0]) | (uint32_t(FloatToHalf(v[1])) << 16);
         out[1] = FloatToHalf(v[2]) | (uint32_t(FloatToHalf(v[3])) << 16);
         return 8;
 
-      case 36:
-        // k_32_FLOAT
+      case 36: // k_32_FLOAT
         out[0] = AsUint(v[0]);
         return 4;
 
-      case 37:
-        // k_32_32_FLOAT
+      case 37: // k_32_32_FLOAT
         out[0] = AsUint(v[0]), out[1] = AsUint(v[1]);
         return 8;
 
-      case 38:
-        // k_32_32_32_32_FLOAT
+      case 38: // k_32_32_32_32_FLOAT
         for (int i = 0; i < 4; ++i)
           out[i] = AsUint(v[i]);
 
@@ -366,11 +333,7 @@ namespace sst::native
     using V = ucode::AluVectorOpcode;
     using S = ucode::AluScalarOpcode;
 
-    // D3D9: 0 * x = +0
-    inline float Mul(float a, float b)
-    {
-      return (a && b) ? a * b : 0.0f;
-    }
+    inline float Mul(float a, float b) { return (a && b) ? a * b : 0.0f; } // D3D9: 0 * x = +0
 
     // One lane of a vector operation. Returns true if the result is replicated from x.
     inline bool VectorOp(V op, const float (&o)[3][4], float r[4], bool &pred, int32_t &a0)
@@ -787,6 +750,7 @@ namespace sst::native
     bool NeedsPerVertexFlow(const uint32_t *ucode, uint32_t dwords, uint32_t *temp_count)
     {
       using Op = ucode::ControlFlowOpcode;
+
       uint32_t temps = 1;
 
       auto use = [&](uint32_t reg, bool relative)
@@ -795,9 +759,7 @@ namespace sst::native
       };
 
       *temp_count = kTempCount;
-
-      // shrinks to the first exec's instructions
-      uint32_t cf_end = 2 * (dwords / 3);
+      uint32_t cf_end = 2 * (dwords / 3); // shrinks to the first exec's instructions
 
       for (uint32_t cf = 0; cf < cf_end; ++cf)
       {
@@ -962,10 +924,7 @@ namespace sst::native
         }
       };
 
-      float *T(uint32_t reg, uint32_t comp)
-      {
-        return &temps_[(size_t(reg) * 4 + comp) * kLanes];
-      }
+      float *T(uint32_t reg, uint32_t comp) { return &temps_[(size_t(reg) * 4 + comp) * kLanes]; }
 
       uint32_t TempIndex(uint32_t address, bool relative) const
       {
@@ -1004,18 +963,11 @@ namespace sst::native
       uint32_t fetch_lane_base_ = 0;
 
     private:
-      // [reg][component][lane]
-      std::vector<float> temps_;
-
-      // zeroed per batch: the registers the shader uses
-      size_t clear_floats_;
-
-      // previous scalar
-      float ps_[kLanes];
+      std::vector<float> temps_; // [reg][component][lane]
+      size_t clear_floats_;      // zeroed per batch: the registers the shader uses
+      float ps_[kLanes];         // previous scalar
       int32_t a0_[kLanes];
-
-      // lane 0 steers control flow (one lane if it matters)
-      bool pred_[kLanes];
+      bool pred_[kLanes]; // lane 0 steers control flow (one lane if it matters)
       uint32_t vfetch_address_[kLanes];
       State state_;
 
@@ -1029,6 +981,7 @@ namespace sst::native
     void Interpreter::Execute()
     {
       using Op = ucode::ControlFlowOpcode;
+
       uint32_t cf_next = 1;
       uint32_t steps = 0;
 
@@ -1099,8 +1052,7 @@ namespace sst::native
                 }
                 else
                 {
-                  // texture fetches: not supported (zero)
-                  float zero[4][kLanes] = {};
+                  float zero[4][kLanes] = {}; // texture fetches: not supported (zero)
                   StoreFetch(fetch.dest(), fetch.is_dest_relative(), fetch.dest_swizzle(), zero);
                 }
               }
@@ -1143,8 +1095,7 @@ namespace sst::native
 
           if (state_.loop_iterators[d] >= lc.count)
           {
-            // skip the loop
-            cf_next = ls.address();
+            cf_next = ls.address(); // skip the loop
             break;
           }
 
@@ -1214,8 +1165,7 @@ namespace sst::native
         }
 
         case Op::kAlloc:
-          // a new export allocation ends the previous memory export
-          Flush();
+          Flush(); // a new export allocation ends the previous memory export
           break;
 
         default:
@@ -1346,8 +1296,7 @@ namespace sst::native
 
               break;
 
-            default:
-              // kMin
+            default: // kMin
               for (uint32_t l = 0; l < L; ++l)
                 r[l] = std::isless(a[l], b[l]) ? a[l] : b[l];
 
@@ -1356,7 +1305,6 @@ namespace sst::native
           }
         }
         else
-        {
           for (uint32_t l = 0; l < L; ++l)
           {
             float o[3][4], r[4];
@@ -1371,7 +1319,6 @@ namespace sst::native
             for (uint32_t j = 0; j < 4; ++j)
               vr[j][l] = r[j];
           }
-        }
       }
       else
       {
@@ -1444,14 +1391,11 @@ namespace sst::native
         }
 
         auto value = [&](uint32_t j, uint32_t l)
-        {
-          return src[j] ? src[j][l] : fill[j];
-        };
+        { return src[j] ? src[j][l] : fill[j]; };
 
         if (reg == uint32_t(ucode::ExportRegister::kExportAddress))
         {
-          // a new address ends the previous export
-          Flush();
+          Flush(); // a new address ends the previous export
 
           for (uint32_t j = 0; j < 4; ++j)
             for (uint32_t l = 0; l < L; ++l)
@@ -1518,18 +1462,11 @@ namespace sst::native
         const uint32_t s = (swizzle >> (3 * j)) & 7;
 
         if (s <= 3)
-        {
           std::memcpy(d, value[s], lanes_ * sizeof(float));
-        }
         else if (s == 5)
-        {
           std::fill(d, d + lanes_, 1.0f);
-        }
-        else if (s != 7)
-        {
-          // 7 = keep; 4 (and the invalid 6) = 0
+        else if (s != 7) // 7 = keep; 4 (and the invalid 6) = 0
           std::fill(d, d + lanes_, 0.0f);
-        }
       }
     }
 
@@ -1543,11 +1480,11 @@ namespace sst::native
       const auto &full = *reinterpret_cast<const ucode::VertexFetchInstruction *>(state_.vfetch_full);
       const uint32_t slot = full.fetch_constant_index();
       const uint32_t fc0 = c_.fetch_constants[2 * slot], fc1 = c_.fetch_constants[2 * slot + 1];
-
-      // bytes
-      const uint64_t buffer_begin = uint64_t(fc0 & 0x1FFFFFFCu);
-      const uint64_t buffer_end = buffer_begin + (fc1 & 0x03FFFFFCu);
-      const uint32_t endian = fc1 & 3;
+      const bool override = c_.override_data && slot == c_.override_slot;
+      const uint64_t buffer_begin = override ? 0 : uint64_t(fc0 & 0x1FFFFFFCu); // bytes
+      const uint64_t buffer_end = override ? uint64_t(c_.override_size) : buffer_begin + (fc1 & 0x03FFFFFCu);
+      const uint32_t endian = override ? 2u : (fc1 & 3);
+      const uint8_t *const source = override ? c_.override_data : membase_;
       const uint32_t L = lanes_;
 
       if (!instr.is_mini_fetch())
@@ -1590,23 +1527,19 @@ namespace sst::native
       {
         switch (e.format)
         {
-        case 36:
-          // k_32_FLOAT
+        case 36: // k_32_FLOAT
           float_words = 1;
           break;
 
-        case 37:
-          // k_32_32_FLOAT
+        case 37: // k_32_32_FLOAT
           float_words = 2;
           break;
 
-        case 57:
-          // k_32_32_32_FLOAT
+        case 57: // k_32_32_32_FLOAT
           float_words = 3;
           break;
 
-        case 38:
-          // k_32_32_32_32_FLOAT
+        case 38: // k_32_32_32_32_FLOAT
           float_words = 4;
           break;
 
@@ -1615,7 +1548,7 @@ namespace sst::native
         }
       }
 
-      const bool valid = bytes && (fc0 & 3) == 3;
+      const bool valid = bytes && (override || (fc0 & 3) == 3);
       float result[4][kLanes];
 
       for (uint32_t l = 0; l < L; ++l)
@@ -1623,9 +1556,9 @@ namespace sst::native
         const uint64_t first = uint64_t(uint32_t(int32_t(vfetch_address_[l]) + instr.offset())) * 4;
         uint32_t out[4] = {};
 
-        if (valid && first >= buffer_begin && first + bytes <= buffer_end && first + bytes <= kGuestPhysicalSize)
+        if (valid && first >= buffer_begin && first + bytes <= buffer_end && (override || first + bytes <= kGuestPhysicalSize))
         {
-          const uint8_t *p = membase_ + first;
+          const uint8_t *p = source + first;
 
           if (float_words)
           {
@@ -1681,9 +1614,7 @@ namespace sst::native
         const uint32_t format_info = eA[2];
         const uint32_t index = eA[1] & 0x7FFFFF;
         const uint32_t count = eA[3] & 0x7FFFFF;
-
-        // dwords -> bytes, drops the marker bits
-        const uint32_t base = eA[0] << 2;
+        const uint32_t base = eA[0] << 2; // dwords -> bytes, drops the marker bits
         const uint32_t endian = format_info & 7;
         stats_->last_format = (format_info >> 8) & 0x3F;
         stats_->last_base = base;
@@ -1863,11 +1794,8 @@ namespace sst::native
   // Background dispatcher: runs submitted jobs in order (each one split across the pool as usual).
   struct MemexportRunner::Queue
   {
-    explicit Queue(MemexportRunner *runner)
-        : runner(runner), thread([this]
-                                 { Main(); })
-    {
-    }
+    explicit Queue(MemexportRunner *runner) : runner(runner), thread([this]
+                                                                     { Main(); }) {}
 
     ~Queue()
     {
@@ -1915,9 +1843,8 @@ namespace sst::native
           wake.wait(lock, [&]
                     { return quit || !jobs.empty(); });
 
-          // quit with nothing left
           if (jobs.empty())
-            return;
+            return; // quit with nothing left
 
           next = std::move(jobs.front());
           jobs.pop_front();
@@ -1941,13 +1868,10 @@ namespace sst::native
     uint64_t submitted = 0;
     std::atomic<uint64_t> finished{0};
     bool quit = false;
-
-    // last: starts once the rest is constructed
-    std::thread thread;
+    std::thread thread; // last: starts once the rest is constructed
   };
 
-  MemexportRunner::MemexportRunner(uint8_t *physical_membase, uint32_t worker_threads)
-      : membase_(physical_membase)
+  MemexportRunner::MemexportRunner(uint8_t *physical_membase, uint32_t worker_threads) : membase_(physical_membase)
   {
     if (worker_threads)
       pool_ = std::make_unique<Pool>(worker_threads);
@@ -1955,8 +1879,7 @@ namespace sst::native
 
   MemexportRunner::~MemexportRunner()
   {
-    // finishes queued jobs (they use the pool)
-    queue_.reset();
+    queue_.reset(); // finishes queued jobs (they use the pool)
   }
 
   void MemexportRunner::Execute(MemexportJob &job)
@@ -2157,6 +2080,7 @@ namespace sst::native
   bool FloatConstantsRead(const uint32_t *ucode, uint32_t dwords, uint64_t used[4])
   {
     using Op = ucode::ControlFlowOpcode;
+
     used[0] = used[1] = used[2] = used[3] = 0;
     uint32_t cf_end = 2 * (dwords / 3);
 
@@ -2177,9 +2101,8 @@ namespace sst::native
 
       for (uint32_t i = 0; i < e.count() && 3 * size_t(e.address() + i) + 3 <= dwords; ++i)
       {
-        // fetch
         if ((e.sequence() >> (2 * i)) & 1)
-          continue;
+          continue; // fetch
 
         const auto &a = *reinterpret_cast<const ucode::AluInstruction *>(&ucode[3 * (e.address() + i)]);
         const bool scalar_const_op = ucode::GetAluScalarOpcodeInfo(a.scalar_opcode()).operand_count == 2;
@@ -2204,6 +2127,7 @@ namespace sst::native
   uint32_t VertexFetchSlots(const uint32_t *ucode, uint32_t dwords, uint32_t *slots, uint32_t max)
   {
     using Op = ucode::ControlFlowOpcode;
+
     uint32_t n = 0;
     uint32_t cf_end = 2 * (dwords / 3);
 

@@ -1,23 +1,4 @@
 // sst_rematch - D3D trace layer
-//
-// Pass-through hooks on every Xbox D3D function mapped in the project doc
-// native-renderer-d3d-layer.md. Each hook records the call, optionally logs its
-// arguments, then runs the original recompiled function (__imp__sub_XXXXXXXX),
-// so the game behaves exactly as without hooks.
-//
-// Purpose: verify the D3D map against the running game before the native
-// renderer replaces these functions.
-//
-//   --sst_d3d_trace=true          per-frame call counts + first calls' args
-//   --sst_d3d_trace_calls=N       log the first N calls of each function (4)
-//   --sst_d3d_trace_every=N       print a summary every N frames (600)
-//   --sst_dump_shaders=true       write every unique shader container the game
-//                                 creates to <exe>/d3d_trace/shaders/
-//
-// Run 1 findings folded in: 0x82302100 receives pixel-shader containers and
-// 0x82302210 vertex-shader ones; 0x8230C488 is DrawVertices. SetVertexShader /
-// SetPixelShader are named from the object sizes and are *verified* below by
-// tracking which stage created each shader object.
 
 #include "gpu/native/native.h"
 
@@ -44,20 +25,26 @@
 
 REXCVAR_DEFINE_BOOL(sst_d3d_trace, false, "SST",
                     "Trace Xbox D3D calls (pass-through hooks) and log per-frame stats");
+
 REXCVAR_DEFINE_INT32(sst_d3d_trace_calls, 4, "SST",
                      "Log arguments of the first N calls of each traced D3D function");
+
 REXCVAR_DEFINE_INT32(sst_d3d_trace_every, 600, "SST",
                      "Print a D3D call summary every N frames while tracing");
+
 REXCVAR_DEFINE_BOOL(sst_dump_shaders, false, "SST",
                     "Dump every unique shader container passed to Create*Shader");
 
 namespace
 {
   // guest memory helpers
+
+  // Guest data is big-endian. On Windows the 0xE0000000+ physical window sits 0x1000 bytes further into host memory (64KB allocation granularity); the recompiled code adds this via REX_PHYS_HOST_OFFSET and so must we
   inline const uint8_t *GuestPtr(const uint8_t *base, uint32_t addr)
   {
     return base + addr + rex::memory::detail::PhysicalHostOffset(addr);
   }
+
   inline uint32_t be32(const uint8_t *base, uint32_t addr)
   {
     uint32_t v;
@@ -66,12 +53,13 @@ namespace
   }
 
   // traced function table
+
   enum class Arg : uint8_t
   {
     None,  // only count
     Dev,   // r3 = device, log r4..r8
     DevF1, // r3 = device, log r4..r8 and f1
-    NoDev, // r3.. are plain arguments
+    NoDev  // r3.. are plain arguments
   };
 
   struct Fn
@@ -90,7 +78,6 @@ namespace
       {0x82300688, "SetPixelShader", Arg::Dev},
       {0x82300308, "SetVertexShaderConstantF", Arg::Dev},
       {0x823003E8, "SetPixelShaderConstantF", Arg::Dev},
-
       // geometry
       {0x82300CA8, "CreateVertexDeclaration", Arg::NoDev},
       {0x82300BA0, "SetVertexDeclaration", Arg::Dev},
@@ -98,9 +85,9 @@ namespace
       {0x822FDAF8, "SetIndices", Arg::Dev},
       {0x8230C870, "DrawIndexedVertices", Arg::Dev},
       {0x8230C488, "DrawVertices", Arg::Dev},
-      {0x8230BF90, "DrawVerticesUP", Arg::Dev},
+      {0x8230BF90, "BeginVertices", Arg::Dev},
+      {0x8230C430, "EndVertices", Arg::Dev},
       {0x8230C440, "DrawVerticesUP_wrapper", Arg::Dev},
-
       // textures / surfaces
       {0x82307588, "SetTexture", Arg::Dev},
       {0x822FCEE8, "SetSamplerState_A", Arg::Dev},
@@ -110,7 +97,6 @@ namespace
       {0x82307080, "LockRect", Arg::NoDev},
       {0x82305680, "UnlockRect", Arg::NoDev},
       {0x8230D418, "Release", Arg::None},
-
       // targets / frame
       {0x822FE220, "SetRenderTarget", Arg::Dev},
       {0x822FE588, "SetDepthStencilSurface", Arg::Dev},
@@ -125,7 +111,6 @@ namespace
       {0x8230EAA8, "KickOff", Arg::Dev},
       {0x82300D30, "PreSwap", Arg::Dev},
       {0x8230EAB0, "Swap", Arg::Dev},
-
       // render states (r4 = Xbox hardware enum value)
       {0x822FBCF0, "RS_ZEnable", Arg::Dev},
       {0x822FBD30, "RS_ZWriteEnable", Arg::Dev},
@@ -145,6 +130,7 @@ namespace
       {0x822FC070, "RS_ClipPlaneEnable", Arg::Dev},
       {0x822FC288, "RS_ColorWriteEnable", Arg::Dev},
   };
+
   constexpr size_t kNumFns = std::size(kFns);
 
   constexpr size_t IndexOf(uint32_t addr)
@@ -152,6 +138,7 @@ namespace
     for (size_t i = 0; i < kNumFns; ++i)
       if (kFns[i].addr == addr)
         return i;
+
     return kNumFns;
   }
 
@@ -169,7 +156,8 @@ namespace
     std::atomic<uint64_t> frames{0};
     std::atomic<uint32_t> device{0};
 
-    std::mutex mtx;                                   // guards everything below
+    std::mutex mtx; // guards everything below
+
     std::map<std::string, uint64_t> histo;            // "Name = value" -> count
     std::set<uint64_t> shader_hashes[2];              // unique containers per stage
     uint64_t shader_magic_mismatch[2] = {0, 0};       // container stage != function stage
@@ -179,6 +167,7 @@ namespace
     uint64_t set_shader_unknown[2] = {0, 0};
     std::map<std::string, uint64_t> tex_kinds;
   };
+
   Stats &S()
   {
     static Stats s;
@@ -196,19 +185,23 @@ namespace
   void LogCall(size_t i, const PPCContext &ctx)
   {
     const Fn &fn = kFns[i];
+
     switch (fn.args)
     {
     case Arg::None:
       return;
+
     case Arg::Dev:
       REXLOG_INFO("[d3d] {}(dev={:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})", fn.name,
                   ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32);
       return;
+
     case Arg::DevF1:
       REXLOG_INFO("[d3d] {}(dev={:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, f1={})", fn.name,
                   ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
                   ctx.f1.f64);
       return;
+
     case Arg::NoDev:
       REXLOG_INFO("[d3d] {}({:08X}, {:08X}, {:08X}, {:08X}, {:08X})", fn.name, ctx.r3.u32,
                   ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
@@ -221,13 +214,16 @@ namespace
     auto &s = S();
     s.total[i].fetch_add(1, std::memory_order_relaxed);
     s.frame[i].fetch_add(1, std::memory_order_relaxed);
+
     if (!REXCVAR_GET(sst_d3d_trace))
       return;
 
     const Fn &fn = kFns[i];
+
     if (fn.args == Arg::Dev || fn.args == Arg::DevF1)
     {
       uint32_t expected = 0;
+
       if (!s.device.compare_exchange_strong(expected, ctx.r3.u32) && expected != ctx.r3.u32)
       {
         if (s.logged[i].load() == 0)
@@ -235,6 +231,7 @@ namespace
                       ctx.r3.u32, expected);
       }
     }
+
     if (s.logged[i].fetch_add(1) < static_cast<uint32_t>(REXCVAR_GET(sst_d3d_trace_calls)))
       LogCall(i, ctx);
   }
@@ -244,38 +241,45 @@ namespace
   {
     const uint32_t addr = ctx.r3.u32;
     const uint32_t magic = be32(base, addr);
+
     if ((magic & 0xFFFFFF00u) != 0x102A1100u)
     {
       REXLOG_WARN("[d3d] Create shader: {:08X} is not a shader container (magic {:08X})", addr,
                   magic);
       return;
     }
+
     const int stage = (magic & 1) ? kVS : kPS; // 0x102A1101 = VS, 0x102A1100 = PS
     const uint32_t size = be32(base, addr + 4) + be32(base, addr + 8);
+
     if (size == 0 || size > (1u << 20))
       return;
 
     // FNV-1a 64 over the container: identifies unique shaders for the dump
     const uint8_t *p = GuestPtr(base, addr);
     uint64_t h = 0xcbf29ce484222325ull;
+
     for (uint32_t k = 0; k < size; ++k)
       h = (h ^ p[k]) * 0x100000001b3ull;
 
     bool fresh;
+
     {
       std::lock_guard lock(S().mtx);
+
       if (stage != fn_stage)
         ++S().shader_magic_mismatch[fn_stage];
+
       fresh = S().shader_hashes[stage].insert(h).second;
     }
+
     if (fresh && REXCVAR_GET(sst_dump_shaders))
     {
       auto dir = rex::filesystem::GetExecutableFolder() / "d3d_trace" / "shaders";
       std::error_code ec;
       std::filesystem::create_directories(dir, ec);
       char name[48];
-      std::snprintf(name, sizeof(name), "%s_%016llX.bin", stage == kVS ? "VS" : "PS",
-                    static_cast<unsigned long long>(h));
+      std::snprintf(name, sizeof(name), "%s_%016llX.bin", stage == kVS ? "VS" : "PS", static_cast<unsigned long long>(h));
       std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char *>(p), size);
     }
   }
@@ -285,6 +289,7 @@ namespace
   {
     if (!ctx.r3.u32)
       return;
+
     std::lock_guard lock(S().mtx);
     S().shader_objects[ctx.r3.u32] = stage;
   }
@@ -293,11 +298,14 @@ namespace
   void OnSetShader(int fn_stage, const PPCContext &ctx)
   {
     const uint32_t obj = ctx.r4.u32;
+
     if (!obj)
       return;
+
     std::lock_guard lock(S().mtx);
     auto &s = S();
     auto it = s.shader_objects.find(obj);
+
     if (it == s.shader_objects.end())
       ++s.set_shader_unknown[fn_stage];
     else if (it->second == fn_stage)
@@ -311,6 +319,7 @@ namespace
   void OnSetTexture(const PPCContext &ctx, const uint8_t *base)
   {
     const uint32_t tex = ctx.r5.u32;
+
     if (!tex)
       return;
 
@@ -329,6 +338,7 @@ namespace
     std::snprintf(key, sizeof(key), "type=%u fmt=0x%02X dim=%u tiled=%u", type, format, dim, tiled);
     std::lock_guard lock(S().mtx);
     auto &n = S().tex_kinds[key];
+
     if (n++ == 0 && REXCVAR_GET(sst_d3d_trace))
       REXLOG_INFO("[d3d] new texture kind {} (2D size {}x{}) first at {:08X}: "
                   "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
@@ -340,12 +350,15 @@ namespace
   {
     auto &s = S();
     REXLOG_INFO("[d3d] ===== frame {} : calls this frame (total) =====", frame);
+
     for (size_t i = 0; i < kNumFns; ++i)
     {
       const uint64_t t = s.total[i].load();
+
       if (t)
         REXLOG_INFO("[d3d]   {:<30} {:>6} ({})", kFns[i].name, s.frame[i].load(), t);
     }
+
     std::lock_guard lock(s.mtx);
     REXLOG_INFO("[d3d]   unique shader containers: VS {} PS {} (stage mismatches: VS fn {} PS fn {})",
                 s.shader_hashes[kVS].size(), s.shader_hashes[kPS].size(),
@@ -354,8 +367,10 @@ namespace
                 s.set_shader_wrong[kVS], s.set_shader_unknown[kVS]);
     REXLOG_INFO("[d3d]   SetPixelShader  objects: ok {} wrong {} unknown {}", s.set_shader_ok[kPS],
                 s.set_shader_wrong[kPS], s.set_shader_unknown[kPS]);
+
     for (auto &[k, n] : s.histo)
       REXLOG_INFO("[d3d]   value {:<40} x{}", k, n);
+
     for (auto &[k, n] : s.tex_kinds)
       REXLOG_INFO("[d3d]   texture {:<36} x{}", k, n);
   }
@@ -365,8 +380,10 @@ namespace
     auto &s = S();
     const uint64_t frame = s.frames.fetch_add(1) + 1;
     const int every = REXCVAR_GET(sst_d3d_trace_every);
+
     if (REXCVAR_GET(sst_d3d_trace) && every > 0 && frame % static_cast<uint64_t>(every) == 0)
       PrintSummary(frame);
+
     for (auto &f : s.frame)
       f.store(0, std::memory_order_relaxed);
   }
@@ -374,7 +391,7 @@ namespace
   // Arguments for the native renderer, taken before the original call.
   sst::native::HookArgs CaptureArgs(const PPCContext &ctx)
   {
-    return {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.f1.f64};
+    return {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.f1.f64, ctx.r9.u32, ctx.r10.u32};
   }
 
 }
@@ -417,8 +434,9 @@ SST_HOOK(822FD9D8, (void)0, (void)0, const sst::native::HookArgs native_args = C
 SST_TRACE(822FDAF8)
 SST_HOOK(8230C870, Histo(std::string("DrawIndexedVertices prim = ") + std::to_string(ctx.r4.u32)), (void)0, const sst::native::HookArgs native_args = CaptureArgs(ctx), sst::native::OnDrawIndexed(base, native_args))
 SST_HOOK(8230C488, Histo(std::string("DrawVertices prim = ") + std::to_string(ctx.r4.u32)), (void)0, const sst::native::HookArgs native_args = CaptureArgs(ctx), sst::native::OnDraw(base, native_args))
-SST_TRACE_VALUE(8230BF90, "DrawVerticesUP prim")
-SST_HOOK(8230C440, Histo(std::string("DrawVerticesUP_wrapper prim = ") + std::to_string(ctx.r4.u32)), (void)0, const sst::native::HookArgs native_args = CaptureArgs(ctx), sst::native::OnDrawUP(base, native_args))
+SST_HOOK(8230BF90, Histo(std::string("BeginVertices prim = ") + std::to_string(ctx.r4.u32)), (void)0, const sst::native::HookArgs native_args = CaptureArgs(ctx), sst::native::OnBeginVertices(native_args, ctx.r3.u32))
+SST_HOOK(8230C430, (void)0, (void)0, const sst::native::HookArgs native_args = CaptureArgs(ctx), sst::native::OnEndVertices(base, native_args))
+SST_HOOK(8230C440, Histo(std::string("DrawVerticesUP_wrapper prim = ") + std::to_string(ctx.r4.u32)), (void)0, const sst::native::HookArgs native_args = CaptureArgs(ctx), (sst::native::OnDrawUPDone(), sst::native::OnDrawUP(base, native_args)))
 SST_TRACE_EX(82307588, OnSetTexture(ctx, base), (void)0)
 SST_TRACE(822FCEE8)
 SST_TRACE(822FD078)
@@ -432,9 +450,10 @@ SST_TRACE(822FE588)
 SST_TRACE(822FE0E8)
 SST_HOOK(8230A888, (void)0, (void)0, const sst::native::HookArgs native_args = CaptureArgs(ctx), sst::native::OnClear(base, native_args))
 SST_TRACE(823095F0)
-SST_TRACE_VALUE(8230B0B8, "Resolve flags")
-SST_TRACE(82311120)
-SST_TRACE(8230F178)
+// Resolve: the native renderer acts before the original call (the device still holds the render-target state the resolve reads)
+SST_HOOK(8230B0B8, Histo(std::string("Resolve flags = ") + std::to_string(ctx.r4.u32)), (void)0, sst::native::OnResolve(base, CaptureArgs(ctx)), (void)0)
+SST_HOOK(82311120, (void)0, (void)0, sst::native::OnResolveVariant(base, CaptureArgs(ctx)), (void)0)
+SST_HOOK(8230F178, (void)0, (void)0, sst::native::OnSetPredication(base, CaptureArgs(ctx)), (void)0)
 SST_TRACE(8230F780)
 SST_TRACE(8230F2E8)
 SST_TRACE(8230EAA8)

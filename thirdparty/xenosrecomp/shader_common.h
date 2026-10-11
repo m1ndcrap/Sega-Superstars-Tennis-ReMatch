@@ -74,10 +74,10 @@ uint3 getTexture3DDimensions(Texture3D<float4> texture)
     return dimensions;
 }
 
-float3 getWeights3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+float3 getWeights3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
 {
     Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
-    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture3DDimensions(texture) - 0.5));
+    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture3DDimensions(texture) + offset - 0.5));
 }
 
 float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
@@ -158,9 +158,10 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
     return r;
 }
 
-float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
 {
-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+    Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
+    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture3DDimensions(texture));
 }
 
 struct CubeMapData

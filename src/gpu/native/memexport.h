@@ -18,6 +18,11 @@ namespace sst::native
     const uint32_t *bool_constants = nullptr;  // 8 dwords (VS bools 0-127, PS 128-255)
     const uint32_t *loop_constants = nullptr;  // 32 dwords, may be null (= all zero)
     const uint32_t *fetch_constants = nullptr; // 96 slots x 2 dwords (vertex fetch layout)
+
+    // Optional: vertex fetch slot whose data is this host buffer (8-in-32 endian) instead of guest physical memory - DrawVerticesUP / immediate-mode data, which may live in virtual memory
+    const uint8_t *override_data = nullptr;
+    uint32_t override_size = 0;
+    uint32_t override_slot = 96;
   };
 
   struct MemexportStats
@@ -66,6 +71,7 @@ namespace sst::native
 
     // ucode: host-endian microcode (control flow first), `dwords` long
     // Runs the shader once per entry of `vertex_indices` (r0.x = index), writing all memory exports. Returns false if nothing could be run
+    // ucode: host-endian microcode (control flow first), `dwords` long. Runs the shader once per entry of `vertex_indices` (r0.x = index), writing all memory exports. Returns false if nothing could be run
     bool Run(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, MemexportStats *stats, bool force_per_vertex = false);
 
     // Debug: runs an ordinary vertex shader on the CPU and returns each vertex's position export (clip space xyzw, 4 floats per vertex; NaN if the shader didn't export one). Memory exports, if any, are still written.
@@ -82,9 +88,7 @@ namespace sst::native
 
     // Waits until every job up to and including `ticket` has finished.
     void Wait(uint64_t ticket);
-
-    // highest finished ticket
-    uint64_t finished() const;
+    uint64_t finished() const; // highest finished ticket
 
   private:
     struct Pool;

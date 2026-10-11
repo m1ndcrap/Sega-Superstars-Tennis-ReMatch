@@ -19,14 +19,13 @@
 
 namespace sst::native
 {
-
   using Microsoft::WRL::ComPtr;
 
   namespace
   {
     // Bump when the translator, the prelude or the compile options change so stale cache files are rebuilt
-    constexpr uint32_t kCacheVersion = 3; // 2: D3D9 multiply rule; 3: vertex index in r0.x
-    constexpr uint32_t kFileMagic = 0x53535453;
+    constexpr uint32_t kCacheVersion = 4;       // 2: D3D9 multiply rule; 3: vertex index in r0.x; 4: 3D fetch offsets
+    constexpr uint32_t kFileMagic = 0x53535453; // "SSTS"
 
     struct FileHeader
     {
@@ -55,6 +54,7 @@ namespace sst::native
 
       return false;
     }
+
   }
 
   struct Worker
@@ -75,9 +75,9 @@ namespace sst::native
 
     if (FAILED(provider.DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&probe))))
     {
-      REXLOG_ERROR(
-          "[sst-native] dxcompiler.dll not found: shaders can't be compiled. Copy dxcompiler.dll and "
-          "dxil.dll from the Windows SDK (Windows Kits\\10\\bin\\<version>\\x64) next to the exe.");
+      REXLOG_ERROR("[sst-native] dxcompiler.dll not found: shaders can't be compiled. Copy dxcompiler.dll and "
+                   "dxil.dll from the Windows SDK (Windows Kits\\10\\bin\\<version>\\x64) next to the exe.");
+      // Cached shaders still load; new ones fail
     }
 
     const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
@@ -118,6 +118,7 @@ namespace sst::native
   ShaderEntry *ShaderCache::Register(const uint8_t *container, uint32_t size)
   {
     const uint64_t hash = XXH3_64bits(container, size);
+
     {
       std::shared_lock lock(entries_mutex_);
       auto it = entries_.find(hash);
@@ -143,6 +144,7 @@ namespace sst::native
     }
 
     ShaderEntry *raw;
+
     {
       std::unique_lock lock(entries_mutex_);
       auto [it, fresh] = entries_.try_emplace(hash, std::move(entry));
@@ -196,8 +198,8 @@ namespace sst::native
     }
 
     ShaderVariant *variant;
-
     bool queue = false;
+
     {
       std::lock_guard lock(entry->variants_mutex);
       auto &slot = entry->variants[spec];
@@ -214,6 +216,7 @@ namespace sst::native
     if (queue)
     {
       pending_.fetch_add(1);
+
       {
         std::lock_guard lock(queue_mutex_);
         queue_.push_back({entry, spec, variant});
@@ -240,12 +243,12 @@ namespace sst::native
       fn(GetCurrentThread(), name);
     }
 #endif
-
     Worker worker;
 
     for (;;)
     {
       Job job;
+
       {
         std::unique_lock lock(queue_mutex_);
         queue_cv_.wait(lock, [this]
@@ -340,7 +343,6 @@ namespace sst::native
         L"-Qstrip_reflect",
         L"-Qstrip_debug",
     };
-
     DxcBuffer buffer = {source.data(), source.size(), DXC_CP_UTF8};
     ComPtr<IDxcResult> result;
     HRESULT status = E_FAIL;
@@ -365,9 +367,8 @@ namespace sst::native
     variant.dxil.assign(bytes, bytes + object->GetBufferSize());
 
     if (!IsSigned(variant.dxil) && !stats_.unsigned_warned.exchange(true))
-      REXLOG_WARN(
-          "[sst-native] DXIL is unsigned: dxil.dll was not found next to dxcompiler.dll. D3D12 will "
-          "reject these shaders; copy dxil.dll from the Windows SDK next to the exe.");
+      REXLOG_WARN("[sst-native] DXIL is unsigned: dxil.dll was not found next to dxcompiler.dll. D3D12 will "
+                  "reject these shaders; copy dxil.dll from the Windows SDK next to the exe.");
 
     stats_.compiled.fetch_add(1);
     stats_.compile_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
@@ -378,11 +379,13 @@ namespace sst::native
       const FileHeader header = {kFileMagic, kCacheVersion, tr.spec_constants_mask, uint32_t(variant.dxil.size())};
       auto tmp = path;
       tmp += ".tmp";
+
       {
         std::ofstream out(tmp, std::ios::binary);
         out.write(reinterpret_cast<const char *>(&header), sizeof(header));
         out.write(reinterpret_cast<const char *>(variant.dxil.data()), std::streamsize(variant.dxil.size()));
       }
+
       std::error_code ec;
       std::filesystem::rename(tmp, path, ec);
     }
@@ -394,10 +397,8 @@ namespace sst::native
   {
     const uint32_t compiled = stats_.compiled.load();
     const uint64_t us = stats_.compile_us.load();
-    REXLOG_INFO(
-        "[sst-native] shaders {}: {} unique ({} memexport skipped), {} from disk cache, {} compiled "
-        "(avg {:.1f} ms), {} failed, {} pending",
-        when, stats_.registered.load(), stats_.memexport.load(), stats_.from_disk.load(), compiled,
-        compiled ? double(us) / compiled / 1000.0 : 0.0, stats_.failed.load(), pending_.load());
+    REXLOG_INFO("[sst-native] shaders {}: {} unique ({} memexport skipped), {} from disk cache, {} compiled "
+                "(avg {:.1f} ms), {} failed, {} pending",
+                when, stats_.registered.load(), stats_.memexport.load(), stats_.from_disk.load(), compiled, compiled ? double(us) / compiled / 1000.0 : 0.0, stats_.failed.load(), pending_.load());
   }
 }

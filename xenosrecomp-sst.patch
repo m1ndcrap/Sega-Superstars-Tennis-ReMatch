@@ -15,7 +15,7 @@ index e505a5e..efbd4d0 100644
      target_compile_definitions(XenosRecomp PRIVATE XENOS_RECOMP_DXIL)
      target_link_libraries(XenosRecomp PRIVATE Microsoft::DXIL)
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..0a0488d 100644
+index 1c74034..38291d0 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
 @@ -30,6 +30,7 @@ struct PushConstants
@@ -47,17 +47,30 @@ index 1c74034..0a0488d 100644
 +    return dimensions;
 +}
 +
-+float3 getWeights3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
++float3 getWeights3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
 +{
 +    Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
-+    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture3DDimensions(texture) - 0.5));
++    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture3DDimensions(texture) + offset - 0.5));
 +}
 +
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+@@ -143,9 +158,10 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     return r;
+ }
+ 
+-float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
++float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
+ {
+-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
++    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture3DDimensions(texture));
+ }
+ 
+ struct CubeMapData
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..ab849a3 100644
+index 698a418..67e0fb9 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -115,7 +115,14 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
@@ -76,7 +89,20 @@ index 698a418..ab849a3 100644
  };
  
  static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
-@@ -449,6 +456,40 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -339,6 +346,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     case TextureDimension::Texture2D:
+         print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
+         break;
++#ifdef SST_RECOMP
++    case TextureDimension::Texture3D:
++        // SST: keep the texel offsets of 3D fetches as well (shadow-map PCF taps).
++        print(", float3({}, {}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f, instr.offsetZ * 0.5f);
++        break;
++#endif
+     case TextureDimension::TextureCube:
+         out += ", cubeMapData";
+         break;
+@@ -449,6 +462,40 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
  
              std::string regFormatted;
  
@@ -117,7 +143,7 @@ index 698a418..ab849a3 100644
              if (select)
              {
                  regFormatted = fmt::format("r{}", reg);
-@@ -471,18 +512,28 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -471,18 +518,28 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                      #endif
                          {
                              regFormatted = fmt::format("{}({}{})", constantName,
@@ -147,7 +173,7 @@ index 698a418..ab849a3 100644
                      regFormatted = fmt::format("c{}", reg);
                  }
              }
-@@ -626,6 +677,15 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -626,6 +683,15 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              default:
              {
                  auto findResult = interpolators.find(instr.vectorDest);
@@ -163,7 +189,7 @@ index 698a418..ab849a3 100644
                  assert(findResult != interpolators.end());
                  exportRegister = findResult->second;
                  break;
-@@ -698,7 +758,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -698,7 +764,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              break;
  
          case AluVectorOpcode::Mul:
@@ -175,7 +201,7 @@ index 698a418..ab849a3 100644
              break;
  
          case AluVectorOpcode::Max:
-@@ -739,7 +803,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -739,7 +809,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              break;
  
          case AluVectorOpcode::Mad:
@@ -187,7 +213,7 @@ index 698a418..ab849a3 100644
              break;
  
          case AluVectorOpcode::CndEq:
-@@ -756,11 +824,19 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -756,11 +830,19 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
  
          case AluVectorOpcode::Dp4:
          case AluVectorOpcode::Dp3:
@@ -207,7 +233,7 @@ index 698a418..ab849a3 100644
              break;
  
          case AluVectorOpcode::Cube:
-@@ -866,12 +942,20 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -866,12 +948,20 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              break;
  
          case AluScalarOpcode::Muls:
@@ -228,7 +254,7 @@ index 698a418..ab849a3 100644
              break;
  
          case AluScalarOpcode::Maxs:
-@@ -990,7 +1074,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -990,7 +1080,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
  
          case AluScalarOpcode::Mulsc0:
          case AluScalarOpcode::Mulsc1:
@@ -240,7 +266,7 @@ index 698a418..ab849a3 100644
              break;
  
          case AluScalarOpcode::Addsc0:
-@@ -1113,6 +1201,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1113,6 +1207,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
      constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
  
@@ -255,7 +281,7 @@ index 698a418..ab849a3 100644
      out += "#ifdef __spirv__\n\n";
  
  #ifdef UNLEASHED_RECOMP
-@@ -1187,8 +1283,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1187,8 +1289,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  
@@ -277,7 +303,7 @@ index 698a418..ab849a3 100644
      println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
      out += "{\n";
  
-@@ -1346,6 +1455,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1346,6 +1461,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
      #endif
@@ -289,7 +315,7 @@ index 698a418..ab849a3 100644
  
          out += "\tout float4 oPos : SV_Position";
  
-@@ -1471,6 +1585,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1471,6 +1591,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
              }
@@ -303,7 +329,7 @@ index 698a418..ab849a3 100644
          #endif
              else
              {
-@@ -1479,6 +1600,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1479,6 +1606,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  

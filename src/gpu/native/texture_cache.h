@@ -38,6 +38,17 @@ namespace sst::native
 
     // fetch: the 6 fetch constant dwords (host endian). fetch_dimension: the xenos::FetchOpDimension the shader samples with. Records uploads on `list`. Returns the SRV heap index, or kNone (bind a placeholder)
     uint32_t GetTexture(ID3D12GraphicsCommandList *list, const AllocateFn &allocate, const uint32_t fetch[6], uint32_t fetch_dimension);
+    // Render-target resolve destinations: textures the renderer draws itself. A fetch constant whose base address is a registered page samples this resource (when the size matches) instead of guest memory
+    struct External
+    {
+      ID3D12Resource *resource = nullptr;
+      uint32_t dxgi_format = 0;
+      uint32_t width = 0, height = 0, slices = 1;
+      bool volume = false; // Texture3D (stacked textures sampled with 3D fetches)
+    };
+
+    void SetExternal(uint32_t base_page, const External &e);
+    void RemoveExternal(uint32_t base_page);
 
     // Sampler heap index for the fetch constant + the shader's overrides
     uint32_t GetSampler(const uint32_t fetch[6], const TextureFetchUse &use);
@@ -92,6 +103,14 @@ namespace sst::native
     std::unordered_map<uint64_t, uint32_t> samplers_;
 
     std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
+    struct ExternalEntry
+    {
+      External info;
+      std::unordered_map<uint32_t, uint32_t> views; // swizzle | kind << 12 -> SRV slot
+    };
+
+    std::unordered_map<uint32_t, ExternalEntry> externals_;
+    uint32_t GetExternalView(ExternalEntry &e, uint32_t guest_format, uint32_t swizzle, uint32_t fetch_dimension, uint32_t width, uint32_t height);
     std::vector<Deferred> deferred_;
     uint64_t frame_ = 0, frame_fence_ = 0;
     uint64_t total_bytes_ = 0;
@@ -102,7 +121,7 @@ namespace sst::native
       uint64_t created = 0, uploads = 0, reuploads = 0, upload_bytes = 0, hashed_bytes = 0;
       double upload_ms = 0, hash_ms = 0;
       uint64_t unsupported = 0, bad = 0, dimension_mismatch = 0, evicted = 0, srv_full = 0, sampler_full = 0, failed = 0;
-      uint64_t lookups = 0, deferred_loads = 0, checks_skipped = 0;
+      uint64_t lookups = 0, deferred_loads = 0, checks_skipped = 0, external_hits = 0, external_mismatch = 0;
       uint32_t logged = 0;
     } stats_;
 

@@ -499,9 +499,7 @@ namespace sst::native
       ++stats_.failed;
 
       if (LogOnce(0x100000000ull | hash))
-        REXLOG_WARN("[sst-native] texture: failed to create {}x{}x{} {} mips {} (DXGI {})",
-                    t->host_width, t->host_height, desc.DepthOrArraySize, FormatName(k.format),
-                    t->levels, uint32_t(format));
+        REXLOG_WARN("[sst-native] texture: failed to create {}x{}x{} {} mips {} (DXGI {})", t->host_width, t->host_height, desc.DepthOrArraySize, FormatName(k.format), t->levels, uint32_t(format));
 
       return nullptr;
     }
@@ -520,17 +518,11 @@ namespace sst::native
       ++stats_.logged;
       REXLOG_INFO("[sst-native] texture #{}: {}x{}{} {} {} {}, mips {}-{}{}, base {:08X} ({} bytes), "
                   "mips {:08X} ({} bytes), endian {}{} -> DXGI {}",
-                  stats_.created, k.width, k.height,
-                  dim == xenos::DataDimension::k3D     ? fmt::format("x{}", k.depth_or_array)
-                  : dim == xenos::DataDimension::kCube ? std::string(" cube")
-                  : k.depth_or_array > 1               ? fmt::format(" [{}]", k.depth_or_array)
-                                                       : std::string(),
-                  FormatName(k.format), k.tiled ? "tiled" : "linear",
-                  fmt::format("pitch {}", k.pitch << 5), k.mip_min, k.mip_max,
-                  k.packed ? " (packed tail)" : "", k.base_page << 12, t->base_size,
-                  k.mip_page << 12, t->mip_size, k.endian,
-                  k.signed_mode == 1 ? ", signed" : k.signed_mode == 2 ? ", sRGB"
-                                                                       : "",
+                  stats_.created, k.width, k.height, dim == xenos::DataDimension::k3D ? fmt::format("x{}", k.depth_or_array) : dim == xenos::DataDimension::kCube ? std::string(" cube")
+                                                                                                                           : k.depth_or_array > 1                 ? fmt::format(" [{}]", k.depth_or_array)
+                                                                                                                                                                  : std::string(),
+                  FormatName(k.format), k.tiled ? "tiled" : "linear", fmt::format("pitch {}", k.pitch << 5), k.mip_min, k.mip_max, k.packed ? " (packed tail)" : "", k.base_page << 12, t->base_size, k.mip_page << 12, t->mip_size, k.endian, k.signed_mode == 1 ? ", signed" : k.signed_mode == 2 ? ", sRGB"
+                                                                                                                                                                                                                                                                                                    : "",
                   uint32_t(format));
     }
 
@@ -738,8 +730,7 @@ namespace sst::native
       ++stats_.unsupported;
 
       if (LogOnce(0x200000000ull | format))
-        REXLOG_WARN("[sst-native] texture: format {} ({}) not supported yet (placeholder)", format,
-                    FormatName(format));
+        REXLOG_WARN("[sst-native] texture: format {} ({}) not supported yet (placeholder)", format, FormatName(format));
 
       return kNone;
     }
@@ -753,8 +744,16 @@ namespace sst::native
       return kNone;
     }
 
-    const auto dim = tf.dimension;
+    // Drawn by the renderer (render-target resolve destination)?
+    if (!externals_.empty())
+    {
+      auto it = externals_.find((fetch[1] >> 12) & 0x1FFFF);
 
+      if (it != externals_.end())
+        return GetExternalView(it->second, format, tf.swizzle, fetch_dimension, wm1 + 1, hm1 + 1);
+    }
+
+    const auto dim = tf.dimension;
     // Shader dimension (FetchOpDimension: 0 1D, 1 2D, 2 3D/stacked, 3 cube) vs the texture
     uint32_t view_kind = 0; // 0 2D, 1 3D, 2 cube
     bool compatible = false;
@@ -816,13 +815,8 @@ namespace sst::native
     if (used_signs & ~1u)
     {
       if (LogOnce(0x400000000ull | (uint64_t(format) << 8) | used_signs))
-        REXLOG_INFO("[sst-native] texture: {} with signs {}{}{}{} (swizzle {}{}{}{}): {}", FormatName(format),
-                    signs[0], signs[1], signs[2], signs[3], kSwizzleChars[swizzle & 7],
-                    kSwizzleChars[(swizzle >> 3) & 7], kSwizzleChars[(swizzle >> 6) & 7],
-                    kSwizzleChars[(swizzle >> 9) & 7],
-                    signed_mode == 1   ? "signed format"
-                    : signed_mode == 2 ? "sRGB format"
-                                       : "sampled as unsigned (not emulated yet)");
+        REXLOG_INFO("[sst-native] texture: {} with signs {}{}{}{} (swizzle {}{}{}{}): {}", FormatName(format), signs[0], signs[1], signs[2], signs[3], kSwizzleChars[swizzle & 7], kSwizzleChars[(swizzle >> 3) & 7], kSwizzleChars[(swizzle >> 6) & 7], kSwizzleChars[(swizzle >> 9) & 7], signed_mode == 1 ? "signed format" : signed_mode == 2 ? "sRGB format"
+                                                                                                                                                                                                                                                                                                                                                  : "sampled as unsigned (not emulated yet)");
     }
 
     if (tf.exp_adjust != 0 && LogOnce(0x500000000ull | uint32_t(tf.exp_adjust & 63)))
@@ -926,9 +920,8 @@ namespace sst::native
     for (uint32_t i = 0; i < 4; ++i)
     {
       const uint32_t v = (swizzle >> (3 * i)) & 7;
-      const uint32_t c = v < 4    ? (hf.swizzle >> (3 * v)) & 7
-                         : v == 5 ? D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1
-                                  : D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0;
+      const uint32_t c = v < 4 ? (hf.swizzle >> (3 * v)) & 7 : v == 5 ? D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1
+                                                                      : D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0;
       mapping |= c << (3 * i);
     }
 
@@ -963,16 +956,98 @@ namespace sst::native
     return slot;
   }
 
+  void TextureCache::SetExternal(uint32_t base_page, const External &e)
+  {
+    RemoveExternal(base_page);
+    externals_[base_page].info = e;
+  }
+
+  void TextureCache::RemoveExternal(uint32_t base_page)
+  {
+    auto it = externals_.find(base_page);
+
+    if (it == externals_.end())
+      return;
+
+    Deferred d;
+    d.fence = frame_fence_;
+
+    for (const auto &[view, slot] : it->second.views)
+      d.slots.push_back(slot);
+
+    deferred_.push_back(std::move(d));
+    externals_.erase(it);
+  }
+
+  uint32_t TextureCache::GetExternalView(ExternalEntry &e, uint32_t guest_format, uint32_t swizzle, uint32_t fetch_dimension, uint32_t width, uint32_t height)
+  {
+    // 2D fetches read 2D textures; 3D fetches read volumes (stacked textures the renderer keeps as Texture3D)
+    const bool want_volume = fetch_dimension == 2;
+
+    if (fetch_dimension != 1 && fetch_dimension != 2)
+      return kNone;
+
+    if (want_volume != e.info.volume || width > e.info.width || height > e.info.height)
+    {
+      ++stats_.external_mismatch;
+
+      if (LogOnce(0x600000000ull ^ (uint64_t(width) << 16) ^ height ^ (uint64_t(fetch_dimension) << 30)))
+        REXLOG_WARN("[sst-native] texture: resolved texture sampled as {} {}x{} but it is {} {}x{}", want_volume ? "3D" : "2D", width, height, e.info.volume ? "3D" : "2D", e.info.width, e.info.height);
+
+      return kNone;
+    }
+
+    ++stats_.external_hits;
+    const uint32_t view_key = swizzle | (uint32_t(want_volume) << 12);
+
+    if (auto it = e.views.find(view_key); it != e.views.end())
+      return it->second;
+
+    const uint32_t slot = AllocateSrvSlot();
+
+    if (slot == kNone)
+      return kNone;
+
+    const HostFormat hf = GetHostFormat(guest_format);
+    const uint16_t data_swizzle = hf.load != Load::kNone ? hf.swizzle : kRGBA;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT(e.info.dxgi_format);
+    uint32_t mapping = 0;
+
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+      const uint32_t v = (swizzle >> (3 * i)) & 7;
+      const uint32_t c = v < 4 ? (data_swizzle >> (3 * v)) & 7 : v == 5 ? D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1
+                                                                        : D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0;
+      mapping |= c << (3 * i);
+    }
+
+    sd.Shader4ComponentMapping = mapping | (1u << 12);
+
+    if (want_volume)
+    {
+      sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+      sd.Texture3D.MipLevels = 1;
+    }
+    else
+    {
+      sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      sd.Texture2D.MipLevels = 1;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += size_t(slot) * srv_size_;
+    device_->CreateShaderResourceView(e.info.resource, &sd, h);
+    e.views.emplace(view_key, slot);
+    return slot;
+  }
+
   uint32_t TextureCache::GetSampler(const uint32_t fetch[6], const TextureFetchUse &use)
   {
     xenos::xe_gpu_texture_fetch_t tf;
     std::memcpy(&tf, fetch, sizeof(tf));
-
     auto pick = [](uint8_t over, uint32_t base)
-    {
-      return over != 3 ? uint32_t(over) : base;
-    };
-
+    { return over != 3 ? uint32_t(over) : base; };
     const uint32_t mag = pick(use.mag_filter, uint32_t(tf.mag_filter)) & 3;
     const uint32_t min = pick(use.min_filter, uint32_t(tf.min_filter)) & 3;
     const uint32_t mip = pick(use.mip_filter, uint32_t(tf.mip_filter)) & 3;
@@ -1038,16 +1113,9 @@ namespace sst::native
 
   std::string TextureCache::StatusLine() const
   {
-    return fmt::format(
-        "textures: {} live ({} MB), {} lookups, created {}, uploads {} (re-uploads {}) {:.1f} MB "
-        "in {:.1f} ms, hashed {:.1f} MB in {:.1f} ms, unsupported {}, bad {}, dimension "
-        "mismatches {}, failed {}, evicted {}, loads deferred {}, checks skipped (stable) {}, samplers {}{}{}",
-        textures_.size(), total_bytes_ >> 20, stats_.lookups, stats_.created, stats_.uploads,
-        stats_.reuploads, double(stats_.upload_bytes) / (1 << 20), stats_.upload_ms,
-        double(stats_.hashed_bytes) / (1 << 20), stats_.hash_ms, stats_.unsupported, stats_.bad,
-        stats_.dimension_mismatch, stats_.failed, stats_.evicted, stats_.deferred_loads, stats_.checks_skipped, samplers_.size(),
-        stats_.srv_full ? fmt::format(", SRV heap full x{}", stats_.srv_full) : std::string(),
-        stats_.sampler_full ? fmt::format(", sampler heap full x{}", stats_.sampler_full)
-                            : std::string());
+    return fmt::format("textures: {} live ({} MB), {} lookups, created {}, uploads {} (re-uploads {}) {:.1f} MB "
+                       "in {:.1f} ms, hashed {:.1f} MB in {:.1f} ms, unsupported {}, bad {}, dimension "
+                       "mismatches {}, failed {}, evicted {}, loads deferred {}, checks skipped (stable) {}, resolved-texture reads {} (size mismatches {}), samplers {}{}{}",
+                       textures_.size(), total_bytes_ >> 20, stats_.lookups, stats_.created, stats_.uploads, stats_.reuploads, double(stats_.upload_bytes) / (1 << 20), stats_.upload_ms, double(stats_.hashed_bytes) / (1 << 20), stats_.hash_ms, stats_.unsupported, stats_.bad, stats_.dimension_mismatch, stats_.failed, stats_.evicted, stats_.deferred_loads, stats_.checks_skipped, stats_.external_hits, stats_.external_mismatch, samplers_.size(), stats_.srv_full ? fmt::format(", SRV heap full x{}", stats_.srv_full) : std::string(), stats_.sampler_full ? fmt::format(", sampler heap full x{}", stats_.sampler_full) : std::string());
   }
 }

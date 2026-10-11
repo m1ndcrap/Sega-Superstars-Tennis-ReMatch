@@ -29,7 +29,7 @@
 #include <cmath>
 #include <cstring>
 
-REXCVAR_DEFINE_BOOL(sst_native_quads, false, "SST",
+REXCVAR_DEFINE_BOOL(sst_native_quads, true, "SST",
                     "Native renderer: draw QUADLIST / TRIFAN primitives (converted to triangle "
                     "lists). Off until textures work: full-screen passes would cover the scene");
 
@@ -55,6 +55,15 @@ REXCVAR_DEFINE_BOOL(sst_native_pipeline_async, true, "SST",
 REXCVAR_DEFINE_BOOL(sst_native_pipeline_library, true, "SST",
                     "Native renderer: keep created pipelines in cache/pipelines.bin so later runs "
                     "load them instead of compiling");
+
+REXCVAR_DEFINE_INT32(sst_native_rt_trace, 0, "SST",
+                     "Native renderer debug: log the render-target passes, clears and resolves of "
+                     "this frame number (F10 traces the next frame)");
+
+REXCVAR_DEFINE_BOOL(sst_native_render_targets, true, "SST",
+                    "Native renderer: emulate render targets and resolves (shadows, bloom, "
+                    "post-processing). false = everything drawn straight into the output "
+                    "(the earlier mode, with --sst_native_rt choosing targets)");
 
 REXCVAR_DEFINE_BOOL(sst_native_memexport_async, true, "SST",
                     "Native renderer: run memory-export (morph) shaders on a background thread; "
@@ -138,7 +147,7 @@ namespace sst::native
 
     // Heap slots below these are placeholders / default samplers; the rest belong to the texture cache
     constexpr uint32_t kSrvHeapSize = 65536, kSamplerHeapSize = 2048;
-    constexpr uint32_t kSrvReserved = 16, kSamplerReserved = 16;
+    constexpr uint32_t kSrvReserved = 512, kSamplerReserved = 16;
 
     // F9 capture: stream-output buffer (data, then one 16-byte counter per draw)
     constexpr size_t kSoDataBytes = 48u << 20; // 3M vertices
@@ -334,6 +343,10 @@ namespace sst::native
     uint8_t cull, front_ccw;
     uint8_t topology_type; // D3D12_PRIMITIVE_TOPOLOGY_TYPE
     uint8_t strip_cut;     // 0 none, 1 0xFFFF, 2 0xFFFFFFFF
+    uint8_t rtv_format;    // DXGI_FORMAT of the colour target (0: the output, legacy mode)
+    uint8_t dsv;           // 0 legacy depth buffer, 1 none, 2 D32_FLOAT_S8X24
+    int32_t depth_bias;    // polygon offset (D3D12 integer units)
+    float slope_bias;      // polygon offset scale (per pixel)
   };
 
   // Pipelines are compiled on background threads (PipelineWorkers) and kept in an ID3D12PipelineLibrary saved to cache/pipelines.bin, so a pipeline is only ever compiled once per machine / driver. Until a new one is ready, draws that need it are skipped (no stall when a court loads).
@@ -646,6 +659,10 @@ namespace sst::native
     CreateDebugPixelShader();
     CreateTimestampQueries();
 
+    if (!CreateBlitResources())
+      REXLOG_WARN("[sst-native] render-target resources unavailable: drawing into the output "
+                  "only");
+
     if (!CreateDescriptorsAndPlaceholders())
     {
       REXLOG_ERROR("[sst-native] failed to create placeholder textures");
@@ -922,6 +939,11 @@ namespace sst::native
 
     geo_pool_.Reset();
     geo_entries_.clear();
+    color_rts_.clear();
+    depth_rts_.clear();
+    resolved_.clear();
+    retired_rts_.clear();
+    blit_pipelines_.clear();
     textures_.reset();
     list_.Reset();
 
@@ -1007,6 +1029,897 @@ namespace sst::native
       f.page = f.pages.size() - 1;
       f.offset = 0;
     }
+  }
+
+  // render targets: host textures, resolve copies, presenting
+  namespace
+  {
+    constexpr uint32_t kRtRtvCount = 256, kRtDsvCount = 64;
+    constexpr uint32_t kRtSrvFirst = 16; // renderer-owned SRV slots: [16, kSrvReserved)
+
+    // Host format of a guest colour render-target format (RB_COLOR_INFO bits 16-19).
+    DXGI_FORMAT ColorTargetFormat(uint32_t format)
+    {
+      switch (format)
+      {
+      case 0: // k_8_8_8_8
+      case 1: // k_8_8_8_8_GAMMA
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+
+      case 2:  // k_2_10_10_10
+      case 10: // k_2_10_10_10_AS_10_10_10_10
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+
+      case 3:  // k_2_10_10_10_FLOAT
+      case 12: // k_2_10_10_10_FLOAT_AS_16_16_16_16
+      case 5:  // k_16_16_16_16 (-32..32 fixed point)
+      case 7:  // k_16_16_16_16_FLOAT
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+      case 4: // k_16_16
+      case 6: // k_16_16_FLOAT
+        return DXGI_FORMAT_R16G16_FLOAT;
+
+      case 14: // k_32_FLOAT
+        return DXGI_FORMAT_R32_FLOAT;
+
+      case 15: // k_32_32_FLOAT
+        return DXGI_FORMAT_R32G32_FLOAT;
+
+      default:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+      }
+    }
+
+    // Host format of a resolve destination (guest texture format).
+    DXGI_FORMAT ResolveTextureFormat(uint32_t format)
+    {
+      switch (format)
+      {
+      case 22: // k_24_8
+      case 23: // k_24_8_FLOAT
+      case 36: // k_32_FLOAT
+        return DXGI_FORMAT_R32_FLOAT;
+
+      case 7:  // k_2_10_10_10
+      case 54: // k_2_10_10_10_AS_16_16_16_16
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+
+      case 32: // k_16_16_16_16_FLOAT
+      case 26:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+      case 31:
+      case 25:
+        return DXGI_FORMAT_R16G16_FLOAT;
+
+      default: // k_8_8_8_8 and anything else
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+      }
+    }
+
+    const D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+  }
+
+  bool Renderer::RenderTargetsEnabled() const
+  {
+    return REXCVAR_GET(sst_native_render_targets) && rt_rtv_heap_ && blit_root_;
+  }
+
+  D3D12_CPU_DESCRIPTOR_HANDLE Renderer::RtRtv(uint32_t index) const
+  {
+    D3D12_CPU_DESCRIPTOR_HANDLE h = rt_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += size_t(index) * rtv_size_;
+    return h;
+  }
+
+  D3D12_CPU_DESCRIPTOR_HANDLE Renderer::RtDsv(uint32_t index) const
+  {
+    D3D12_CPU_DESCRIPTOR_HANDLE h = rt_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += size_t(index) * dsv_size_;
+    return h;
+  }
+
+  D3D12_GPU_DESCRIPTOR_HANDLE Renderer::SrvGpu(uint32_t slot) const
+  {
+    D3D12_GPU_DESCRIPTOR_HANDLE h = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    h.ptr += size_t(slot) * srv_size_;
+    return h;
+  }
+
+  uint32_t Renderer::AllocateRtSrv()
+  {
+    if (rt_srv_next_ < kRtSrvFirst)
+      rt_srv_next_ = kRtSrvFirst;
+
+    return rt_srv_next_ < kSrvReserved ? rt_srv_next_++ : 0;
+  }
+
+  void Renderer::SetRTState(HostRT &rt, D3D12_RESOURCE_STATES state)
+  {
+    if (rt.state == state)
+      return;
+
+    auto b = Transition(rt.resource.Get(), rt.state, state);
+    list_->ResourceBarrier(1, &b);
+    rt.state = state;
+  }
+
+  Renderer::HostRT *Renderer::GetHostRT(const uint8_t *base, uint32_t surface, bool depth, uint32_t min_width, uint32_t min_height)
+  {
+    if (!PlausibleAddress(surface))
+      return nullptr;
+
+    auto &map = depth ? depth_rts_ : color_rts_;
+
+    // Logical size: the surface's own size (size word at +0x24) or what is drawn into it, whichever is larger.
+    const uint32_t size = be32(base, surface + 0x24);
+    const uint32_t sw = (size >> 18) + 1, sh = ((size >> 3) & 0x7FFF) + 1;
+    const uint32_t w = std::clamp(std::max(sw, min_width), 1u, 4096u);
+    const uint32_t h = std::clamp(std::max(sh, min_height), 1u, 4096u);
+    const uint32_t guest_format = (be32(base, surface + 0x1C) >> 16) & 0xF;
+    auto it = map.find(surface);
+
+    if (it != map.end())
+    {
+      HostRT &rt = it->second;
+
+      if (rt.width >= w && rt.height >= h && (depth || rt.guest_format == guest_format))
+        return &rt;
+
+      // Grows (or changes format): make a new one; the old one may still be in use by submitted frames, so keep it alive until the GPU is done.
+      if (!depth && rt.guest_format != guest_format && LogOnce(0xA800000000000000ull ^ (uint64_t(surface) << 8) ^ guest_format))
+        REXLOG_INFO("[sst-native] render target {:08X} changed format {} -> {}", surface, rt.guest_format, guest_format);
+
+      retired_rts_.push_back({fence_value_ + 1, rt.resource});
+    }
+
+    HostRT rt;
+    rt.depth = depth;
+    rt.width = std::max(w, it != map.end() ? it->second.width : 0u);
+    rt.height = std::max(h, it != map.end() ? it->second.height : 0u);
+    rt.guest_format = guest_format;
+    rt.format = depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : ColorTargetFormat(guest_format);
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = rt.width;
+    desc.Height = rt.height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = depth ? DXGI_FORMAT_R32G8X24_TYPELESS : rt.format;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = rt.format;
+    rt.state = depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, rt.state, &clear, IID_PPV_ARGS(&rt.resource))))
+    {
+      if (LogOnce(0xA900000000000000ull ^ surface))
+        REXLOG_WARN("[sst-native] could not create the {}x{} {} target for surface {:08X}", rt.width, rt.height, depth ? "depth" : "colour", surface);
+
+      return nullptr;
+    }
+
+    // Views: reuse the slots of the target being replaced.
+    if (it != map.end())
+    {
+      rt.view = it->second.view;
+      rt.srv = it->second.srv;
+    }
+    else
+    {
+      rt.view = depth ? rt_dsv_next_++ : rt_rtv_next_++;
+      rt.srv = AllocateRtSrv();
+
+      if ((depth && rt.view >= kRtDsvCount) || (!depth && rt.view >= kRtRtvCount) || !rt.srv)
+      {
+        if (LogOnce(0xAA00000000000000ull))
+          REXLOG_WARN("[sst-native] out of render-target descriptors");
+
+        return nullptr;
+      }
+    }
+
+    if (depth)
+    {
+      D3D12_DEPTH_STENCIL_VIEW_DESC dd = {};
+      dd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+      dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+      device_->CreateDepthStencilView(rt.resource.Get(), &dd, RtDsv(rt.view));
+    }
+    else
+    {
+      device_->CreateRenderTargetView(rt.resource.Get(), nullptr, RtRtv(rt.view));
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = depth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : rt.format;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE srv_handle = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+    srv_handle.ptr += size_t(rt.srv) * srv_size_;
+    device_->CreateShaderResourceView(rt.resource.Get(), &sd, srv_handle);
+    ++stats_.host_rts;
+    REXLOG_INFO("[sst-native] render target {:08X}: {}x{} {} (surface {}x{}, guest format {})", surface, rt.width, rt.height, depth ? "depth D32S8" : "colour", sw, sh, guest_format);
+    bound_targets_ = 0;
+    HostRT &stored = map[surface] = std::move(rt);
+
+    if (!recording_)
+      return &stored;
+
+    // New contents are undefined: start from zero like EDRAM after a clear.
+    if (depth)
+    {
+      list_->ClearDepthStencilView(RtDsv(stored.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);
+    }
+    else
+    {
+      static constexpr float kZero[4] = {};
+      list_->ClearRenderTargetView(RtRtv(stored.view), kZero, 0, nullptr);
+    }
+
+    return &stored;
+  }
+
+  Renderer::ResolvedTexture *Renderer::GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume)
+  {
+    const DXGI_FORMAT format = ResolveTextureFormat(guest_format);
+    auto it = resolved_.find(page);
+
+    if (it != resolved_.end())
+    {
+      ResolvedTexture &t = *it->second;
+
+      if (t.format == format && t.width == width && t.height == height && t.slices == slices && t.volume == volume)
+        return &t;
+
+      textures_->RemoveExternal(page);
+      retired_rts_.push_back({fence_value_ + 1, t.resource});
+    }
+
+    auto t = std::make_unique<ResolvedTexture>();
+    t->format = format;
+    t->width = width;
+    t->height = height;
+    t->slices = slices;
+    t->volume = volume;
+    t->guest_format = guest_format;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = UINT16(slices);
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    t->state = kShaderRead;
+
+    if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, t->state, nullptr, IID_PPV_ARGS(&t->resource))))
+    {
+      if (LogOnce(0xAB00000000000000ull ^ page))
+        REXLOG_WARN("[sst-native] could not create the {}x{}x{} resolve texture at {:08X}", width, height, slices, page << 12);
+
+      resolved_.erase(page);
+      return nullptr;
+    }
+
+    // Views: one RTV per slice, an identity SRV (presenting). Reuse slots.
+    if (it != resolved_.end())
+    {
+      t->rtvs = it->second->rtvs;
+      t->srv = it->second->srv;
+    }
+
+    while (t->rtvs.size() < slices)
+    {
+      if (rt_rtv_next_ >= kRtRtvCount)
+        return nullptr;
+
+      t->rtvs.push_back(rt_rtv_next_++);
+    }
+
+    if (!t->srv)
+      t->srv = AllocateRtSrv();
+
+    for (uint32_t i = 0; i < slices; ++i)
+    {
+      D3D12_RENDER_TARGET_VIEW_DESC rd = {};
+      rd.Format = format;
+
+      if (volume)
+      {
+        rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+        rd.Texture3D.FirstWSlice = i;
+        rd.Texture3D.WSize = 1;
+      }
+      else
+      {
+        rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+      }
+
+      device_->CreateRenderTargetView(t->resource.Get(), &rd, RtRtv(t->rtvs[i]));
+    }
+
+    if (t->srv)
+    {
+      D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+      sd.Format = format;
+      sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+      if (volume)
+      {
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        sd.Texture3D.MipLevels = 1;
+      }
+      else
+      {
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+      }
+
+      D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+      h.ptr += size_t(t->srv) * srv_size_;
+      device_->CreateShaderResourceView(t->resource.Get(), &sd, h);
+    }
+
+    TextureCache::External e;
+    e.resource = t->resource.Get();
+    e.dxgi_format = uint32_t(format);
+    e.width = width;
+    e.height = height;
+    e.slices = slices;
+    e.volume = volume;
+    textures_->SetExternal(page, e);
+    REXLOG_INFO("[sst-native] resolve texture {:08X}: {}x{}{} guest format {} -> DXGI {}", page << 12, width, height, slices > 1 ? fmt::format("x{}", slices) : "", guest_format, uint32_t(format));
+    ResolvedTexture *raw = t.get();
+    resolved_[page] = std::move(t);
+    return raw;
+  }
+
+  bool Renderer::CreateBlitResources()
+  {
+    // Root signature: b0 = 4 root constants (source offset), t0 = source.
+    D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, 4};
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable = {1, &range};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rs = {};
+    rs.NumParameters = 2;
+    rs.pParameters = params;
+    ComPtr<ID3DBlob> blob, error;
+
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) || FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&blit_root_))))
+      return false;
+
+    static const char kVS[] =
+        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+        "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+        "  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+        "}\n";
+
+    static const char kPS[] =
+        "cbuffer C : register(b0) { int4 offset; };\n"
+        "Texture2D<float4> src : register(t0);\n"
+        "float4 main(float4 p : SV_Position) : SV_Target {\n"
+        "  float4 c = src.Load(int3(int2(p.xy) + offset.xy, 0));\n"
+        "  return offset.z != 0 ? c.bgra : c;\n"
+        "}\n";
+
+    ComPtr<IDxcCompiler3> compiler;
+
+    if (FAILED(provider_->DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
+      return false;
+
+    auto compile = [&](const char *source, const wchar_t *profile, std::vector<uint8_t> &out)
+    {
+      const wchar_t *args[] = {L"-T", profile, L"-E", L"main", L"-Qstrip_reflect", L"-Qstrip_debug"};
+      DxcBuffer buffer = {source, std::strlen(source), DXC_CP_UTF8};
+      ComPtr<IDxcResult> result;
+      HRESULT status = E_FAIL;
+
+      if (FAILED(compiler->Compile(&buffer, args, UINT32(std::size(args)), nullptr, IID_PPV_ARGS(&result))) || FAILED(result->GetStatus(&status)) || FAILED(status))
+        return false;
+
+      ComPtr<IDxcBlob> object;
+
+      if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) || !object)
+        return false;
+
+      const auto *b = static_cast<const uint8_t *>(object->GetBufferPointer());
+      out.assign(b, b + object->GetBufferSize());
+      return true;
+    };
+
+    if (!compile(kVS, L"vs_6_0", blit_vs_) || !compile(kPS, L"ps_6_0", blit_ps_))
+    {
+      blit_root_.Reset();
+      return false;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = kRtRtvCount;
+
+    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt_rtv_heap_))))
+      return false;
+
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    hd.NumDescriptors = kRtDsvCount;
+
+    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt_dsv_heap_))))
+      return false;
+
+    dsv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    srv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return true;
+  }
+
+  ID3D12PipelineState *Renderer::GetBlitPipeline(DXGI_FORMAT format)
+  {
+    auto it = blit_pipelines_.find(uint32_t(format));
+
+    if (it != blit_pipelines_.end())
+      return it->second.Get();
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
+    d.pRootSignature = blit_root_.Get();
+    d.VS = {blit_vs_.data(), blit_vs_.size()};
+    d.PS = {blit_ps_.data(), blit_ps_.size()};
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    d.SampleMask = UINT_MAX;
+    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    d.RasterizerState.DepthClipEnable = TRUE;
+    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    d.NumRenderTargets = 1;
+    d.RTVFormats[0] = format;
+    d.SampleDesc.Count = 1;
+    ComPtr<ID3D12PipelineState> pso;
+
+    if (FAILED(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso))))
+      pso = nullptr;
+
+    return blit_pipelines_.emplace(uint32_t(format), pso).first->second.Get();
+  }
+
+  void Renderer::Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb)
+  {
+    ID3D12PipelineState *pso = GetBlitPipeline(format);
+
+    if (!pso || dst.right <= dst.left || dst.bottom <= dst.top)
+      return;
+
+    list_->SetGraphicsRootSignature(blit_root_.Get());
+    list_->SetPipelineState(pso);
+    const int32_t offset[4] = {src_x - dst.left, src_y - dst.top, swap_rb ? 1 : 0, 0};
+    list_->SetGraphicsRoot32BitConstants(0, 4, offset, 0);
+    list_->SetGraphicsRootDescriptorTable(1, SrvGpu(src_srv));
+    list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    // The triangle covers the whole viewport; viewport + scissor = destination.
+    const D3D12_VIEWPORT vp = {float(dst.left), float(dst.top), float(dst.right - dst.left), float(dst.bottom - dst.top), 0, 1};
+    list_->RSSetViewports(1, &vp);
+    list_->RSSetScissorRects(1, &dst);
+    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list_->DrawInstanced(3, 1, 0, 0);
+    RestoreDrawState();
+  }
+
+  void Renderer::RestoreDrawState()
+  {
+    list_->SetGraphicsRootSignature(root_signature_.Get());
+
+    for (UINT i = 0; i < 3; ++i)
+      list_->SetGraphicsRootDescriptorTable(kRootTextures2D + i, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+
+    list_->SetGraphicsRootDescriptorTable(kRootSamplers, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
+    bound_targets_ = 0;
+  }
+
+  // End of frame: show the game's front buffer (its last full-size resolve), or failing that the last colour target drawn to.
+  void Renderer::PresentRenderTargets()
+  {
+    const D3D12_RECT full = {0, 0, LONG(width_), LONG(height_)};
+
+    // (Looked up by page: the texture may have been replaced since the resolve.)
+    ResolvedTexture *present_source_ = nullptr;
+
+    if (present_page_)
+    {
+      auto it = resolved_.find(present_page_);
+
+      if (it != resolved_.end())
+        present_source_ = it->second.get();
+    }
+
+    present_page_ = 0;
+
+    if (present_source_ && present_source_->srv && !present_source_->volume)
+    {
+      ++stats_.presented_from_resolve;
+
+      if (present_source_->state != kShaderRead)
+      {
+        auto b = Transition(present_source_->resource.Get(), present_source_->state, kShaderRead);
+        list_->ResourceBarrier(1, &b);
+        present_source_->state = kShaderRead;
+      }
+
+      Blit(present_source_->srv, 0, 0, Rtv(target_), D3D12Presenter::kGuestOutputFormat, full, present_source_->rb_swapped);
+    }
+    else if (last_color_rt_ && last_color_rt_->srv)
+    {
+      SetRTState(*last_color_rt_, kShaderRead);
+      Blit(last_color_rt_->srv, 0, 0, Rtv(target_), D3D12Presenter::kGuestOutputFormat, full);
+      SetRTState(*last_color_rt_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+
+    last_color_rt_ = nullptr;
+  }
+
+  // render targets: resolves + trace
+  namespace
+  {
+    float BeFloat(const uint8_t *base, uint32_t addr)
+    {
+      const uint32_t v = be32(base, addr);
+      float f;
+      std::memcpy(&f, &v, 4);
+      return f;
+    }
+  }
+
+  std::string Renderer::DescribeTexture(const uint32_t fetch[6])
+  {
+    const uint32_t type = fetch[0] & 3, format = fetch[1] & 0x3F;
+    const uint32_t dim = (fetch[5] >> 9) & 3, stacked = (fetch[1] >> 10) & 1;
+    uint32_t w, h, d;
+
+    // 3D
+    if (dim == 2)
+    {
+      w = (fetch[2] & 0x7FF) + 1, h = ((fetch[2] >> 11) & 0x7FF) + 1, d = (fetch[2] >> 22) + 1;
+    }
+    else
+    {
+      w = (fetch[2] & 0x1FFF) + 1, h = ((fetch[2] >> 13) & 0x1FFF) + 1, d = (fetch[2] >> 26) + 1;
+    }
+
+    return fmt::format("{:08X} fmt {} {}x{}{} dim {}{}{} pitch {} endian {} swz {:03X} mips {:08X} "
+                       "(type {})",
+                       fetch[1] & ~0xFFFu, format, w, h, d > 1 ? fmt::format("x{}", d) : "", dim,
+                       stacked ? " stacked" : "", (fetch[0] >> 31) ? " tiled" : " linear",
+                       ((fetch[0] >> 22) & 0x1FF) * 32, (fetch[1] >> 6) & 3,
+                       (fetch[3] >> 1) & 0xFFF, fetch[5] & ~0xFFFu, type);
+  }
+
+  std::string Renderer::DescribeSurface(const uint8_t *base, uint32_t surface)
+  {
+    if (!surface)
+      return "none";
+
+    if (!PlausibleAddress(surface))
+      return fmt::format("{:08X}?", surface);
+
+    const uint32_t info = be32(base, surface + 0x1C), size = be32(base, surface + 0x24);
+    std::string s = fmt::format("{:08X} [edram base {} fmt {} size word {:08X}]", surface, info & 0xFFF, (info >> 16) & 0xF, size);
+
+    if (rt_trace_.surfaces_logged.insert(surface).second)
+    {
+      std::string words;
+
+      for (uint32_t i = 0; i < 16; ++i)
+        words += fmt::format(" {:08X}", be32(base, surface + 4 * i));
+
+      rt_trace_.lines.push_back(fmt::format("  surface {:08X}:{}", surface, words));
+    }
+
+    return s;
+  }
+
+  void Renderer::TraceClosePass()
+  {
+    RtTrace &t = rt_trace_;
+
+    if (!t.has_pass)
+      return;
+
+    std::string prims;
+
+    for (auto &[p, n] : t.pass_prims)
+      prims += fmt::format(" {:X}:{}", p, n);
+
+    t.lines.push_back(fmt::format("  -> {} draws ({} morph) prims{}; {} pixel shaders", t.pass_draws, t.pass_morph, prims, t.pass_ps.size()));
+
+    for (const std::string &tex : t.pass_textures)
+      t.lines.push_back("     samples " + tex);
+
+    t.has_pass = false;
+  }
+
+  void Renderer::TraceState(const uint8_t *base, uint32_t dev)
+  {
+    RtTrace &t = rt_trace_;
+    uint32_t words[20];
+    uint32_t n = 0;
+
+    // RT0-3, depth
+    for (uint32_t i = 0; i < 5; ++i)
+      words[n++] = be32(base, dev + kDevRT0 + 4 * i);
+
+    words[n++] = be32(base, dev + 0x2880); // RB_SURFACE_INFO
+    words[n++] = be32(base, dev + 0x2884); // RB_COLOR_INFO
+    words[n++] = be32(base, dev + 0x2888); // RB_DEPTH_INFO
+
+    for (uint32_t r = PA_CL_VPORT_XSCALE; r <= PA_CL_VPORT_ZOFFSET; ++r)
+      words[n++] = Reg(base, dev, r);
+
+    words[n++] = be32(base, dev + kDevScissorTL);
+    words[n++] = be32(base, dev + kDevScissorBR);
+    const uint64_t key = XXH3_64bits(words, n * 4);
+
+    if (t.has_pass && key == t.pass_key)
+      return;
+
+    TraceClosePass();
+    t.has_pass = true;
+    t.pass_key = key;
+    t.pass_draws = t.pass_morph = 0;
+    t.pass_prims.clear();
+    t.pass_textures.clear();
+    t.pass_texture_keys.clear();
+    t.pass_ps.clear();
+    const float xs = RegF(base, dev, PA_CL_VPORT_XSCALE), ys = RegF(base, dev, PA_CL_VPORT_YSCALE);
+    const float xo = RegF(base, dev, PA_CL_VPORT_XOFFSET), yo = RegF(base, dev, PA_CL_VPORT_YOFFSET);
+    const uint32_t tl = words[n - 2], br = words[n - 1];
+    t.lines.push_back(fmt::format(
+        "pass {}: RT0 {} | RT1 {:08X} | depth {} | surface info {:08X} colour info {:08X} depth info "
+        "{:08X} | viewport scale {} {} offset {} {} | scissor {}x{}-{}x{}",
+        ++t.pass_index, DescribeSurface(base, words[0]), words[1], DescribeSurface(base, words[4]),
+        words[5], words[6], words[7], xs, ys, xo, yo, tl & 0x7FFF, (tl >> 16) & 0x7FFF, br & 0x7FFF,
+        (br >> 16) & 0x7FFF));
+  }
+
+  void Renderer::TraceDraw(const uint8_t *base, uint32_t dev, const DrawCall &call, bool morph)
+  {
+    RtTrace &t = rt_trace_;
+    TraceState(base, dev);
+    ++t.pass_draws;
+
+    if (morph)
+      ++t.pass_morph;
+
+    ++t.pass_prims[call.prim];
+    const uint32_t ps_obj = be32(base, dev + kDevPS);
+    ShaderEntry *ps = ps_obj ? ResolveShader(base, ps_obj, false) : nullptr;
+
+    if (call.up_data && PlausibleAddress(call.up_data))
+    {
+      // Vertex-data draws (DrawVerticesUP / immediate mode): the raw vertices.
+      const uint32_t vs_obj = be32(base, dev + kDevVS);
+      ShaderEntry *vs = vs_obj ? ResolveShader(base, vs_obj, true) : nullptr;
+      std::string line = fmt::format(
+          "  {} draw: prim {} vertices {} stride {} vs {:016X} ps {:016X} depthcontrol {:08X} "
+          "blendcontrol {:08X} colorcontrol {:08X} mode {:08X}",
+          call.immediate ? "immediate-mode" : "DrawVerticesUP", call.prim, call.count, call.up_stride,
+          vs ? vs->hash : 0, ps ? ps->hash : 0, Reg(base, dev, RB_DEPTHCONTROL),
+          Reg(base, dev, RB_BLENDCONTROL0), Reg(base, dev, RB_COLORCONTROL),
+          Reg(base, dev, PA_SU_SC_MODE_CNTL));
+      const uint32_t words = std::min(call.up_stride / 4, 8u);
+      const uint32_t shown = std::min(call.count, 6u);
+
+      for (uint32_t v = 0; v < call.count && words; ++v)
+      {
+        // ... and the last one
+        if (v == shown && v + 1 < call.count)
+          v = call.count - 1;
+
+        t.lines.push_back(std::move(line));
+        line = fmt::format("      v{}:", v);
+
+        for (uint32_t w = 0; w < words; ++w)
+        {
+          const uint32_t x = be32(base, call.up_data + v * call.up_stride + 4 * w);
+          float f;
+          std::memcpy(&f, &x, 4);
+          line += (std::fabs(f) > 1e-6f && std::fabs(f) < 1e6f) ? fmt::format(" {:.3f}", f) : fmt::format(" {:08X}", x);
+        }
+      }
+
+      t.lines.push_back(line);
+    }
+
+    if (!ps)
+      return;
+
+    t.pass_ps.insert(ps->hash);
+    const TextureUsage &u = GetTextureUsage(ps);
+
+    for (uint32_t i = 0; i < 16; ++i)
+    {
+      if (!((u.mask >> i) & 1))
+        continue;
+
+      uint32_t fetch[6];
+
+      for (uint32_t k = 0; k < 6; ++k)
+        fetch[k] = be32(base, dev + kDevFetchConstants + 24 * i + 4 * k);
+
+      const uint64_t key = (uint64_t(fetch[1]) << 32) ^ fetch[2] ^ (uint64_t(i) << 58);
+
+      if (t.pass_textures.size() < 16 && t.pass_texture_keys.insert(key).second)
+        t.pass_textures.push_back(fmt::format("s{} (tfetch dim {}): {}", i, u.uses[i].dimension - 1, DescribeTexture(fetch)));
+    }
+  }
+
+  void Renderer::TraceEvent(const uint8_t *base, uint32_t device, const std::string &what)
+  {
+    if (!rt_trace_.active)
+      return;
+
+    TraceState(base, device);
+    rt_trace_.lines.push_back("  " + what);
+  }
+
+  void Renderer::Resolve(const uint8_t *base, const ResolveCall &c)
+  {
+    ++stats_.resolves;
+    const uint32_t dev = c.device;
+
+    if (!PlausibleAddress(dev))
+      return;
+
+    // Destination texture (its fetch constant at +0x1C) and the copy rectangle.
+    uint32_t fetch[6] = {};
+
+    if (PlausibleAddress(c.dst_texture))
+      for (uint32_t k = 0; k < 6; ++k)
+        fetch[k] = be32(base, c.dst_texture + 0x1C + 4 * k);
+
+    int32_t rect[4] = {-1, -1, -1, -1}, point[2] = {-1, -1};
+
+    if (PlausibleAddress(c.src_rect))
+      for (int i = 0; i < 4; ++i)
+        rect[i] = int32_t(be32(base, c.src_rect + 4 * i));
+
+    if (PlausibleAddress(c.dst_point))
+      for (int i = 0; i < 2; ++i)
+        point[i] = int32_t(be32(base, c.dst_point + 4 * i));
+
+    const uint32_t which = c.flags & 7; // 0-3 colour target, 4 depth
+    const uint32_t surface = which == 4 ? be32(base, dev + kDevDepth) : be32(base, dev + kDevRT0 + 4 * (which & 3));
+    std::string colour = "none";
+
+    if (PlausibleAddress(c.clear_color))
+      colour = fmt::format("{} {} {} {}", BeFloat(base, c.clear_color), BeFloat(base, c.clear_color + 4), BeFloat(base, c.clear_color + 8), BeFloat(base, c.clear_color + 12));
+
+    const std::string line = fmt::format(
+        "resolve flags {:X} from {} rect {} {} {} {} -> texture {:08X} {} at {} {} level {} slice {} "
+        "clear colour {} z {}",
+        c.flags, which == 4 ? "depth" : fmt::format("RT{}", which & 3), rect[0], rect[1], rect[2],
+        rect[3], c.dst_texture, fetch[0] ? DescribeTexture(fetch) : std::string("(none)"), point[0],
+        point[1], c.level, c.slice, colour, c.clear_z);
+
+    if (rt_trace_.active)
+    {
+      TraceState(base, dev);
+      rt_trace_.lines.push_back("  " + line);
+      rt_trace_.lines.push_back("     source surface " + DescribeSurface(base, surface));
+    }
+
+    if (LogOnce(0xA700000000000000ull ^ (uint64_t(c.flags) << 40) ^ (fetch[1] & ~0xFFFu) ^ (uint64_t(surface) << 8)) && stats_.resolves_logged++ < 40)
+      REXLOG_INFO("[sst-native] {}", line);
+
+    // the copy
+    if (!RenderTargetsEnabled())
+      return;
+
+    if (!recording_)
+      BeginFrame();
+
+    const bool depth = which == 4;
+    auto &map = depth ? depth_rts_ : color_rts_;
+    auto src_it = map.find(surface);
+
+    if (src_it == map.end() || !src_it->second.srv || (fetch[0] & 3) != 2 || c.level != 0)
+    {
+      ++stats_.resolves_skipped;
+
+      if (LogOnce(0xAD00000000000000ull ^ (uint64_t(c.flags) << 32) ^ surface))
+        REXLOG_INFO("[sst-native] resolve skipped ({}): {}", src_it == map.end() ? "nothing drawn to the source yet" : c.level != 0 ? "mip level"
+                                                                                                                                    : "destination",
+                    line);
+
+      return;
+    }
+
+    HostRT &src = src_it->second;
+    const bool stacked = (fetch[1] >> 10) & 1;
+    const uint32_t dw = (fetch[2] & 0x1FFF) + 1, dh = ((fetch[2] >> 13) & 0x1FFF) + 1;
+    const uint32_t slices = stacked ? (fetch[2] >> 26) + 1 : 1;
+    const uint32_t page = (fetch[1] >> 12) & 0x1FFFF;
+    ResolvedTexture *dst = GetResolvedTexture(page, fetch[1] & 0x3F, dw, dh, slices, stacked);
+
+    if (!dst)
+    {
+      ++stats_.resolves_skipped;
+      return;
+    }
+
+    // Source rectangle (default: the destination's size) and destination point.
+    const int32_t sx0 = rect[0] >= 0 ? rect[0] : 0, sy0 = rect[1] >= 0 ? rect[1] : 0;
+    const int32_t sx1 = rect[0] >= 0 ? rect[2] : int32_t(dw), sy1 = rect[1] >= 0 ? rect[3] : int32_t(dh);
+    const int32_t px = point[0] >= 0 ? point[0] : 0, py = point[1] >= 0 ? point[1] : 0;
+    D3D12_RECT dr = {std::max<LONG>(px, 0), std::max<LONG>(py, 0), std::min<LONG>(px + (sx1 - sx0), LONG(dw)), std::min<LONG>(py + (sy1 - sy0), LONG(dh))};
+    const uint32_t slice = std::min(c.slice, slices - 1);
+    SetRTState(src, kShaderRead);
+
+    if (dst->state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+    {
+      auto b = Transition(dst->resource.Get(), dst->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      list_->ResourceBarrier(1, &b);
+      dst->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+
+    // Colour resolves into textures whose fetch swizzle reads blue from data component x (ARGB-style formats: swizzle zyxw) are stored red/blue swapped, as the Xbox's resolve does for them; the sampling swizzle then swaps them back.
+    const uint32_t dst_swizzle = (fetch[3] >> 1) & 0xFFF;
+    const bool swap_rb = !depth && (dst_swizzle & 7) == 2 && ((dst_swizzle >> 6) & 7) == 0;
+    dst->rb_swapped = swap_rb;
+    Blit(src.srv, sx0 + (dr.left - px), sy0 + (dr.top - py), RtRtv(dst->rtvs[slice]), dst->format, dr, swap_rb);
+
+    {
+      auto b = Transition(dst->resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
+      list_->ResourceBarrier(1, &b);
+      dst->state = kShaderRead;
+    }
+
+    SetRTState(src, depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ++stats_.resolves_done;
+
+    // Clears after the copy: 0x100 the colour target, 0x200 depth / stencil.
+    const D3D12_RECT sr = {std::max(sx0, 0), std::max(sy0, 0), std::min<LONG>(sx1, src.width), std::min<LONG>(sy1, src.height)};
+
+    if (sr.right > sr.left && sr.bottom > sr.top)
+    {
+      if ((c.flags & 0x100) && !depth)
+      {
+        float col[4] = {0, 0, 0, 0};
+
+        if (PlausibleAddress(c.clear_color))
+          for (int i = 0; i < 4; ++i)
+            col[i] = BeFloat(base, c.clear_color + 4 * i);
+
+        list_->ClearRenderTargetView(RtRtv(src.view), col, 1, &sr);
+      }
+
+      if (c.flags & 0x200)
+      {
+        const uint32_t ds = be32(base, dev + kDevDepth);
+        auto dit = depth_rts_.find(ds);
+
+        if (dit != depth_rts_.end())
+        {
+          HostRT &d = dit->second;
+          SetRTState(d, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+          const D3D12_RECT dsr = {sr.left, sr.top, std::min<LONG>(sr.right, d.width), std::min<LONG>(sr.bottom, d.height)};
+
+          if (dsr.right > dsr.left && dsr.bottom > dsr.top)
+            list_->ClearDepthStencilView(RtDsv(d.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, std::clamp(c.clear_z, 0.0f, 1.0f), 0, 1, &dsr);
+        }
+      }
+    }
+
+    // The game's front buffer copy: the last full-size colour resolve.
+    if (!depth && !stacked && dw == width_ && dh == height_)
+      present_page_ = page;
   }
 
   // performance helpers
@@ -1235,6 +2148,13 @@ namespace sst::native
 
     ReadGpuTime(frame_res_);
     constant_cache_.clear();
+    bound_targets_ = 0;
+
+    {
+      const uint64_t done = fence_->GetCompletedValue();
+      std::erase_if(retired_rts_, [&](const auto &r)
+                    { return r.first <= done; });
+    }
 
     // decayed after the last submission
     geo_state_ = D3D12_RESOURCE_STATE_COMMON;
@@ -1331,6 +2251,10 @@ namespace sst::native
 
     stats_.late_checked += late_checks_.size();
     late_checks_.clear();
+
+    if (RenderTargetsEnabled())
+      PresentRenderTargets();
+
     auto to_src = Transition(outputs_[target_].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list_->ResourceBarrier(1, &to_src);
     const bool capturing = capture_active_;
@@ -1383,6 +2307,29 @@ namespace sst::native
     else if (capture_quiet_ || (REXCVAR_GET(sst_native_capture_frame) > 0 && submitted_ + 1 == uint64_t(REXCVAR_GET(sst_native_capture_frame))))
     {
       capture_requested_ = true;
+    }
+
+    // Render-target trace: log the frame that just ended; F10 (or --sst_native_rt_trace) traces the next one.
+    if (rt_trace_.active)
+    {
+      TraceClosePass();
+      REXLOG_INFO("[rt-trace] ---- frame {} ({} events) ----", rt_trace_.frame, rt_trace_.lines.size());
+
+      for (const std::string &line : rt_trace_.lines)
+        REXLOG_INFO("[rt-trace] {}", line);
+
+      REXLOG_INFO("[rt-trace] ---- end of frame {} ----", rt_trace_.frame);
+      rt_trace_.active = false;
+      rt_trace_.lines.clear();
+    }
+
+    if ((GetAsyncKeyState(VK_F10) & 1) || (REXCVAR_GET(sst_native_rt_trace) > 0 && submitted_ + 1 == uint64_t(REXCVAR_GET(sst_native_rt_trace))))
+    {
+      rt_trace_.active = true;
+      rt_trace_.frame = submitted_ + 1;
+      rt_trace_.has_pass = false;
+      rt_trace_.pass_index = 0;
+      rt_trace_.lines.clear();
     }
 
     CollectMemexports(false);
@@ -1441,6 +2388,13 @@ namespace sst::native
   void Renderer::Clear(const uint8_t *base, uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil)
   {
     PhaseClock clk(prof_, kPhClear);
+
+    if (rt_trace_.active)
+    {
+      TraceState(base, device);
+      rt_trace_.lines.push_back(fmt::format("  clear flags {:X} colour {:08X} z {} stencil {}", flags, color, z, stencil));
+    }
+
     ++stats_.clears;
     ++stats_.clear_flags[flags];
 
@@ -1448,6 +2402,76 @@ namespace sst::native
       BeginFrame();
 
     const uint32_t rt0 = be32(base, device + kDevRT0);
+
+    if (RenderTargetsEnabled())
+    {
+      // Xbox D3DCLEAR_TARGET0-3 = 0x1-0x8, ZBUFFER 0x10, STENCIL 0x20 (Clear drops 0xF0 when no depth surface is set). The area is viewport (+ scissor), which PA_SC_WINDOW_SCISSOR holds.
+      const uint32_t tl = be32(base, device + kDevScissorTL), br = be32(base, device + kDevScissorBR);
+      const LONG x0 = LONG(tl & 0x7FFF), y0 = LONG((tl >> 16) & 0x7FFF);
+      const LONG x1 = LONG(br & 0x7FFF), y1 = LONG((br >> 16) & 0x7FFF);
+      uint32_t vw = 0, vh = 0;
+
+      if (Reg(base, device, PA_CL_VTE_CNTL) & 1)
+      {
+        const float xs = std::fabs(RegF(base, device, PA_CL_VPORT_XSCALE));
+        const float ys = std::fabs(RegF(base, device, PA_CL_VPORT_YSCALE));
+        const float xo = RegF(base, device, PA_CL_VPORT_XOFFSET);
+        const float yo = RegF(base, device, PA_CL_VPORT_YOFFSET);
+
+        if (std::isfinite(xs + ys + xo + yo) && xs < 8192 && ys < 8192)
+        {
+          vw = uint32_t(std::max(0.0f, std::ceil(xo + xs)));
+          vh = uint32_t(std::max(0.0f, std::ceil(yo + ys)));
+        }
+      }
+
+      auto area = [&](const HostRT &rt)
+      {
+        D3D12_RECT r = {0, 0, LONG(rt.width), LONG(rt.height)};
+
+        if (x1 > x0 && y1 > y0)
+          r = {std::min(x0, r.right), std::min(y0, r.bottom), std::min(x1, r.right), std::min(y1, r.bottom)};
+
+        return r;
+      };
+
+      if ((flags & 0xF) && rt0)
+      {
+        if (HostRT *c = GetHostRT(base, rt0, false, vw, vh))
+        {
+          SetRTState(*c, D3D12_RESOURCE_STATE_RENDER_TARGET);
+          const float col[4] = {float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f, float(color & 0xFF) / 255.0f, float((color >> 24) & 0xFF) / 255.0f};
+          const D3D12_RECT r = area(*c);
+
+          if (r.right > r.left && r.bottom > r.top)
+            list_->ClearRenderTargetView(RtRtv(c->view), col, 1, &r);
+        }
+      }
+
+      const uint32_t ds = be32(base, device + kDevDepth);
+
+      if ((flags & 0x30) && ds)
+      {
+        if (HostRT *d = GetHostRT(base, ds, true, vw, vh))
+        {
+          SetRTState(*d, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+          D3D12_CLEAR_FLAGS cf = D3D12_CLEAR_FLAGS(0);
+
+          if (flags & 0x10)
+            cf |= D3D12_CLEAR_FLAG_DEPTH;
+
+          if (flags & 0x20)
+            cf |= D3D12_CLEAR_FLAG_STENCIL;
+
+          const D3D12_RECT r = area(*d);
+
+          if (r.right > r.left && r.bottom > r.top)
+            list_->ClearDepthStencilView(RtDsv(d->view), cf, std::clamp(z, 0.0f, 1.0f), UINT8(stencil), 1, &r);
+        }
+      }
+
+      return;
+    }
 
     if (stats_.clear_logged++ < 12)
       REXLOG_INFO("[sst-native] clear flags {:X} colour {:08X} z {} stencil {} RT0 {:08X} [{:08X}]", flags, color, z, stencil, rt0, rt0 ? be32(base, rt0 + 0x24) : 0);
@@ -1593,6 +2617,8 @@ namespace sst::native
                                                                                        : D3D12_CULL_MODE_NONE;
     d.RasterizerState.FrontCounterClockwise = key.front_ccw;
     d.RasterizerState.DepthClipEnable = TRUE;
+    d.RasterizerState.DepthBias = key.depth_bias;
+    d.RasterizerState.SlopeScaledDepthBias = key.slope_bias;
 
     d.DepthStencilState.DepthEnable = key.depth_enable;
     d.DepthStencilState.DepthWriteMask = key.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
@@ -1603,8 +2629,9 @@ namespace sst::native
                                                                                                             : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
     d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE(key.topology_type);
     d.NumRenderTargets = 1;
-    d.RTVFormats[0] = D3D12Presenter::kGuestOutputFormat;
-    d.DSVFormat = kDepthFormat;
+    d.RTVFormats[0] = key.rtv_format ? DXGI_FORMAT(key.rtv_format) : D3D12Presenter::kGuestOutputFormat;
+    d.DSVFormat = key.dsv == 0 ? kDepthFormat : key.dsv == 2 ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                                             : DXGI_FORMAT_UNKNOWN;
     d.SampleDesc.Count = 1;
 
     auto job = std::make_shared<PipelineJob>();
@@ -2170,6 +3197,15 @@ namespace sst::native
     vc.bool_constants = bools;
     vc.loop_constants = loops;
     vc.fetch_constants = fetch;
+
+    if (call.up_data)
+    {
+      // DrawVerticesUP / immediate mode: vertex fetch slot 95 is the caller's data (often in virtual memory, so it's passed as a host pointer).
+      vc.override_data = GuestPtr(base, call.up_data);
+      vc.override_size = call.up_stride * (call.start + call.count);
+      vc.override_slot = 95;
+    }
+
     return memexport_->RunFetchIndices(check_ucode_.data(), uint32_t(check_ucode_.size()), vc, check_indices_.data(), vertex_count, &fetch_records_);
   }
 
@@ -2536,6 +3572,9 @@ namespace sst::native
     ShaderEntry *vs_entry = ResolveShader(base, vs_obj, true);
     clk.Switch(kPhOther);
 
+    if (rt_trace_.active)
+      TraceDraw(base, dev, call, vs_entry && vs_entry->memexport);
+
     if (vs_entry && vs_entry->memexport)
     {
       clk.Switch(kPhMemexport);
@@ -2564,7 +3603,8 @@ namespace sst::native
                   RegF(base, dev, PA_CL_VPORT_XOFFSET), RegF(base, dev, PA_CL_VPORT_YOFFSET),
                   RegF(base, dev, PA_CL_VPORT_ZOFFSET), Reg(base, dev, PA_CL_VTE_CNTL));
 
-    const bool rt_selected = RenderTargetSelected(base, dev, rt_size);
+    const bool rt_mode = RenderTargetsEnabled();
+    const bool rt_selected = rt_mode || RenderTargetSelected(base, dev, rt_size);
 
     if (REXCVAR_GET(sst_native_rt) == "auto")
       (rt_selected ? main_rts_ : other_rts_).insert(rt0);
@@ -2578,6 +3618,7 @@ namespace sst::native
     // Primitive type
     D3D_PRIMITIVE_TOPOLOGY topology;
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
+    bool rect_list = false;
     bool convert = false; // TRIFAN / QUADLIST -> indexed triangle list
 
     switch (call.prim)
@@ -2620,7 +3661,19 @@ namespace sst::native
       convert = true;
       break;
 
-    default: // RECTLIST (8) and others: later
+    case 8: // RECTLIST: 3 corners per rectangle, 4th added on the CPU
+      if (!rt_mode)
+      {
+        ++stats_.skip_prim;
+        return;
+      }
+
+      topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      rect_list = true;
+      break;
+
+    default: // others: later
       ++stats_.skip_prim;
       return;
     }
@@ -2695,6 +3748,7 @@ namespace sst::native
     bool computed_fetch = false;
     uint32_t full_fetch_addr = 0;
     std::vector<HostElement> host_elements;
+    int position_element = -1;  // host element holding POSITION (RECTLIST corner detection)
     std::string capture_detail; // F9 capture: inputs of this draw
     std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
     layout.reserve(inputs.size());
@@ -2900,6 +3954,10 @@ namespace sst::native
       {
         d.InputSlot = 0;
         d.AlignedByteOffset = UINT(16 * host_elements.size());
+
+        if (in.usage == 0 && position_element < 0)
+          position_element = int(host_elements.size());
+
         host_elements.push_back(h);
       }
       else
@@ -2930,7 +3988,62 @@ namespace sst::native
     const uint32_t depthcontrol = Reg(base, dev, RB_DEPTHCONTROL);
     const uint32_t colorcontrol = Reg(base, dev, RB_COLORCONTROL);
     const uint32_t mode = Reg(base, dev, PA_SU_SC_MODE_CNTL);
-    const bool has_depth = be32(base, dev + kDevDepth) != 0;
+
+    // Render targets: host textures for this draw's colour / depth surfaces.
+    HostRT *color_rt = nullptr;
+    HostRT *depth_rt = nullptr;
+    uint32_t target_w = width_, target_h = height_;
+
+    if (rt_mode)
+    {
+      // What the viewport covers (for sizing targets drawn bigger than the surface).
+      uint32_t vw = 0, vh = 0;
+
+      if (Reg(base, dev, PA_CL_VTE_CNTL) & 1)
+      {
+        const float xs = std::fabs(RegF(base, dev, PA_CL_VPORT_XSCALE));
+        const float ys = std::fabs(RegF(base, dev, PA_CL_VPORT_YSCALE));
+        const float xo = RegF(base, dev, PA_CL_VPORT_XOFFSET), yo = RegF(base, dev, PA_CL_VPORT_YOFFSET);
+
+        if (std::isfinite(xs + ys + xo + yo) && xs < 8192 && ys < 8192)
+        {
+          vw = uint32_t(std::max(0.0f, std::ceil(xo + xs)));
+          vh = uint32_t(std::max(0.0f, std::ceil(yo + ys)));
+        }
+      }
+
+      color_rt = GetHostRT(base, rt0, false, vw, vh);
+
+      if (!color_rt)
+      {
+        ++stats_.skip_rt;
+        return;
+      }
+
+      const uint32_t ds = be32(base, dev + kDevDepth);
+
+      // stencil or depth test on
+      if (ds && (depthcontrol & 3))
+      {
+        depth_rt = GetHostRT(base, ds, true, vw, vh);
+
+        if (depth_rt && (depth_rt->width != color_rt->width || depth_rt->height != color_rt->height))
+        {
+          if (LogOnce(0xAC00000000000000ull ^ (uint64_t(rt0) << 24) ^ ds))
+            REXLOG_INFO("[sst-native] colour target {:08X} ({}x{}) and depth {:08X} ({}x{}) differ "
+                        "in size: drawing without depth",
+                        rt0, color_rt->width, color_rt->height, ds, depth_rt->width,
+                        depth_rt->height);
+
+          depth_rt = nullptr;
+        }
+      }
+
+      target_w = color_rt->width;
+      target_h = color_rt->height;
+    }
+
+    const bool has_depth = rt_mode ? depth_rt != nullptr : be32(base, dev + kDevDepth) != 0;
 
     uint32_t ps_spec = 0;
     const bool alpha_test = (colorcontrol >> 3) & 1;
@@ -2992,8 +4105,34 @@ namespace sst::native
     key.depth_enable = has_depth && ((depthcontrol >> 1) & 1);
     key.depth_write = key.depth_enable && ((depthcontrol >> 2) & 1);
     key.depth_func = key.depth_enable ? uint8_t((depthcontrol >> 4) & 7) : 7;
-    key.cull = uint8_t(mode & 3);
+    key.cull = rect_list ? 0 : uint8_t(mode & 3);
+    key.rtv_format = rt_mode ? uint8_t(color_rt->format) : 0;
+    key.dsv = rt_mode ? (depth_rt ? 2 : 1) : 0;
     key.front_ccw = ((mode >> 2) & 1) ? 0 : 1;
+
+    // Polygon offset (the shadow pass's depth bias; without it surfaces shadow themselves in a dotted pattern). PA_SU_SC_MODE_CNTL bits 11-13 enable it for front / back / both; the device keeps PA_SU_POLY_OFFSET_FRONT_SCALE, _FRONT_OFFSET, _BACK_SCALE, _BACK_OFFSET at dev+0x2A50..+0x2A5C. Units as Xenia: scale in 1/16 subpixels, offset in float24 depth ULPs.
+    if (key.depth_enable && (mode & (7u << 11)))
+    {
+      const bool front = (mode >> 11) & 1, para = (mode >> 13) & 1;
+      const uint32_t at = dev + ((front || para) ? 0x2A50 : 0x2A58);
+      float scale, offset;
+      const uint32_t sv = be32(base, at), ov = be32(base, at + 4);
+      std::memcpy(&scale, &sv, 4);
+      std::memcpy(&offset, &ov, 4);
+
+      if (std::isfinite(scale) && std::isfinite(offset))
+      {
+        int32_t bias = int32_t(std::ceil(std::fabs(offset) * float(1u << 21))) << 3;
+        key.depth_bias = offset < 0 ? -bias : bias;
+        key.slope_bias = scale * (1.0f / 16.0f);
+
+        if (LogOnce(0xAE00000000000000ull ^ (uint64_t(sv) << 20) ^ ov))
+          REXLOG_INFO("[sst-native] polygon offset: scale {} offset {} (mode {:08X}) -> depth bias "
+                      "{} slope {}",
+                      scale, offset, mode, key.depth_bias, key.slope_bias);
+      }
+    }
+
     key.topology_type = uint8_t(topology_type);
 
     clk.Switch(kPhIndices);
@@ -3003,9 +4142,10 @@ namespace sst::native
       BeginFrame();
 
     // Indices, decoded with the index buffer's own swap mode: DrawIndexedVertices puts (Common >> 29) & 3 into the index DMA's swap field (0 none, 1 8in16, 2 8in32, 3 16in32), so 16-bit indices are not always 8in16
-    std::vector<uint32_t> converted; // TRIFAN / QUADLIST
-    std::vector<uint32_t> indices;   // little-endian, as the GPU reads them
-    const uint8_t *ib_src = nullptr; // guest index data (late-write check)
+    std::vector<uint32_t> converted;    // TRIFAN / QUADLIST
+    std::vector<uint32_t> rect_indices; // RECTLIST (4 vertices per rectangle)
+    std::vector<uint32_t> indices;      // little-endian, as the GPU reads them
+    const uint8_t *ib_src = nullptr;    // guest index data (late-write check)
     size_t ib_src_bytes = 0;
     bool index32 = false;
     uint32_t vmin = 0, vmax = 0;
@@ -3143,6 +4283,10 @@ namespace sst::native
       BeginFrame();
 
     clk.Switch(kPhVertices);
+
+    // Immediate-mode data (BeginVertices/EndVertices): the game's particle helper writes one record per sprite but draws 4 quad-list vertices per record, so its shaders must derive the record index from the vertex index in a way the instruction scan above doesn't see (most likely by rewriting r0 before the vfetch). These draws are few and small: always take the element indices from running the shader on the CPU.
+    if (call.immediate && !host_elements.empty())
+      computed_fetch = true;
 
     // Vertex data: resolve each fetch constant, then decode the referenced vertex range into one host stream (16 bytes per input)
     const uint32_t first_vertex = call.indexed ? call.base_vertex + vmin : call.start;
@@ -3285,7 +4429,7 @@ namespace sst::native
       uint64_t vhash = 0;
       bool vhit = false;
 
-      if (GeoCacheUsable() && !computed_fetch && !call.up_data && !reads_morph)
+      if (GeoCacheUsable() && !computed_fetch && !call.up_data && !reads_morph && !rect_list)
       {
         uint64_t words[4 * kMaxStreams + 8 * 16 + 4];
         uint32_t n = 0;
@@ -3366,7 +4510,7 @@ namespace sst::native
 
         uint32_t *out = reinterpret_cast<uint32_t *>(up.cpu);
 
-        if (computed_fetch && !call.up_data && ComputeFetchRecords(base, call, vs_obj, vs_entry, first_vertex, vertex_count))
+        if (computed_fetch && ComputeFetchRecords(base, call, vs_obj, vs_entry, first_vertex, vertex_count))
         {
           ++stats_.computed_fetch_draws;
 
@@ -3400,6 +4544,11 @@ namespace sst::native
         }
         else
         {
+          if (computed_fetch && LogOnce(0xCC00000000000000ull ^ vs_entry->hash))
+            REXLOG_WARN("[sst-native] VS {:016X}: running it on the CPU for its fetch indices "
+                        "failed; vertices fetched in order instead",
+                        vs_entry->hash);
+
           for (uint32_t v = 0; v < vertex_count; ++v)
           {
             for (const HostElement &h : host_elements)
@@ -3508,7 +4657,67 @@ namespace sst::native
         }
 
         capture_host_ = capture_active_ ? reinterpret_cast<const float *>(up.cpu) : nullptr;
-        const D3D12_VERTEX_BUFFER_VIEW vbv = {up.gpu, vertex_count * host_stride, host_stride};
+        D3D12_VERTEX_BUFFER_VIEW vbv = {up.gpu, vertex_count * host_stride, host_stride};
+
+        if (rect_list)
+        {
+          // RECTLIST: each 3 vertices are corners of a rectangle; the GPU makes the 4th. Find the right-angle corner c (by the positions) and add the opposite corner a + b - c (all float inputs, which the full-screen passes' vertex shaders pass through or transform linearly).
+          const uint32_t rects = vertex_count / 3;
+          const uint32_t floats = host_stride / 4;
+          const Upload ex = Allocate(size_t(std::max(rects, 1u)) * 4 * host_stride, 16);
+
+          if (!ex.cpu || !rects)
+          {
+            ++stats_.skip_data;
+            return;
+          }
+
+          const float *src = reinterpret_cast<const float *>(up.cpu);
+          float *dst = reinterpret_cast<float *>(ex.cpu);
+          rect_indices.clear();
+
+          for (uint32_t r = 0; r < rects; ++r)
+          {
+            const float *v[3] = {src + size_t(3 * r) * floats, src + size_t(3 * r + 1) * floats, src + size_t(3 * r + 2) * floats};
+            uint32_t corner = 0;
+
+            if (position_element >= 0)
+            {
+              float best = FLT_MAX;
+
+              for (uint32_t i = 0; i < 3; ++i)
+              {
+                const float *p = v[i] + 4 * position_element;
+                const float *q1 = v[(i + 1) % 3] + 4 * position_element;
+                const float *q2 = v[(i + 2) % 3] + 4 * position_element;
+                const float d = std::fabs((q1[0] - p[0]) * (q2[0] - p[0]) + (q1[1] - p[1]) * (q2[1] - p[1]));
+
+                if (d < best)
+                  best = d, corner = i;
+              }
+            }
+
+            const uint32_t a = (corner + 1) % 3, b = (corner + 2) % 3;
+            float *out = dst + size_t(4 * r) * floats;
+            std::memcpy(out, v[0], 3 * size_t(floats) * 4);
+            float *v3 = out + 3 * size_t(floats);
+
+            for (size_t e = 0; e < host_elements.size(); ++e)
+            {
+              for (uint32_t j = 0; j < 4; ++j)
+              {
+                const size_t k = 4 * e + j;
+                v3[k] = host_elements[e].fetch.out == FetchElement::Out::kUint ? v[corner][k] : v[a][k] + v[b][k] - v[corner][k];
+              }
+            }
+
+            rect_indices.insert(rect_indices.end(), {4 * r, 4 * r + 1, 4 * r + 2, 4 * r + a, 4 * r + b, 4 * r + 3});
+          }
+
+          ++stats_.rects_converted;
+          vbv = {ex.gpu, rects * 4 * host_stride, host_stride};
+        }
+
         list_->IASetVertexBuffers(0, 1, &vbv);
 
         if (ventry)
@@ -3526,7 +4735,26 @@ namespace sst::native
     uint32_t draw_count = call.count;
     bool draw_indexed = call.indexed;
 
-    if (convert)
+    if (rect_list)
+    {
+      if (rect_indices.empty() || call.indexed)
+      {
+        ++stats_.skip_prim;
+        return;
+      }
+
+      const Upload up = Allocate(rect_indices.size() * 4, 16);
+
+      if (!up.cpu)
+        return;
+
+      std::memcpy(up.cpu, rect_indices.data(), rect_indices.size() * 4);
+      const D3D12_INDEX_BUFFER_VIEW ibv = {up.gpu, UINT(rect_indices.size() * 4), DXGI_FORMAT_R32_UINT};
+      list_->IASetIndexBuffer(&ibv);
+      draw_count = uint32_t(rect_indices.size());
+      draw_indexed = true;
+    }
+    else if (convert)
     {
       // Source indices relative to first_vertex
       auto source = [&](uint32_t i) -> uint32_t
@@ -3640,7 +4868,7 @@ namespace sst::native
       float xs = RegF(base, dev, PA_CL_VPORT_XSCALE), xo = RegF(base, dev, PA_CL_VPORT_XOFFSET);
       float ys = RegF(base, dev, PA_CL_VPORT_YSCALE), yo = RegF(base, dev, PA_CL_VPORT_YOFFSET);
       float zs = RegF(base, dev, PA_CL_VPORT_ZSCALE), zo = RegF(base, dev, PA_CL_VPORT_ZOFFSET);
-      D3D12_VIEWPORT vp = {0, 0, float(width_), float(height_), 0, 1};
+      D3D12_VIEWPORT vp = {0, 0, float(target_w), float(target_h), 0, 1};
 
       if ((vte & 1) && xs != 0 && ys != 0 && std::isfinite(xs) && std::isfinite(ys))
       {
@@ -3676,7 +4904,7 @@ namespace sst::native
 
       // Scissor: SetScissorRect (sub_822FD8D8) keeps PA_SC_WINDOW_SCISSOR_TL/BR at dev+0x28C4/+0x28C8 (x | y << 16): the viewport rectangle, intersected with the scissor rectangle when scissor testing is on (dev+0x2E50).
       {
-        D3D12_RECT rect = {0, 0, LONG(width_), LONG(height_)};
+        D3D12_RECT rect = {0, 0, LONG(target_w), LONG(target_h)};
 
         if (REXCVAR_GET(sst_native_scissor))
         {
@@ -3686,8 +4914,8 @@ namespace sst::native
 
           if (x1 > x0 && y1 > y0)
           {
-            rect = {std::min(x0, LONG(width_)), std::min(y0, LONG(height_)), std::min(x1, LONG(width_)), std::min(y1, LONG(height_))};
-            const bool partial = x0 > 0 || y0 > 0 || x1 < LONG(width_) || y1 < LONG(height_);
+            rect = {std::min(x0, LONG(target_w)), std::min(y0, LONG(target_h)), std::min(x1, LONG(target_w)), std::min(y1, LONG(target_h))};
+            const bool partial = x0 > 0 || y0 > 0 || x1 < LONG(target_w) || y1 < LONG(target_h);
 
             if (partial)
             {
@@ -3709,6 +4937,27 @@ namespace sst::native
     clk.Switch(kPhRecord);
     const float blend_factor[4] = {RegF(base, dev, RB_BLEND_RED), RegF(base, dev, RB_BLEND_RED + 1), RegF(base, dev, RB_BLEND_RED + 2), RegF(base, dev, RB_BLEND_RED + 3)};
     list_->OMSetBlendFactor(blend_factor);
+
+    if (rt_mode)
+    {
+      SetRTState(*color_rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+      if (depth_rt)
+        SetRTState(*depth_rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+      const uint64_t pair = (uint64_t(color_rt->view + 1) << 32) | (depth_rt ? depth_rt->view + 1 : 0);
+
+      if (pair != bound_targets_)
+      {
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv = RtRtv(color_rt->view);
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = depth_rt ? RtDsv(depth_rt->view) : rtv;
+        list_->OMSetRenderTargets(1, &rtv, FALSE, depth_rt ? &dsv : nullptr);
+        bound_targets_ = pair;
+      }
+
+      last_color_rt_ = color_rt;
+    }
+
     list_->SetPipelineState(pso);
     list_->SetGraphicsRootConstantBufferView(kRootVSConstants, vsc_gpu);
     list_->SetGraphicsRootConstantBufferView(kRootVSConstantsRaw, vsc_gpu);
@@ -3718,7 +4967,7 @@ namespace sst::native
     list_->IASetPrimitiveTopology(topology);
 
     if (draw_indexed)
-      list_->DrawIndexedInstanced(draw_count, 1, 0, convert ? 0 : -int32_t(vmin), 0);
+      list_->DrawIndexedInstanced(draw_count, 1, 0, convert || rect_list ? 0 : -int32_t(vmin), 0);
     else
       list_->DrawInstanced(draw_count, 1, 0, 0);
 
@@ -4174,12 +5423,12 @@ namespace sst::native
 
     REXLOG_INFO("[sst-native] frame {}: {} draws, {} drawn ({} depth-only); skipped: shader {} "
                 "pending {} fetch {} prim {} rt {} pipeline {} data {} cull {} memexport-target {}; {} clears; "
-                "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB",
+                "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB; resolves {}",
                 frame, s.draws, s.drawn, s.depth_only, s.skip_shader, s.skip_pending, s.skip_decl,
                 s.skip_prim, s.skip_rt, s.skip_pipeline, s.skip_data, s.skip_cull, s.skip_memexport,
                 s.clears,
                 s.pipelines_created, s.pipelines_failed, s.shaders_from_objects,
-                double(s.upload_bytes) / (1 << 20));
+                double(s.upload_bytes) / (1 << 20), s.resolves);
     std::string prims;
 
     for (auto &[p, n] : s.prims)
@@ -4197,6 +5446,11 @@ namespace sst::native
                 "waited {} times), constants: {} files uploaded, {} reused",
                 s.memexport_draws, s.memexport_run, s.memexport_async, s.memexport_waits,
                 s.constants_uploaded, s.constants_reused);
+
+    REXLOG_INFO("[sst-native]   render targets: {} host targets made, resolves {} done / {} "
+                "skipped, rectangle lists {}, frames shown from the front-buffer resolve {}",
+                s.host_rts, s.resolves_done, s.resolves_skipped, s.rects_converted,
+                s.presented_from_resolve);
 
     REXLOG_INFO("[sst-native]   geometry cache: vertex hits {}, index hits {}, stored {} ({:.1f} MB), "
                 "dynamic (decoded each time) {}, flushes {}; {} keys, {:.0f} of {} MB used",
