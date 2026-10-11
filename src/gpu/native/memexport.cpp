@@ -27,8 +27,20 @@
 #include <cmath>
 #include <cstring>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace sst::native
 {
+  // Background helper threads yield to the game's own threads when cores are busy
+  inline void LowerThreadPriority()
+  {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+  }
+
   namespace ucode = rex::graphics::ucode;
   namespace xenos = rex::graphics::xenos;
 
@@ -1749,6 +1761,7 @@ namespace sst::native
 
     void Worker()
     {
+      LowerThreadPriority();
       uint64_t seen = 0;
 
       for (;;)
@@ -1834,6 +1847,8 @@ namespace sst::native
 
     void Main()
     {
+      LowerThreadPriority();
+
       for (;;)
       {
         std::pair<uint64_t, std::shared_ptr<MemexportJob>> next;

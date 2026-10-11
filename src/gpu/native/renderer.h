@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -61,10 +62,21 @@ namespace sst::native
     float clear_z = 0;
   };
 
+  // A snapshot of guest memory [begin, end) that GuestPtr / be32 read instead of live memory on the calling thread (render thread: what the hook saw)
+  struct GuestOverlay
+  {
+    uint32_t begin = 0, end = 0;
+    const uint8_t *data = nullptr;
+  };
+
+  void SetGuestOverlays(const GuestOverlay *overlays, uint32_t count);
+
   class Renderer
   {
   public:
     static constexpr uint32_t kSlots = 3;
+    // Output textures: the last one shown, frames waiting to be shown, the one being rendered
+    static constexpr uint32_t kOutputs = 5;
     Renderer();
     ~Renderer();
 
@@ -81,6 +93,8 @@ namespace sst::native
     void TraceEvent(const uint8_t *base, uint32_t device, const std::string &what);
     void LogStats(uint64_t frame);
     uint64_t frames() const { return submitted_; }
+    // Commands run on a separate render thread (perf log wording only)
+    void SetThreaded(bool threaded) { threaded_ = threaded; }
 
     // plugin (command-processor thread)
     ID3D12Resource *Acquire(uint32_t *slot, uint32_t *width, uint32_t *height);
@@ -137,17 +151,15 @@ namespace sst::native
       uint64_t period_tsc = 0;
       std::chrono::steady_clock::time_point period_start{}, last_frame{};
       double frame_ms_sum = 0, frame_ms_max = 0, gpu_ms_sum = 0, gpu_ms_max = 0;
-      uint32_t frames = 0, over_60 = 0, over_30 = 0, gpu_frames = 0;
+      uint32_t frames = 0, over_60 = 0, over_30 = 0, gpu_frames = 0, over_20 = 0;
     };
 
     static uint64_t Tick() { return __rdtsc(); }
-
     // Attributes elapsed time to one phase at a time; the rest goes to the last
     struct PhaseClock
     {
       PhaseClock(Profile &p, Phase ph) : prof(p), phase(ph), start(Tick()) {}
       ~PhaseClock() { prof.ticks[phase] += Tick() - start; }
-
       void Switch(Phase next)
       {
         const uint64_t now = Tick();
@@ -163,6 +175,7 @@ namespace sst::native
 
   private:
     Profile prof_;
+    bool threaded_ = false;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamps_;
     Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback_;
     uint64_t timestamp_frequency_ = 0;
@@ -172,7 +185,11 @@ namespace sst::native
     void LogProfile();
     // Constant files uploaded this frame, by content (XXH3 of the guest bytes)
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> constant_cache_;
-    D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const uint8_t *guest);
+    // Uploads the first `bytes` of a stage's constant file (the registers its shader reads; 4096 = all)
+    D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const uint8_t *guest, uint32_t bytes = 4096);
+    // Bytes of the constant file a shader reads: up to its highest register, or everything with relative addressing. Cached per entry
+    uint32_t ConstantBytes(const ShaderEntry *entry);
+    std::unordered_map<const ShaderEntry *, uint32_t> constant_bytes_;
     // Geometry cache: decoded vertex / converted index data in one video memory pool (bump allocated; when full, everything is re-stored on next use)
     struct GeoEntry
     {
@@ -182,7 +199,17 @@ namespace sst::native
       uint32_t changes = 0;        // times the source data changed
       uint32_t vmin = 0, vmax = 0; // index entries: referenced vertex range
       bool dynamic = false;        // changes too often to cache
+      uint32_t stable = 0;         // consecutive checks with unchanged data
+      uint64_t checked_frame = 0;  // frame of the last hash check
     };
+
+    // An entry whose data never changed in several checks and was already checked this frame is trusted for the rest of the frame (static meshes are drawn several times a frame: shadow cascades + scene). Every entry is still checked once per frame: data rewritten in place between frames (UI, menus, loading screens) must show up on the next frame, not a few later
+    bool GeoTrusted(const GeoEntry &e) const { return e.changes == 0 && e.stable >= 4 && e.size && e.generation == geo_generation_ && e.checked_frame == submitted_; }
+    void GeoChecked(GeoEntry &e, bool unchanged)
+    {
+      e.stable = unchanged ? e.stable + 1 : 0;
+      e.checked_frame = submitted_;
+    }
 
     bool GeoCacheUsable();
     void GeoStore(GeoEntry &e, const Upload &src, uint32_t size);
@@ -200,6 +227,7 @@ namespace sst::native
     void BeginFrame();
     void WaitFence(uint64_t value);
     ShaderEntry *ResolveShader(const uint8_t *base, uint32_t object, bool vertex);
+    ShaderEntry *ResolveShaderSlow(const uint8_t *base, uint32_t object, bool vertex, uint32_t vcopy, uint32_t vsize, uint32_t ucode_ptr);
     // Memory-export (morph) draws: run on the CPU, writing guest memory
     void RunMemexport(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry);
     void RecordMemexportRanges(const uint8_t *base, uint32_t dev);
@@ -229,7 +257,7 @@ namespace sst::native
     void CheckVsPositions(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, const float *host, uint32_t host_inputs);
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t slot) const;
 
-    // Render targets (milestone 4): every guest render-target surface (colour or depth) is a host texture at its logical size (max of the surface size and the viewports drawn with; the main scene's 640x736 tile surface is drawn as one 1280x736 image). Resolves copy them into host textures registered with the texture cache under the destination's guest address; the frame shown is the last full-size resolve (the game's front buffer copy)
+    // render targets (milestone 4) Every guest render-target surface (colour or depth) is a host texture at its logical size (max of the surface size and the viewports drawn with; the main scene's 640x736 tile surface is drawn as one 1280x736 image). Resolves copy them into host textures registered with the texture cache under the destination's guest address; the frame shown is the last full-size resolve (the game's front buffer copy)
     struct HostRT
     {
       Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -324,7 +352,8 @@ namespace sst::native
     uint32_t width_ = 0, height_ = 0;
 
     // Output ring + depth
-    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSlots> outputs_;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kOutputs> outputs_;
+    std::array<uint64_t, kOutputs> output_seq_{}; // frame sequence held (0 = none)
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtv_heap_, dsv_heap_;
     uint32_t rtv_size_ = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> depth_;
@@ -389,7 +418,6 @@ namespace sst::native
     };
 
     std::unordered_map<uint64_t, MorphHistory> morph_history_;
-
     struct ClipHistory
     {
       std::vector<float> ndc; // x/w, y/w per vertex (NaN behind the camera)
@@ -398,7 +426,6 @@ namespace sst::native
 
     std::unordered_map<uint64_t, ClipHistory> clip_history_;
     std::unordered_map<uint64_t, uint32_t> clip_occurrence_; // per frame
-
     struct LateRange
     {
       const uint8_t *ptr;
@@ -417,6 +444,7 @@ namespace sst::native
 
     std::vector<LateCheck> late_checks_;
 
+    // F9 capture (GPU stream output vs CPU)
     struct CapturedDraw
     {
       uint64_t vs_hash = 0, seq = 0;
@@ -449,6 +477,15 @@ namespace sst::native
     // Shader object address -> hash of its container copy at the last bind
     std::unordered_map<uint32_t, uint64_t> object_vhash_;
     std::unordered_map<uint32_t, uint32_t> object_ucode_; // microcode pointer at the last bind
+    // Objects already validated this frame (ResolveShader fast path)
+    struct ResolvedObject
+    {
+      uint64_t frame = UINT64_MAX;
+      uint32_t ucode = 0;
+      ShaderEntry *entry = nullptr;
+    };
+
+    std::unordered_map<uint32_t, ResolvedObject> resolved_objects_;
     std::vector<uint32_t> check_ucode_, check_indices_;
     std::vector<float> check_constants_, check_positions_;
 
@@ -466,6 +503,11 @@ namespace sst::native
     std::mutex slot_mutex_;
     int latest_ = -1;
     int pinned_ = -1;
+    // Frame pacing at the hand-off (slot_mutex_): frames finished vs taken by the plugin at the guest's swaps; repeats = the same frame taken twice, skips = finished frames never taken
+    uint64_t latest_seq_ = 0, acquired_seq_ = 0;
+    int acquired_slot_ = -1;
+    std::condition_variable frame_cv_; // a new frame finished (latest_seq_)
+    uint64_t acquires_ = 0, acquire_repeats_ = 0, acquire_skips_ = 0;
 
     // Stats (render thread)
     struct Stats
@@ -490,7 +532,7 @@ namespace sst::native
       uint64_t constants_uploaded = 0, constants_reused = 0;
       uint64_t resolves = 0, resolves_logged = 0;
       uint64_t resolves_done = 0, resolves_skipped = 0, rects_converted = 0, host_rts = 0, presented_from_resolve = 0;
-      uint64_t geo_vertex_hits = 0, geo_index_hits = 0, geo_stores = 0, geo_store_bytes = 0, geo_dynamic = 0, geo_flushes = 0;
+      uint64_t geo_vertex_hits = 0, geo_index_hits = 0, geo_stores = 0, geo_store_bytes = 0, geo_dynamic = 0, geo_flushes = 0, geo_trusted = 0;
       uint64_t scissored_draws = 0, scissor_logged = 0;
       uint64_t pipelines_created = 0, pipelines_failed = 0, pipelines_from_cache = 0, skip_pipeline_pending = 0;
       double pipeline_ms = 0;

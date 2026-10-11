@@ -16,3 +16,6 @@ find_shader_keys.py
 shader_key_report.txt
 .vs/
 *.res
+
+tools/*
+sst_menu_files.zip

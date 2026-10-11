@@ -25,6 +25,7 @@ if(WIN32)
         src/gpu/native/memexport.cpp
         src/gpu/native/xenos_ucode_tables.cpp
         src/gpu/native/texture_cache.cpp
+        src/gpu/native/hitch_profiler.cpp
     )
 else()
     list(APPEND SSTREMATCH_SOURCES src/gpu/native/native_stub.cpp)
