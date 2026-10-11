@@ -1,71 +1,68 @@
 #include "shader_recompiler.h"
 #include "shader_common.h"
 
-static constexpr char SWIZZLES[] = 
-{ 
-    'x',
-    'y', 
-    'z', 
-    'w', 
-    '0', 
-    '1',
-    '_',
-    '_'
+static constexpr char SWIZZLES[] =
+    {
+        'x',
+        'y',
+        'z',
+        'w',
+        '0',
+        '1',
+        '_',
+        '_'};
+
+static constexpr const char *USAGE_TYPES[] =
+    {
+        "float4", // POSITION
+        "float4", // BLENDWEIGHT
+        "uint4",  // BLENDINDICES
+        "uint4",  // NORMAL
+        "float4", // PSIZE
+        "float4", // TEXCOORD
+        "uint4",  // TANGENT
+        "uint4",  // BINORMAL
+        "float4", // TESSFACTOR
+        "float4", // POSITIONT
+        "float4", // COLOR
+        "float4", // FOG
+        "float4", // DEPTH
+        "float4", // SAMPLE
 };
 
-static constexpr const char* USAGE_TYPES[] =
-{
-    "float4", // POSITION
-    "float4", // BLENDWEIGHT
-    "uint4", // BLENDINDICES
-    "uint4", // NORMAL
-    "float4", // PSIZE
-    "float4", // TEXCOORD
-    "uint4", // TANGENT
-    "uint4", // BINORMAL
-    "float4", // TESSFACTOR
-    "float4", // POSITIONT
-    "float4", // COLOR
-    "float4", // FOG
-    "float4", // DEPTH
-    "float4", // SAMPLE
-};
+static constexpr const char *USAGE_VARIABLES[] =
+    {
+        "Position",
+        "BlendWeight",
+        "BlendIndices",
+        "Normal",
+        "PointSize",
+        "TexCoord",
+        "Tangent",
+        "Binormal",
+        "TessFactor",
+        "PositionT",
+        "Color",
+        "Fog",
+        "Depth",
+        "Sample"};
 
-static constexpr const char* USAGE_VARIABLES[] =
-{
-    "Position",
-    "BlendWeight",
-    "BlendIndices",
-    "Normal",
-    "PointSize",
-    "TexCoord",
-    "Tangent",
-    "Binormal",
-    "TessFactor",
-    "PositionT",
-    "Color",
-    "Fog",
-    "Depth",
-    "Sample"
-};
-
-static constexpr const char* USAGE_SEMANTICS[] =
-{
-    "POSITION",
-    "BLENDWEIGHT",
-    "BLENDINDICES",
-    "NORMAL",
-    "PSIZE",
-    "TEXCOORD",
-    "TANGENT",
-    "BINORMAL",
-    "TESSFACTOR",
-    "POSITIONT",
-    "COLOR",
-    "FOG",
-    "DEPTH",
-    "SAMPLE"
-};
+static constexpr const char *USAGE_SEMANTICS[] =
+    {
+        "POSITION",
+        "BLENDWEIGHT",
+        "BLENDINDICES",
+        "NORMAL",
+        "PSIZE",
+        "TEXCOORD",
+        "TANGENT",
+        "BINORMAL",
+        "TESSFACTOR",
+        "POSITIONT",
+        "COLOR",
+        "FOG",
+        "DEPTH",
+        "SAMPLE"};
 
 struct DeclUsageLocation
 {
@@ -76,61 +73,60 @@ struct DeclUsageLocation
 
 // NOTE: These are specialized Vulkan locations for Unleashed Recompiled. Change as necessary. Likely not going to work with other games.
 static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
-{
-    { DeclUsage::Position, 0, 0 },
-    { DeclUsage::Normal, 0, 1 },
-    { DeclUsage::Tangent, 0, 2 },
-    { DeclUsage::Binormal, 0, 3 },
-    { DeclUsage::TexCoord, 0, 4 },
-    { DeclUsage::TexCoord, 1, 5 },
-    { DeclUsage::TexCoord, 2, 6 },
-    { DeclUsage::TexCoord, 3, 7 },
-    { DeclUsage::Color, 0, 8 },
-    { DeclUsage::BlendIndices, 0, 9 },
-    { DeclUsage::BlendWeight, 0, 10 },
-    { DeclUsage::Color, 1, 11 },
-    { DeclUsage::TexCoord, 4, 12 },
-    { DeclUsage::TexCoord, 5, 13 },
-    { DeclUsage::TexCoord, 6, 14 },
-    { DeclUsage::TexCoord, 7, 15 },
-    { DeclUsage::Position, 1, 15 },
+    {
+        {DeclUsage::Position, 0, 0},
+        {DeclUsage::Normal, 0, 1},
+        {DeclUsage::Tangent, 0, 2},
+        {DeclUsage::Binormal, 0, 3},
+        {DeclUsage::TexCoord, 0, 4},
+        {DeclUsage::TexCoord, 1, 5},
+        {DeclUsage::TexCoord, 2, 6},
+        {DeclUsage::TexCoord, 3, 7},
+        {DeclUsage::Color, 0, 8},
+        {DeclUsage::BlendIndices, 0, 9},
+        {DeclUsage::BlendWeight, 0, 10},
+        {DeclUsage::Color, 1, 11},
+        {DeclUsage::TexCoord, 4, 12},
+        {DeclUsage::TexCoord, 5, 13},
+        {DeclUsage::TexCoord, 6, 14},
+        {DeclUsage::TexCoord, 7, 15},
+        {DeclUsage::Position, 1, 15},
 };
 
 static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
-{
-    { DeclUsage::TexCoord, 0 },
-    { DeclUsage::TexCoord, 1 },
-    { DeclUsage::TexCoord, 2 },
-    { DeclUsage::TexCoord, 3 },
-    { DeclUsage::TexCoord, 4 },
-    { DeclUsage::TexCoord, 5 },
-    { DeclUsage::TexCoord, 6 },
-    { DeclUsage::TexCoord, 7 },
-    { DeclUsage::TexCoord, 8 },
-    { DeclUsage::TexCoord, 9 },
-    { DeclUsage::TexCoord, 10 },
-    { DeclUsage::TexCoord, 11 },
-    { DeclUsage::TexCoord, 12 },
-    { DeclUsage::TexCoord, 13 },
-    { DeclUsage::TexCoord, 14 },
-    { DeclUsage::TexCoord, 15 },
-    { DeclUsage::Color, 0 },
-    { DeclUsage::Color, 1 },
+    {
+        {DeclUsage::TexCoord, 0},
+        {DeclUsage::TexCoord, 1},
+        {DeclUsage::TexCoord, 2},
+        {DeclUsage::TexCoord, 3},
+        {DeclUsage::TexCoord, 4},
+        {DeclUsage::TexCoord, 5},
+        {DeclUsage::TexCoord, 6},
+        {DeclUsage::TexCoord, 7},
+        {DeclUsage::TexCoord, 8},
+        {DeclUsage::TexCoord, 9},
+        {DeclUsage::TexCoord, 10},
+        {DeclUsage::TexCoord, 11},
+        {DeclUsage::TexCoord, 12},
+        {DeclUsage::TexCoord, 13},
+        {DeclUsage::TexCoord, 14},
+        {DeclUsage::TexCoord, 15},
+        {DeclUsage::Color, 0},
+        {DeclUsage::Color, 1},
 #ifdef SST_RECOMP
-    // Sega Superstars Tennis also passes these between VS and PS.
-    { DeclUsage::Normal, 0 },
-    { DeclUsage::Tangent, 0 },
-    { DeclUsage::Binormal, 0 },
-    { DeclUsage::Position, 1 },
+        // Sega Superstars Tennis also passes these between VS and PS.
+        {DeclUsage::Normal, 0},
+        {DeclUsage::Tangent, 0},
+        {DeclUsage::Binormal, 0},
+        {DeclUsage::Position, 1},
 #endif
 };
 
-static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
-{
-    "2D",
-    "3D", 
-    "Cube" 
-};
+static constexpr std::string_view TEXTURE_DIMENSIONS[] =
+    {
+        "2D",
+        "3D",
+        "Cube"};
 
 static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
 {
@@ -165,7 +161,7 @@ void ShaderRecompiler::printDstSwizzle01(uint32_t dstRegister, uint32_t dstSwizz
     }
 }
 
-void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t address)
+void ShaderRecompiler::recompile(const VertexFetchInstruction &instr, uint32_t address)
 {
     if (instr.isPredicated)
     {
@@ -230,7 +226,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     }
 }
 
-void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+void ShaderRecompiler::recompile(const TextureFetchInstruction &instr, bool bicubic)
 {
     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
         return;
@@ -246,15 +242,15 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
 
     auto printSrcRegister = [&](size_t componentCount)
-        {
-            print("r{}.", instr.srcRegister);
+    {
+        print("r{}.", instr.srcRegister);
 
-            for (size_t i = 0; i < componentCount; i++)
-                out += SWIZZLES[((instr.srcSwizzle >> (i * 2))) & 0x3];
-        };
+        for (size_t i = 0; i < componentCount; i++)
+            out += SWIZZLES[((instr.srcSwizzle >> (i * 2))) & 0x3];
+    };
 
     std::string constName;
-    const char* constNamePtr = nullptr;
+    const char *constNamePtr = nullptr;
 #ifdef UNLEASHED_RECOMP
     bool subtractFromOne = false;
 #endif
@@ -264,9 +260,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     {
         constNamePtr = findResult->second;
 
-    #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
         subtractFromOne = hasMtxPrevInvViewProjection && strcmp(constNamePtr, "sampZBuffer") == 0;
-    #endif
+#endif
     }
     else
     {
@@ -293,10 +289,10 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     {
     case FetchOpcode::TextureFetch:
     {
-    #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
         if (subtractFromOne)
             out += "1.0 - ";
-    #endif
+#endif
 
         out += "tfetch";
         break;
@@ -367,14 +363,14 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
 }
 
-void ShaderRecompiler::recompile(const AluInstruction& instr)
+void ShaderRecompiler::recompile(const AluInstruction &instr)
 {
     if (instr.isPredicated)
     {
         indent();
         println("if ({}p0)", instr.predicateCondition ? "" : "!");
 
-        indent(); 
+        indent();
         out += "{\n";
         ++indentation;
     }
@@ -391,142 +387,134 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     };
 
     auto op = [&](size_t operand)
-        {
-            size_t reg = 0;
-            size_t swizzle = 0;
-            bool select = true;
-            bool negate = false;
-            bool abs = false;
+    {
+        size_t reg = 0;
+        size_t swizzle = 0;
+        bool select = true;
+        bool negate = false;
+        bool abs = false;
 
+        switch (operand)
+        {
+        case SCALAR_CONSTANT_0:
+            reg = instr.src3Register;
+            swizzle = instr.src3Swizzle;
+            select = false;
+            negate = instr.src3Negate;
+            abs = instr.absConstants;
+            break;
+
+        case SCALAR_CONSTANT_1:
+            reg = (uint32_t(instr.scalarOpcode) & 1) | (instr.src3Select << 1) | (instr.src3Swizzle & 0x3C);
+            swizzle = instr.src3Swizzle;
+            select = true;
+            negate = instr.src3Negate;
+            abs = instr.absConstants;
+            break;
+
+        default:
             switch (operand)
             {
-            case SCALAR_CONSTANT_0:
+            case VECTOR_0:
+                reg = instr.src1Register;
+                swizzle = instr.src1Swizzle;
+                select = instr.src1Select;
+                negate = instr.src1Negate;
+                break;
+            case VECTOR_1:
+                reg = instr.src2Register;
+                swizzle = instr.src2Swizzle;
+                select = instr.src2Select;
+                negate = instr.src2Negate;
+                break;
+            case VECTOR_2:
+            case SCALAR_0:
+            case SCALAR_1:
                 reg = instr.src3Register;
                 swizzle = instr.src3Swizzle;
-                select = false;
+                select = instr.src3Select;
                 negate = instr.src3Negate;
-                abs = instr.absConstants;
-                break;
-
-            case SCALAR_CONSTANT_1:
-                reg = (uint32_t(instr.scalarOpcode) & 1) | (instr.src3Select << 1) | (instr.src3Swizzle & 0x3C);
-                swizzle = instr.src3Swizzle;
-                select = true;
-                negate = instr.src3Negate;
-                abs = instr.absConstants;
-                break;
-
-            default:
-                switch (operand)
-                {
-                case VECTOR_0:
-                    reg = instr.src1Register;
-                    swizzle = instr.src1Swizzle;
-                    select = instr.src1Select;
-                    negate = instr.src1Negate;
-                    break;
-                case VECTOR_1:
-                    reg = instr.src2Register;
-                    swizzle = instr.src2Swizzle;
-                    select = instr.src2Select;
-                    negate = instr.src2Negate;
-                    break;
-                case VECTOR_2:
-                case SCALAR_0:
-                case SCALAR_1:
-                    reg = instr.src3Register;
-                    swizzle = instr.src3Swizzle;
-                    select = instr.src3Select;
-                    negate = instr.src3Negate;
-                    break;
-                }
-
-                if (select)
-                {
-                    abs = (reg & 0x80) != 0;
-                    reg &= 0x3F;
-                }
-                else
-                {
-                    abs = instr.absConstants;
-                }
-
                 break;
             }
 
-            std::string regFormatted;
-
-#ifdef SST_RECOMP
-            // Relative constant addressing (c[a0 + n] / c[aL + n]), e.g. bone
-            // palettes. Which "const slot" an operand uses follows Xenia
-            // (src_const_is_addressed): slot 0 unless an earlier source is a
-            // constant. The address indexes the whole register file, so read
-            // it through the raw view of the constant buffer.
-            bool sstRelative = false;
-            if (!select)
-            {
-                bool slot1 = false;
-                switch (operand)
-                {
-                case VECTOR_1:
-                    slot1 = !instr.src1Select;
-                    break;
-                case VECTOR_2:
-                case SCALAR_0:
-                case SCALAR_1:
-                case SCALAR_CONSTANT_0:
-                    slot1 = !(instr.src1Select && instr.src2Select);
-                    break;
-                default:
-                    break;
-                }
-                sstRelative = slot1 ? instr.const1Relative : instr.const0Relative;
-            }
-
-            if (sstRelative)
-            {
-                regFormatted = fmt::format("SST_CONST_REL({} + {})", reg,
-                    instr.constAddressRegisterRelative ? "a0" : "aL");
-            }
-            else
-#endif
             if (select)
             {
-                regFormatted = fmt::format("r{}", reg);
+                abs = (reg & 0x80) != 0;
+                reg &= 0x3F;
             }
             else
             {
-                auto findResult = float4Constants.find(reg);
-                if (findResult != float4Constants.end())
-                {
-                    const char* constantName = reinterpret_cast<const char*>(constantTableData + findResult->second->name);
-                    if (findResult->second->registerCount > 1)
-                    {
-                    #ifdef UNLEASHED_RECOMP
-                        if (hasMtxProjection && strcmp(constantName, "g_MtxProjection") == 0)
-                        {
-                            regFormatted = fmt::format("(iterationIndex == 0 ? mtxProjectionReverseZ[{0}] : mtxProjection[{0}])",
-                                reg - findResult->second->registerIndex);
-                        }
-                        else
-                    #endif
-                        {
-                            regFormatted = fmt::format("{}({}{})", constantName,
-                                reg - findResult->second->registerIndex,
+                abs = instr.absConstants;
+            }
+
+            break;
+        }
+
+        std::string regFormatted;
+
 #ifdef SST_RECOMP
-                                // relative operands were handled above
-                                "");
-#else
-                                instr.const0Relative ? (instr.constAddressRegisterRelative ? " + a0" : " + aL") : "");
+        // Relative constant addressing (c[a0 + n] / c[aL + n]), e.g. bone
+        // palettes. Which "const slot" an operand uses follows Xenia
+        // (src_const_is_addressed): slot 0 unless an earlier source is a
+        // constant. The address indexes the whole register file, so read
+        // it through the raw view of the constant buffer.
+        bool sstRelative = false;
+        if (!select)
+        {
+            bool slot1 = false;
+            switch (operand)
+            {
+            case VECTOR_1:
+                slot1 = !instr.src1Select;
+                break;
+            case VECTOR_2:
+            case SCALAR_0:
+            case SCALAR_1:
+            case SCALAR_CONSTANT_0:
+                slot1 = !(instr.src1Select && instr.src2Select);
+                break;
+            default:
+                break;
+            }
+            sstRelative = slot1 ? instr.const1Relative : instr.const0Relative;
+        }
+
+        if (sstRelative)
+        {
+            regFormatted = fmt::format("SST_CONST_REL({} + {})", reg,
+                                       instr.constAddressRegisterRelative ? "a0" : "aL");
+        }
+        else
 #endif
-                        }
+            if (select)
+        {
+            regFormatted = fmt::format("r{}", reg);
+        }
+        else
+        {
+            auto findResult = float4Constants.find(reg);
+            if (findResult != float4Constants.end())
+            {
+                const char *constantName = reinterpret_cast<const char *>(constantTableData + findResult->second->name);
+                if (findResult->second->registerCount > 1)
+                {
+#ifdef UNLEASHED_RECOMP
+                    if (hasMtxProjection && strcmp(constantName, "g_MtxProjection") == 0)
+                    {
+                        regFormatted = fmt::format("(iterationIndex == 0 ? mtxProjectionReverseZ[{0}] : mtxProjection[{0}])",
+                                                   reg - findResult->second->registerIndex);
                     }
                     else
-                    {
-#ifndef SST_RECOMP // the flags may belong to the other constant operand
-                        assert(!instr.const0Relative && !instr.const1Relative);
 #endif
-                        regFormatted = constantName;
+                    {
+                        regFormatted = fmt::format("{}({}{})", constantName,
+                                                   reg - findResult->second->registerIndex,
+#ifdef SST_RECOMP
+                                                   // relative operands were handled above
+                                                   "");
+#else
+                                                   instr.const0Relative ? (instr.constAddressRegisterRelative ? " + a0" : " + aL") : "");
+#endif
                     }
                 }
                 else
@@ -534,74 +522,82 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 #ifndef SST_RECOMP // the flags may belong to the other constant operand
                     assert(!instr.const0Relative && !instr.const1Relative);
 #endif
-                    regFormatted = fmt::format("c{}", reg);
+                    regFormatted = constantName;
                 }
             }
-
-            std::string result;
-
-            if (negate)
-                result += '-';
-
-            if (abs)
-                result += "abs(";
-
-            result += regFormatted;
-            result += '.';
-
-            switch (operand)
+            else
             {
-            case VECTOR_0:
-            case VECTOR_1:
-            case VECTOR_2:
+#ifndef SST_RECOMP // the flags may belong to the other constant operand
+                assert(!instr.const0Relative && !instr.const1Relative);
+#endif
+                regFormatted = fmt::format("c{}", reg);
+            }
+        }
+
+        std::string result;
+
+        if (negate)
+            result += '-';
+
+        if (abs)
+            result += "abs(";
+
+        result += regFormatted;
+        result += '.';
+
+        switch (operand)
+        {
+        case VECTOR_0:
+        case VECTOR_1:
+        case VECTOR_2:
+        {
+            uint32_t mask;
+
+            switch (instr.vectorOpcode)
             {
-                uint32_t mask;
+            case AluVectorOpcode::Dp2Add:
+                mask = (operand == VECTOR_2) ? 0b1 : 0b11;
+                break;
 
-                switch (instr.vectorOpcode)
-                {
-                case AluVectorOpcode::Dp2Add:
-                    mask = (operand == VECTOR_2) ? 0b1 : 0b11;
-                    break;
+            case AluVectorOpcode::Dp3:
+                mask = 0b111;
+                break;
 
-                case AluVectorOpcode::Dp3:
-                    mask = 0b111;
-                    break;
+            case AluVectorOpcode::Dp4:
+            case AluVectorOpcode::Max4:
+                mask = 0b1111;
+                break;
 
-                case AluVectorOpcode::Dp4:
-                case AluVectorOpcode::Max4:
-                    mask = 0b1111;
-                    break;
-
-                default:
-                    mask = instr.vectorWriteMask != 0 ? instr.vectorWriteMask : 0b1;
-                    break;
-                }
-
-                for (size_t i = 0; i < 4; i++)
-                {
-                    if ((mask >> i) & 0x1)
-                        result += SWIZZLES[((swizzle >> (i * 2)) + i) & 0x3];
-                }
-
+            default:
+                mask = instr.vectorWriteMask != 0 ? instr.vectorWriteMask : 0b1;
                 break;
             }
 
-            case SCALAR_0:
-            case SCALAR_CONSTANT_0:
-                result += SWIZZLES[((swizzle >> 6) + 3) & 0x3];
-                break;
-
-            case SCALAR_1:
-            case SCALAR_CONSTANT_1:
-                result += SWIZZLES[swizzle & 0x3];
-                break;
+            for (size_t i = 0; i < 4; i++)
+            {
+                if ((mask >> i) & 0x1)
+                    result += SWIZZLES[((swizzle >> (i * 2)) + i) & 0x3];
             }
 
-            if (abs)
-                result += ")";
+            break;
+        }
 
-            return result;
-        };
+        case SCALAR_0:
+        case SCALAR_CONSTANT_0:
+            result += SWIZZLES[((swizzle >> 6) + 3) & 0x3];
+            break;
+
+        case SCALAR_1:
+        case SCALAR_CONSTANT_1:
+            result += SWIZZLES[swizzle & 0x3];
+            break;
+        }
+
+        if (abs)
+            result += ")";
+
+        return result;
+    };
 
     switch (instr.vectorOpcode)
     {
@@ -609,17 +605,17 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         indent();
         println("clip(any({} == {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
         break;
-    
+
     case AluVectorOpcode::KillGt:
         indent();
         println("clip(any({} > {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
         break;
-    
+
     case AluVectorOpcode::KillGe:
         indent();
         println("clip(any({} >= {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
         break;
-    
+
     case AluVectorOpcode::KillNe:
         indent();
         println("clip(any({} != {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
@@ -637,16 +633,16 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             {
             case ExportRegister::PSColor0:
                 exportRegister = "oC0";
-                break;        
+                break;
             case ExportRegister::PSColor1:
                 exportRegister = "oC1";
-                break;        
+                break;
             case ExportRegister::PSColor2:
                 exportRegister = "oC2";
-                break;            
+                break;
             case ExportRegister::PSColor3:
                 exportRegister = "oC3";
-                break;           
+                break;
             case ExportRegister::PSDepth:
                 exportRegister = "oDepth";
                 break;
@@ -659,7 +655,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             case ExportRegister::VSPosition:
                 exportRegister = "oPos";
 
-            #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
                 if (hasMtxProjection)
                 {
                     indent();
@@ -670,7 +666,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
                     closeIfBracket = true;
                 }
-            #endif
+#endif
 
                 break;
 
@@ -758,7 +754,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluVectorOpcode::Mul:
+#ifdef SST_RECOMP
+            print("sstMul({}, {})", op(VECTOR_0), op(VECTOR_1));
+#else
             print("{} * {}", op(VECTOR_0), op(VECTOR_1));
+#endif
             break;
 
         case AluVectorOpcode::Max:
@@ -799,7 +799,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluVectorOpcode::Mad:
+#ifdef SST_RECOMP
+            print("sstMul({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
+#else
             print("{} * {} + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
+#endif
             break;
 
         case AluVectorOpcode::CndEq:
@@ -816,11 +820,19 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
         case AluVectorOpcode::Dp4:
         case AluVectorOpcode::Dp3:
+#ifdef SST_RECOMP
+            print("sstDot({}, {})", op(VECTOR_0), op(VECTOR_1));
+#else
             print("dot({}, {})", op(VECTOR_0), op(VECTOR_1));
+#endif
             break;
 
         case AluVectorOpcode::Dp2Add:
+#ifdef SST_RECOMP
+            print("sstDot({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
+#else
             print("dot({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
+#endif
             break;
 
         case AluVectorOpcode::Cube:
@@ -926,12 +938,20 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluScalarOpcode::Muls:
+#ifdef SST_RECOMP
+            print("sstMul({}, {})", op(SCALAR_0), op(SCALAR_1));
+#else
             print("{} * {}", op(SCALAR_0), op(SCALAR_1));
+#endif
             break;
 
         case AluScalarOpcode::MulsPrev:
         case AluScalarOpcode::MulsPrev2:
+#ifdef SST_RECOMP
+            print("sstMul({}, ps)", op(SCALAR_0));
+#else
             print("{} * ps", op(SCALAR_0));
+#endif
             break;
 
         case AluScalarOpcode::Maxs:
@@ -1050,7 +1070,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
         case AluScalarOpcode::Mulsc0:
         case AluScalarOpcode::Mulsc1:
+#ifdef SST_RECOMP
+            print("sstMul({}, {})", op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
+#else
             print("{} * {}", op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
+#endif
             break;
 
         case AluScalarOpcode::Addsc0:
@@ -1082,7 +1106,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         case AluScalarOpcode::MaxAs:
             indent();
             println("a0 = (int)clamp(floor({} + 0.5), -256.0, 255.0);", op(SCALAR_0));
-            break;     
+            break;
         case AluScalarOpcode::MaxAsf:
             indent();
             println("a0 = (int)clamp(floor({}), -256.0, 255.0);", op(SCALAR_0));
@@ -1158,9 +1182,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 }
 
-void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
+void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_view &include)
 {
-    const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
+    const auto shaderContainer = reinterpret_cast<const ShaderContainer *>(shaderData);
 
     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
     assert(shaderContainer->constantTableOffset != NULL);
@@ -1170,9 +1194,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     isPixelShader = (shaderContainer->flags & 0x1) == 0;
 
-    const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
-    constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+    const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer *>(shaderData + shaderContainer->constantTableOffset);
+    constantTableData = reinterpret_cast<const uint8_t *>(&constantTableContainer->constantTable);
 
+#ifdef SST_RECOMP
+    // Xenos multiplies follow Direct3D 9: 0 * anything = 0, including infinity and NaN (IEEE gives NaN). Skinning relies on it: unused bone slots have weight 0 but may index constants holding inf / NaN, which would turn the whole vertex into NaN (spikes) on a PC GPU.
+    out += "template<typename T> T sstMul(T a, T b) { return select(or(a == 0, b == 0), (T)0, a * b); }\n";
+    out += "template<typename T> float sstDot(T a, T b) { return dot(sstMul(a, b), (T)1); }\n\n";
+#endif
     out += "#ifdef __spirv__\n\n";
 
 #ifdef UNLEASHED_RECOMP
@@ -1182,12 +1211,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
     {
-        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+        const auto constantInfo = reinterpret_cast<const ConstantInfo *>(
             constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
 
-        const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+        const char *constantName = reinterpret_cast<const char *>(constantTableData + constantInfo->name);
 
-    #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
         if (!isPixelShader)
         {
             if (strcmp(constantName, "g_MtxProjection") == 0)
@@ -1202,27 +1231,27 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             if (strcmp(constantName, "g_MtxPrevInvViewProjection") == 0)
                 hasMtxPrevInvViewProjection = true;
         }
-    #endif
+#endif
 
         switch (constantInfo->registerSet)
         {
         case RegisterSet::Float4:
         {
-            const char* shaderName = isPixelShader ? "Pixel" : "Vertex";
+            const char *shaderName = isPixelShader ? "Pixel" : "Vertex";
 
             if (constantInfo->registerCount > 1)
             {
                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
 
                 println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
-                    constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
+                        constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
             }
             else
             {
                 println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
-                    constantName, shaderName, constantInfo->registerIndex * 16);
+                        constantName, shaderName, constantInfo->registerIndex * 16);
             }
-            
+
             for (uint16_t j = 0; j < constantInfo->registerCount; j++)
                 float4Constants.emplace(constantInfo->registerIndex + j, constantInfo);
 
@@ -1234,22 +1263,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
+                        constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
             }
 
             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
+                    constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
 
             samplers.emplace(constantInfo->registerIndex, constantName);
             break;
         }
-
         }
     }
 
 #ifdef SST_RECOMP
     println("#define SST_CONST_REL(INDEX) vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + clamp(int(INDEX), 0, 255) * 16, 0x10)",
-        isPixelShader ? "Pixel" : "Vertex");
+            isPixelShader ? "Pixel" : "Vertex");
 #endif
     out += "\n#else\n\n";
 
@@ -1257,9 +1285,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     // Raw view of the same constants (the host binds the same buffer to
     // b3/b4 space4) for relative addressing.
     println("cbuffer {0}ShaderConstantsRaw : register(b{1}, space4) {{ float4 g_{0}ShaderConstantsRaw[256]; }};",
-        isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 4 : 3);
+            isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 4 : 3);
     println("#define SST_CONST_REL(INDEX) g_{}ShaderConstantsRaw[clamp(int(INDEX), 0, 255)]",
-        isPixelShader ? "Pixel" : "Vertex");
+            isPixelShader ? "Pixel" : "Vertex");
     out += "\n";
 #endif
     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
@@ -1267,12 +1295,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
     {
-        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+        const auto constantInfo = reinterpret_cast<const ConstantInfo *>(
             constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
 
         if (constantInfo->registerSet == RegisterSet::Float4)
         {
-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+            const char *constantName = reinterpret_cast<const char *>(constantTableData + constantInfo->name);
 
             print("\tfloat4 {}", constantName);
 
@@ -1296,21 +1324,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
     {
-        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+        const auto constantInfo = reinterpret_cast<const ConstantInfo *>(
             constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
 
         if (constantInfo->registerSet == RegisterSet::Sampler)
         {
-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+            const char *constantName = reinterpret_cast<const char *>(constantTableData + constantInfo->name);
 
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
                 println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+                        constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
             }
 
             println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+                    constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
         }
     }
 
@@ -1321,12 +1349,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
     {
-        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+        const auto constantInfo = reinterpret_cast<const ConstantInfo *>(
             constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
 
         if (constantInfo->registerSet == RegisterSet::Bool)
         {
-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+            const char *constantName = reinterpret_cast<const char *>(constantTableData + constantInfo->name);
             println("\t#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
             boolConstants.emplace(constantInfo->registerIndex, constantName);
         }
@@ -1334,7 +1362,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     out += '\n';
 
-    const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
+    const auto shader = reinterpret_cast<const Shader *>(shaderData + shaderContainer->shaderOffset);
 
     out += "#ifndef __spirv__\n";
 
@@ -1351,7 +1379,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         out += "\tin float4 iPos : SV_Position,\n";
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
+        for (auto &[usage, usageIndex] : INTERPOLATORS)
             println("\tin float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
 
         out += "#ifdef __spirv__\n";
@@ -1360,7 +1388,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\tin uint iFace : SV_IsFrontFace\n";
         out += "#endif\n";
 
-        auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
+        auto pixelShader = reinterpret_cast<const PixelShader *>(shader);
         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
             out += ",\n\tout float4 oC0 : SV_Target0";
         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR1)
@@ -1374,7 +1402,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     }
     else
     {
-        auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
+        auto vertexShader = reinterpret_cast<const VertexShader *>(shader);
         for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
         {
             union
@@ -1385,19 +1413,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
 
-            const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
+            const char *usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
 
-        #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
             if ((vertexElement.usage == DeclUsage::TexCoord && vertexElement.usageIndex == 2 && isMetaInstancer) ||
                 (vertexElement.usage == DeclUsage::Position && vertexElement.usageIndex == 1))
             {
                 usageType = "uint4";
             }
-        #endif
+#endif
 
             out += '\t';
 
-            for (auto& usageLocation : USAGE_LOCATIONS)
+            for (auto &usageLocation : USAGE_LOCATIONS)
             {
                 if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
                 {
@@ -1407,22 +1435,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             }
 
             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
-                uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
+                    uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
 
             vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
         }
 
-    #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
         if (hasIndexCount)
         {
             out += "\tin uint iVertexId : SV_VertexID,\n";
             out += "\tin uint iInstanceId : SV_InstanceID,\n";
         }
-    #endif
+#endif
+#ifdef SST_RECOMP
+        // Xenos starts a vertex shader with the vertex index in r0.x (some shaders use it, e.g. particle quads picking their corner)
+        out += "\tin uint iVertexId : SV_VertexID,\n";
+#endif
 
         out += "\tout float4 oPos : SV_Position";
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
+        for (auto &[usage, usageIndex] : INTERPOLATORS)
             print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
     }
 
@@ -1446,16 +1478,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     if (shaderContainer->definitionTableOffset != NULL)
     {
-        auto definitionTable = reinterpret_cast<const DefinitionTable*>(shaderData + shaderContainer->definitionTableOffset);
+        auto definitionTable = reinterpret_cast<const DefinitionTable *>(shaderData + shaderContainer->definitionTableOffset);
         auto definitions = definitionTable->definitions;
         while (*definitions != 0)
         {
-            auto definition = reinterpret_cast<const Float4Definition*>(definitions);
-            auto value = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + definition->physicalOffset);
+            auto definition = reinterpret_cast<const Float4Definition *>(definitions);
+            auto value = reinterpret_cast<const be<uint32_t> *>(shaderData + shaderContainer->virtualSize + definition->physicalOffset);
             for (uint16_t i = 0; i < (definition->count + 3) / 4; i++)
             {
                 println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
-                    definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
+                        definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
 
                 value += 4;
             }
@@ -1464,7 +1496,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         ++definitions;
         while (*definitions != 0)
         {
-            auto definition = reinterpret_cast<const Int4Definition*>(definitions);
+            auto definition = reinterpret_cast<const Int4Definition *>(definitions);
             for (uint16_t i = 0; i < definition->count; i++)
             {
                 union
@@ -1482,7 +1514,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 value = definition->values[i].get();
 
                 println("\tint4 i{} = int4({}, {}, {}, {});",
-                    (definition->registerIndex - 8992) / 4 + i, x, y, z, w);
+                        (definition->registerIndex - 8992) / 4 + i, x, y, z, w);
             }
             definitions += 2;
             definitions += definition->count;
@@ -1502,16 +1534,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             Interpolator interpolator;
             uint32_t value;
         };
-    
+
         if (isPixelShader)
         {
-            value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
+            value = reinterpret_cast<const PixelShader *>(shader)->interpolators[i];
             println("\tfloat4 r{} = i{}{};", uint32_t(interpolator.reg), USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
             printedRegisters[interpolator.reg] = true;
         }
         else
         {
-            auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
+            auto vertexShader = reinterpret_cast<const VertexShader *>(shader);
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
             interpolators.emplace(i, fmt::format("o{}{}", USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex)));
         }
@@ -1519,12 +1551,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     if (!isPixelShader)
     {
-    #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
         if (!hasMtxProjection)
             out += "\toPos = 0.0;\n";
-    #endif
+#endif
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
+        for (auto &[usage, usageIndex] : INTERPOLATORS)
             println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
 
         out += "\n";
@@ -1539,12 +1571,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
             }
-        #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
             else if (!isPixelShader && hasIndexCount && i == 0)
             {
                 out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
             }
-        #endif
+#endif
+#ifdef SST_RECOMP
+            else if (!isPixelShader && i == 0)
+            {
+                // Host draws are rebased; the host adds the first vertex back.
+                out += "float4(float(iVertexId + g_VertexIndexBase), 0.0, 0.0, 0.0);\n";
+            }
+#endif
             else
             {
                 out += "0.0;\n";
@@ -1567,7 +1606,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\tCubeMapData cubeMapData = (CubeMapData)0;\n";
     }
 
-    const be<uint32_t>* code = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset);
+    const be<uint32_t> *code = reinterpret_cast<const be<uint32_t> *>(shaderData + shaderContainer->virtualSize + shader->physicalOffset);
 
     union
     {
@@ -1593,7 +1632,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
         code3 = controlFlowCode[2] >> 16;
 
-        for (auto& cfInstr : controlFlow)
+        for (auto &cfInstr : controlFlow)
         {
             uint32_t address = 0;
 
@@ -1660,7 +1699,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
         code3 = controlFlowCode[2] >> 16;
 
-        for (auto& cfInstr : controlFlow)
+        for (auto &cfInstr : controlFlow)
         {
             if (!simpleControlFlow)
             {
@@ -1721,15 +1760,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 if (simpleControlFlow)
                 {
                     indent();
-                #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
                     print("[unroll] ");
-                #endif
+#endif
                     println("for (aL = 0; aL < i{}.x; aL++)", uint32_t(cfInstr.loopStart.loopId));
                     indent();
                     out += "{\n";
                     ++indentation;
                 }
-                else 
+                else
                 {
                     out += "\t\t\taL = 0;\n";
                 }
@@ -1796,7 +1835,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             }
 
             auto instructionCode = code + address * 3;
-            
+
             for (uint32_t i = 0; i < count; i++)
             {
                 union
@@ -1811,11 +1850,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         uint32_t code2;
                     };
                 };
-            
+
                 code0 = instructionCode[0];
                 code1 = instructionCode[1];
                 code2 = instructionCode[2];
-            
+
                 if ((sequence & 0x1) != 0)
                 {
                     if (vertexFetch.opcode == FetchOpcode::VertexFetch)
@@ -1824,7 +1863,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     }
                     else
                     {
-                    #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
                         if (textureFetch.constIndex == 10) // g_GISampler
                         {
                             specConstantsMask |= SPEC_CONSTANT_BICUBIC_GI_FILTER;
@@ -1853,7 +1892,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                             out += '}';
                         }
                         else
-                    #endif
+#endif
                         {
                             recompile(textureFetch, false);
                         }
@@ -1863,7 +1902,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 {
                     recompile(alu);
                 }
-            
+
                 sequence >>= 2;
                 instructionCode += 3;
             }
@@ -1885,7 +1924,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     indent();
                     out += "}";
 
-                #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
                     specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
 
                     indent();
@@ -1900,13 +1939,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
                     indent();
                     out += '}';
-                #endif
+#endif
                 }
                 else
                 {
-                #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
                     if (!hasMtxProjection)
-                #endif
+#endif
                     {
                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                     }
@@ -1915,13 +1954,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 if (simpleControlFlow)
                 {
                     indent();
-                #ifdef UNLEASHED_RECOMP
+#ifdef UNLEASHED_RECOMP
                     if (hasMtxProjection)
                     {
                         out += "continue;\n";
                     }
                     else
-                #endif
+#endif
                     {
                         out += "return;\n";
                     }

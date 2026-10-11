@@ -15,10 +15,28 @@ index e505a5e..efbd4d0 100644
      target_compile_definitions(XenosRecomp PRIVATE XENOS_RECOMP_DXIL)
      target_link_libraries(XenosRecomp PRIVATE Microsoft::DXIL)
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..b15f722 100644
+index 1c74034..0a0488d 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -65,6 +65,19 @@ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
+@@ -30,6 +30,7 @@ struct PushConstants
+ #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+ #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+ #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
++#define g_VertexIndexBase          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276)
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+ 
+@@ -41,7 +42,8 @@ struct PushConstants
+     uint g_Booleans : packoffset(c16.x); \
+     uint g_SwappedTexcoords : packoffset(c16.y); \
+     float2 g_HalfPixelOffset : packoffset(c16.z); \
+-    float g_AlphaThreshold : packoffset(c17.x);
++    float g_AlphaThreshold : packoffset(c17.x); \
++    uint g_VertexIndexBase : packoffset(c17.y);
+ 
+ uint g_SpecConstants();
+ 
+@@ -65,6 +67,19 @@ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
      return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
  }
  
@@ -39,7 +57,7 @@ index 1c74034..b15f722 100644
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..297e5a4 100644
+index 698a418..ab849a3 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -115,7 +115,14 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
@@ -145,7 +163,99 @@ index 698a418..297e5a4 100644
                  assert(findResult != interpolators.end());
                  exportRegister = findResult->second;
                  break;
-@@ -1187,8 +1247,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -698,7 +758,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             break;
+ 
+         case AluVectorOpcode::Mul:
++#ifdef SST_RECOMP
++            print("sstMul({}, {})", op(VECTOR_0), op(VECTOR_1));
++#else
+             print("{} * {}", op(VECTOR_0), op(VECTOR_1));
++#endif
+             break;
+ 
+         case AluVectorOpcode::Max:
+@@ -739,7 +803,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             break;
+ 
+         case AluVectorOpcode::Mad:
++#ifdef SST_RECOMP
++            print("sstMul({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
++#else
+             print("{} * {} + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
++#endif
+             break;
+ 
+         case AluVectorOpcode::CndEq:
+@@ -756,11 +824,19 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+         case AluVectorOpcode::Dp4:
+         case AluVectorOpcode::Dp3:
++#ifdef SST_RECOMP
++            print("sstDot({}, {})", op(VECTOR_0), op(VECTOR_1));
++#else
+             print("dot({}, {})", op(VECTOR_0), op(VECTOR_1));
++#endif
+             break;
+ 
+         case AluVectorOpcode::Dp2Add:
++#ifdef SST_RECOMP
++            print("sstDot({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
++#else
+             print("dot({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
++#endif
+             break;
+ 
+         case AluVectorOpcode::Cube:
+@@ -866,12 +942,20 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             break;
+ 
+         case AluScalarOpcode::Muls:
++#ifdef SST_RECOMP
++            print("sstMul({}, {})", op(SCALAR_0), op(SCALAR_1));
++#else
+             print("{} * {}", op(SCALAR_0), op(SCALAR_1));
++#endif
+             break;
+ 
+         case AluScalarOpcode::MulsPrev:
+         case AluScalarOpcode::MulsPrev2:
++#ifdef SST_RECOMP
++            print("sstMul({}, ps)", op(SCALAR_0));
++#else
+             print("{} * ps", op(SCALAR_0));
++#endif
+             break;
+ 
+         case AluScalarOpcode::Maxs:
+@@ -990,7 +1074,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+         case AluScalarOpcode::Mulsc0:
+         case AluScalarOpcode::Mulsc1:
++#ifdef SST_RECOMP
++            print("sstMul({}, {})", op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
++#else
+             print("{} * {}", op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
++#endif
+             break;
+ 
+         case AluScalarOpcode::Addsc0:
+@@ -1113,6 +1201,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+ 
++#ifdef SST_RECOMP
++    // Xenos multiplies follow Direct3D 9: 0 * anything = 0, including
++    // infinity and NaN (IEEE gives NaN). Skinning relies on it: unused bone
++    // slots have weight 0 but may index constants holding inf / NaN, which
++    // would turn the whole vertex into NaN (spikes) on a PC GPU.
++    out += "template<typename T> T sstMul(T a, T b) { return select(or(a == 0, b == 0), (T)0, a * b); }\n";
++    out += "template<typename T> float sstDot(T a, T b) { return dot(sstMul(a, b), (T)1); }\n\n";
++#endif
+     out += "#ifdef __spirv__\n\n";
+ 
+ #ifdef UNLEASHED_RECOMP
+@@ -1187,8 +1283,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  
@@ -167,7 +277,33 @@ index 698a418..297e5a4 100644
      println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
      out += "{\n";
  
-@@ -1479,6 +1552,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1346,6 +1455,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             out += "\tin uint iInstanceId : SV_InstanceID,\n";
+         }
+     #endif
++    #ifdef SST_RECOMP
++        // Xenos starts a vertex shader with the vertex index in r0.x (some
++        // shaders use it, e.g. particle quads picking their corner).
++        out += "\tin uint iVertexId : SV_VertexID,\n";
++    #endif
+ 
+         out += "\tout float4 oPos : SV_Position";
+ 
+@@ -1471,6 +1585,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
+             }
++        #endif
++        #ifdef SST_RECOMP
++            else if (!isPixelShader && i == 0)
++            {
++                // Host draws are rebased; the host adds the first vertex back.
++                out += "float4(float(iVertexId + g_VertexIndexBase), 0.0, 0.0, 0.0);\n";
++            }
+         #endif
+             else
+             {
+@@ -1479,6 +1600,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  

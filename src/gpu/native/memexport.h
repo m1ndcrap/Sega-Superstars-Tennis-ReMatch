@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sst::native
@@ -40,16 +41,19 @@ namespace sst::native
   public:
     // physical_membase: host address of guest physical memory (512 MB)
     // worker_threads: extra threads for large draws (0 = run on the caller only)
-
     MemexportRunner(uint8_t *physical_membase, uint32_t worker_threads);
     ~MemexportRunner();
     uint32_t worker_threads() const;
 
     // ucode: host-endian microcode (control flow first), `dwords` long
     // Runs the shader once per entry of `vertex_indices` (r0.x = index), writing all memory exports. Returns false if nothing could be run
-    bool Run(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants,
-             const uint32_t *vertex_indices, uint32_t count, MemexportStats *stats,
-             bool force_per_vertex = false);
+    bool Run(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, MemexportStats *stats, bool force_per_vertex = false);
+
+    // Debug: runs an ordinary vertex shader on the CPU and returns each vertex's position export (clip space xyzw, 4 floats per vertex; NaN if the shader didn't export one). Memory exports, if any, are still written.
+    bool RunPositions(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, float *positions, MemexportStats *stats);
+
+    // For vertex shaders whose fetches don't use the plain vertex index (e.g. particle quads fetching one record per 4 vertices): runs the shader on the CPU and returns, per full vfetch instruction address, the element index each vertex fetched (-1 if that fetch didn't run for it).
+    bool RunFetchIndices(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, std::unordered_map<uint32_t, std::vector<int32_t>> *records);
 
   private:
     struct Pool;
@@ -57,7 +61,7 @@ namespace sst::native
     std::unique_ptr<Pool> pool_;
   };
 
-  // Float constant registers the shader's ALU instructions read (bit per register in used[4]); false if it uses relative constant addressing (then any register may be read).
+  // Float constant registers the shader's ALU instructions read (bit per register in used[4]); false if it uses relative constant addressing (then any register may be read)
   bool FloatConstantsRead(const uint32_t *ucode, uint32_t dwords, uint64_t used[4]);
 
   // Fetch constant slots (0-95) the shader's vertex fetches read
@@ -68,5 +72,4 @@ namespace sst::native
 
   // Disassembly-lite of the control flow / instructions (for logs)
   std::string DescribeMicrocode(const uint32_t *ucode, uint32_t dwords);
-
 }

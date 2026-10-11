@@ -19,6 +19,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <array>
 #include <cfloat>
 #include <cmath>
@@ -72,6 +73,7 @@ namespace sst::native
 
       if (abs < 0x38800000u)
       {
+        // subnormal / zero
         if (abs < 0x33000000u)
           return uint16_t(sign);
 
@@ -144,6 +146,7 @@ namespace sst::native
       }
     }
 
+    // Packs one eM# value into the stream format. Returns the element size in bytes (0 = unsupported format)
     uint32_t PackElement(const float in[4], uint32_t format_info, uint32_t out[4])
     {
       float v[4] = {in[0], in[1], in[2], in[3]};
@@ -604,6 +607,7 @@ namespace sst::native
       return true;
     }
 
+    // Whether the shader's control flow depends on per-vertex state (the predicate), which the lanes can't share; also the number of temp registers it can touch (all with relative addressing)
     bool NeedsPerVertexFlow(const uint32_t *ucode, uint32_t dwords, uint32_t *temp_count)
     {
       using Op = ucode::ControlFlowOpcode;
@@ -674,10 +678,7 @@ namespace sst::native
               const auto &a = *reinterpret_cast<const ucode::AluInstruction *>(ins);
               if (a.is_predicated())
                 return true;
-              if (a.is_const_address_register_relative())
-                for (uint32_t s = 1; s <= 3; ++s)
-                  if (!a.src_is_temp(s) && a.src_const_is_addressed(s))
-                    return true;
+              // (a0-relative constants are fine: operands are gathered per lane.)
               if (!a.is_export())
                 use(a.vector_dest(), a.is_vector_dest_relative());
               use(a.scalar_dest(), a.is_scalar_dest_relative());
@@ -707,12 +708,21 @@ namespace sst::native
           : ucode_(ucode), dwords_(dwords), c_(c), membase_(membase), stats_(stats),
             temps_(size_t(kTempCount) * 4 * kLanes), clear_floats_(size_t(temp_count) * 4 * kLanes) {}
 
-      void Run(const uint32_t *vertex_indices, uint32_t lanes)
+      // Runs `lanes` (<= kLanes) vertices sharing control flow. positions: if set, receives the position export (xyzw) of each lane.
+      void Run(const uint32_t *vertex_indices, uint32_t lanes, float *positions = nullptr)
       {
         lanes_ = lanes;
+        positions_ = positions;
+
+        if (positions)
+          for (uint32_t i = 0; i < 4 * lanes; ++i)
+            positions[i] = std::nanf("");
+
         std::fill(temps_.begin(), temps_.begin() + clear_floats_, 0.0f);
+
         for (uint32_t l = 0; l < lanes; ++l)
           T(0, 0)
+
         [l] = float(vertex_indices[l]);
         std::memset(ps_, 0, sizeof(ps_));
         std::memset(a0_, 0, sizeof(a0_));
@@ -761,7 +771,7 @@ namespace sst::native
 
       void Execute();
       void ExecuteAlu(const ucode::AluInstruction &instr);
-      void ExecuteVfetch(const uint32_t *dwords);
+      void ExecuteVfetch(const uint32_t *dwords, uint32_t address);
       void StoreFetch(uint32_t dest, bool relative, uint32_t swizzle, const float (*value)[kLanes]);
       void Flush();
 
@@ -772,9 +782,17 @@ namespace sst::native
       MemexportStats *stats_;
 
       uint32_t lanes_ = 0;
-      std::vector<float> temps_;
-      size_t clear_floats_; // zeroed per batch: the registers the shader uses
-      float ps_[kLanes];    // previous scalar
+      float *positions_ = nullptr;
+
+    public:
+      // Fetch-index capture: per full vfetch instruction address, the element index each vertex fetched (lane l of the current batch -> base + l)
+      std::unordered_map<uint32_t, std::vector<int32_t>> *fetch_records_ = nullptr;
+      uint32_t fetch_lane_base_ = 0;
+
+    private:
+      std::vector<float> temps_; // [reg][component][lane]
+      size_t clear_floats_;      // zeroed per batch: the registers the shader uses
+      float ps_[kLanes];         // previous scalar
       int32_t a0_[kLanes];
       bool pred_[kLanes]; // lane 0 steers control flow (one lane if it matters)
       uint32_t vfetch_address_[kLanes];
@@ -847,7 +865,7 @@ namespace sst::native
                   continue;
                 if (fetch.opcode() == ucode::FetchOpcode::kVertexFetch)
                 {
-                  ExecuteVfetch(ins);
+                  ExecuteVfetch(ins, exec.address() + i);
                 }
                 else
                 {
@@ -954,18 +972,18 @@ namespace sst::native
       float vr[4][kLanes];
       float sr[kLanes];
 
-      auto gather = [&](uint32_t src, bool scalar_const_op, float (*out)[kLanes],
-                        const uint32_t *comps, uint32_t ncomps, uint32_t need = 0xF)
+      auto gather = [&](uint32_t src, bool scalar_const_op, float (*out)[kLanes], const uint32_t *comps, uint32_t ncomps, uint32_t need = 0xF)
       {
         const uint32_t reg = instr.src_reg(src);
         const uint32_t neg = uint32_t(instr.src_negate(src)) << 31;
 
+        // Two-operand scalar ops (c#.w with r#.x) always read a constant here: src3_sel is then part of the temp register number.
         if (!scalar_const_op && instr.src_is_temp(src))
         {
-          const uint32_t t = TempIndex(ucode::AluInstruction::src_temp_reg(reg),
-                                       ucode::AluInstruction::is_src_temp_relative(reg));
+          const uint32_t t = TempIndex(ucode::AluInstruction::src_temp_reg(reg), ucode::AluInstruction::is_src_temp_relative(reg));
           const bool absolute = ucode::AluInstruction::is_src_temp_value_absolute(reg);
           const uint32_t abs_mask = ~(uint32_t(absolute) << 31);
+
           for (uint32_t j = 0; j < ncomps; ++j)
           {
             if (!((need >> j) & 1))
@@ -974,23 +992,31 @@ namespace sst::native
             for (uint32_t l = 0; l < L; ++l)
               out[j][l] = AsFloat((AsUint(FlushDenormal(p[l])) & abs_mask) ^ neg);
           }
+
           return;
         }
+
         const bool addressed = instr.src_const_is_addressed(src);
+
         if (addressed && instr.is_const_address_register_relative())
         {
           for (uint32_t l = 0; l < L; ++l)
           {
             const float *c = FloatConstant(int32_t(reg) + a0_[l]);
+
             for (uint32_t j = 0; j < ncomps; ++j)
               out[j][l] = AsFloat(AsUint(FlushDenormal(c[comps[j]])) ^ neg);
           }
+
           return;
         }
+
         const float *c = FloatConstant(int32_t(reg) + (addressed ? state_.LoopAddress() : 0));
+
         for (uint32_t j = 0; j < ncomps; ++j)
         {
           const float v = AsFloat(AsUint(FlushDenormal(c[comps[j]])) ^ neg);
+
           for (uint32_t l = 0; l < L; ++l)
             out[j][l] = v;
         }
@@ -1141,7 +1167,15 @@ namespace sst::native
                 data_[k][j][l] = value(j, l);
           written_ |= 1u << k;
         }
-        // Position / interpolators / point size: not needed
+        if (reg == uint32_t(ucode::ExportRegister::kVSPosition) && positions_)
+        {
+          for (uint32_t j = 0; j < 4; ++j)
+            if (mask & (1u << j))
+              for (uint32_t l = 0; l < L; ++l)
+                positions_[4 * l + j] = value(j, l);
+        }
+
+        // Interpolators / point size: not needed
         return;
       }
       if (vmask)
@@ -1177,7 +1211,7 @@ namespace sst::native
       }
     }
 
-    void Interpreter::ExecuteVfetch(const uint32_t *dw)
+    void Interpreter::ExecuteVfetch(const uint32_t *dw, uint32_t address)
     {
       const auto &instr = *reinterpret_cast<const ucode::VertexFetchInstruction *>(dw);
       if (!instr.is_mini_fetch())
@@ -1194,9 +1228,20 @@ namespace sst::native
       {
         const float *src = T(TempIndex(instr.src(), instr.is_src_relative()), instr.src_swizzle());
         const float round = instr.is_index_rounded() ? 0.5f : 0.0f;
+        std::vector<int32_t> *record = nullptr;
+        if (fetch_records_)
+        {
+          record = &(*fetch_records_)[address];
+          if (record->size() < fetch_lane_base_ + L)
+            record->resize(fetch_lane_base_ + L, -1);
+        }
         for (uint32_t l = 0; l < L; ++l)
-          vfetch_address_[l] = instr.stride() * uint32_t(int32_t(std::floor(src[l] + round))) +
-                               uint32_t(buffer_begin >> 2);
+        {
+          const int32_t index = int32_t(std::floor(src[l] + round));
+          vfetch_address_[l] = instr.stride() * uint32_t(index) + uint32_t(buffer_begin >> 2);
+          if (record)
+            (*record)[fetch_lane_base_ + l] = index;
+        }
       }
 
       FetchElement e;
@@ -1207,7 +1252,6 @@ namespace sst::native
       e.exp_adjust = instr.exp_adjust();
       e.out = FetchElement::Out::kFloat;
       const uint32_t bytes = DeclFormatSize(e.format);
-
       // 32-bit float formats: plain swapped dwords (the common case here)
       uint32_t float_words = 0;
 
@@ -1340,6 +1384,8 @@ namespace sst::native
             continue;
           }
           Swap128(packed, endian);
+
+          // Little-endian dwords = guest byte order; 8 / 16-bit elements take the low bytes of the swapped dword (as Xenia replaces bytes in place)
           std::memcpy(membase_ + address, packed, size);
           ++stats_->elements;
         }
@@ -1348,6 +1394,7 @@ namespace sst::native
 
   }
 
+  // Persistent worker threads: a job is split into parts that the workers and the calling thread take in turn
   struct MemexportRunner::Pool
   {
     explicit Pool(uint32_t n)
@@ -1384,7 +1431,6 @@ namespace sst::native
       // Also wait for workers to leave the job, so none can pick up a part index of the next job with this one's function
       done.wait(lock, [&]
                 { return remaining == 0 && active == 0; });
-
       job = nullptr;
     }
 
@@ -1461,7 +1507,10 @@ namespace sst::native
     const uint32_t lanes = per_vertex ? 1 : kLanes;
     if (per_vertex)
       ++stats->per_vertex_draws;
+
+    // Vertices are independent and write disjoint elements: large draws are split across the worker threads (parts of 8 batches)
     constexpr uint32_t kPartVertices = 8 * kLanes;
+
     if (pool_ && !per_vertex && count >= 2 * kPartVertices)
     {
       const uint32_t parts = (count + kPartVertices - 1) / kPartVertices;
@@ -1497,6 +1546,40 @@ namespace sst::native
         interpreter.Run(vertex_indices + i, std::min(lanes, count - i));
     }
     stats->vertices += count;
+    return true;
+  }
+
+  bool MemexportRunner::RunFetchIndices(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, std::unordered_map<uint32_t, std::vector<int32_t>> *records)
+  {
+    if (!ucode || dwords < 3 || !constants.float_constants || !constants.bool_constants ||
+        !constants.fetch_constants || !membase_ || !records)
+      return false;
+    records->clear();
+    uint32_t temp_count;
+    const bool per_vertex = NeedsPerVertexFlow(ucode, dwords, &temp_count);
+    const uint32_t lanes = per_vertex ? 1 : kLanes;
+    MemexportStats ignored;
+    Interpreter interpreter(ucode, dwords, constants, membase_, &ignored, temp_count);
+    interpreter.fetch_records_ = records;
+    for (uint32_t i = 0; i < count; i += lanes)
+    {
+      interpreter.fetch_lane_base_ = i;
+      interpreter.Run(vertex_indices + i, std::min(lanes, count - i));
+    }
+    return true;
+  }
+
+  bool MemexportRunner::RunPositions(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, float *positions, MemexportStats *stats)
+  {
+    if (!ucode || dwords < 3 || !constants.float_constants || !constants.bool_constants ||
+        !constants.fetch_constants || !membase_)
+      return false;
+    uint32_t temp_count;
+    const bool per_vertex = NeedsPerVertexFlow(ucode, dwords, &temp_count);
+    const uint32_t lanes = per_vertex ? 1 : kLanes;
+    Interpreter interpreter(ucode, dwords, constants, membase_, stats, temp_count);
+    for (uint32_t i = 0; i < count; i += lanes)
+      interpreter.Run(vertex_indices + i, std::min(lanes, count - i), positions + 4 * size_t(i));
     return true;
   }
 
