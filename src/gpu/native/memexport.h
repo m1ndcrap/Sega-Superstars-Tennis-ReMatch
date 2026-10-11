@@ -35,6 +35,26 @@ namespace sst::native
     uint32_t last_count = 0;       // element count of the last stream
   };
 
+  // A memory-export run handed to the background thread (MemexportRunner::Submit): everything the shader reads is copied in, so the render thread can go on recording draws while it runs.
+  struct MemexportJob
+  {
+    std::vector<uint32_t> ucode;
+    std::vector<float> constants; // 256 x float4
+    uint32_t bools[8] = {}, loops[32] = {}, fetch[192] = {};
+    std::vector<uint32_t> indices;
+
+    // Cache: with `use_cache`, the job hashes everything the shader reads (microcode, the constants it uses, indices, fetch constants and input buffers) and skips the run when that and the output range [hash_begin, +hash_size) still match the previous run's hashes (`previous_*`).
+    bool use_cache = false, has_previous = false;
+    uint64_t previous_input_hash = 0, previous_output_hash = 0;
+    uint32_t hash_begin = 0, hash_size = 0;
+
+    // Results, valid once the job's ticket has finished.
+    bool ok = false, skipped = false;
+    MemexportStats stats;
+    uint64_t input_hash = 0, output_hash = 0;
+    double ms = 0;
+  };
+
   class MemexportRunner
   {
   public:
@@ -54,10 +74,24 @@ namespace sst::native
     // For vertex shaders whose fetches don't use the plain vertex index (e.g. particle quads fetching one record per 4 vertices): runs the shader on the CPU and returns, per full vfetch instruction address, the element index each vertex fetched (-1 if that fetch didn't run for it).
     bool RunFetchIndices(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, std::unordered_map<uint32_t, std::vector<int32_t>> *records);
 
+    // Runs a job on the calling thread (cache check, run, output hash).
+    void Execute(MemexportJob &job);
+
+    // Background queue (first in, first out). Returns the job's ticket.
+    uint64_t Submit(std::shared_ptr<MemexportJob> job);
+
+    // Waits until every job up to and including `ticket` has finished.
+    void Wait(uint64_t ticket);
+
+    // highest finished ticket
+    uint64_t finished() const;
+
   private:
     struct Pool;
+    struct Queue;
     uint8_t *membase_;
     std::unique_ptr<Pool> pool_;
+    std::unique_ptr<Queue> queue_;
   };
 
   // Float constant registers the shader's ALU instructions read (bit per register in used[4]); false if it uses relative constant addressing (then any register may be read)

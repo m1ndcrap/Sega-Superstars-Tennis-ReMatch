@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,11 @@
 #include "gpu/native/texture_cache.h"
 
 #include <d3d12.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 #include <wrl/client.h>
 
 namespace rex::ui::d3d12
@@ -25,6 +31,7 @@ namespace rex::ui::d3d12
 namespace sst::native
 {
   class ShaderCache;
+  struct PipelineJob;
   struct ShaderVariant;
   struct ShaderEntry;
 
@@ -46,6 +53,8 @@ namespace sst::native
   {
   public:
     static constexpr uint32_t kSlots = 3;
+    Renderer();
+    ~Renderer();
 
     // physical_membase: host address of guest physical memory (fetch constants hold physical addresses)
     bool Initialize(const rex::ui::d3d12::D3D12Provider &provider, ShaderCache *shaders, const uint8_t *physical_membase, uint32_t width, uint32_t height);
@@ -87,6 +96,90 @@ namespace sst::native
       uint64_t offset = 0;
     };
 
+    // Profiling: time on the game's render thread by phase (TSC ticks, summed over the logging period), frame pacing and GPU time per frame
+  public:
+    enum Phase : uint32_t
+    {
+      kPhOther,
+      kPhMemexport,
+      kPhShaders,
+      kPhInputs,
+      kPhIndices,
+      kPhPipeline,
+      kPhVertices,
+      kPhConstants,
+      kPhTextures,
+      kPhRecord,
+      kPhClear,
+      kPhSubmit,
+      kPhFenceWait,
+      kPhCount
+    };
+
+    struct Profile
+    {
+      uint64_t ticks[kPhCount] = {};
+      uint64_t period_tsc = 0;
+      std::chrono::steady_clock::time_point period_start{}, last_frame{};
+      double frame_ms_sum = 0, frame_ms_max = 0, gpu_ms_sum = 0, gpu_ms_max = 0;
+      uint32_t frames = 0, over_60 = 0, over_30 = 0, gpu_frames = 0;
+    };
+
+    static uint64_t Tick() { return __rdtsc(); }
+
+    // Attributes elapsed time to one phase at a time; the rest goes to the last
+    struct PhaseClock
+    {
+      PhaseClock(Profile &p, Phase ph) : prof(p), phase(ph), start(Tick()) {}
+      ~PhaseClock() { prof.ticks[phase] += Tick() - start; }
+
+      void Switch(Phase next)
+      {
+        const uint64_t now = Tick();
+        prof.ticks[phase] += now - start;
+        phase = next;
+        start = now;
+      }
+
+      Profile &prof;
+      Phase phase;
+      uint64_t start;
+    };
+
+  private:
+    Profile prof_;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamps_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback_;
+    uint64_t timestamp_frequency_ = 0;
+    std::array<bool, kSlots> timestamp_pending_{};
+    void CreateTimestampQueries();
+    void ReadGpuTime(uint32_t slot);
+    void LogProfile();
+
+    // Constant files uploaded this frame, by content (XXH3 of the guest bytes)
+    std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> constant_cache_;
+    D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const uint8_t *guest);
+
+    // Geometry cache: decoded vertex / converted index data in one video memory pool (bump allocated; when full, everything is re-stored on next use)
+    struct GeoEntry
+    {
+      uint64_t hash = 0; // XXH3 of the guest source data last stored
+      uint64_t offset = 0, generation = 0;
+      uint32_t size = 0;           // bytes stored (0 = nothing yet)
+      uint32_t changes = 0;        // times the source data changed
+      uint32_t vmin = 0, vmax = 0; // index entries: referenced vertex range
+      bool dynamic = false;        // changes too often to cache
+    };
+
+    bool GeoCacheUsable();
+    void GeoStore(GeoEntry &e, const Upload &src, uint32_t size);
+    D3D12_GPU_VIRTUAL_ADDRESS GeoAddress(const GeoEntry &e) const;
+    Microsoft::WRL::ComPtr<ID3D12Resource> geo_pool_;
+    uint64_t geo_pool_size_ = 0, geo_offset_ = 0, geo_generation_ = 1;
+    D3D12_RESOURCE_STATES geo_state_ = D3D12_RESOURCE_STATE_COMMON;
+    bool geo_failed_ = false;
+    std::unordered_map<uint64_t, GeoEntry> geo_entries_;
+
     bool CreateRootSignature();
     bool CreateDescriptorsAndPlaceholders();
     void CreateDebugPixelShader();
@@ -98,6 +191,22 @@ namespace sst::native
     // Memory-export (morph) draws: run on the CPU, writing guest memory
     void RunMemexport(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry);
     void RecordMemexportRanges(const uint8_t *base, uint32_t dev);
+
+    // Background memexport jobs not yet collected (oldest first)
+    struct PendingMemexport
+    {
+      uint64_t ticket = 0;
+      std::shared_ptr<MemexportJob> job;
+      uint64_t cache_key = 0, input_hash = 0, vs_hash = 0;
+      uint32_t count = 0, literals = 0, stream_count = 0;
+      bool indexed = false;
+      uint32_t begin[4] = {}, size[4] = {}, format[4] = {};
+    };
+
+    std::vector<PendingMemexport> pending_memexports_;
+    void WaitMemexports(uint32_t begin, uint32_t end);
+    void CollectMemexports(bool all);
+    void FinishMemexport(const PendingMemexport &p);
 
     const char *LoadVsState(const uint8_t *base, uint32_t dev, uint32_t vs_obj, const ShaderEntry *vs_entry, std::vector<uint32_t> &ucode, float *constants, uint32_t bools[8], uint32_t fetch[192], uint32_t loops[32], uint32_t *literals);
     bool ComputeFetchRecords(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count);
@@ -267,6 +376,12 @@ namespace sst::native
     // Pipelines
     std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> pipelines_;
     std::unordered_set<uint64_t> failed_pipelines_;
+    struct PipelineWorkers;
+    std::unique_ptr<PipelineWorkers> pipeline_workers_;
+    std::unordered_map<uint64_t, std::shared_ptr<PipelineJob>> pending_pipelines_;
+    std::unordered_map<const ShaderVariant *, uint64_t> dxil_hashes_;
+    uint64_t DxilHash(const ShaderVariant *v);
+    void FinishPipeline(uint64_t hash, PipelineJob &job, const struct PipelineKey &key);
 
     // Hand-off
     std::mutex slot_mutex_;
@@ -279,6 +394,8 @@ namespace sst::native
       uint64_t draws = 0, drawn = 0;
       uint64_t skip_shader = 0, skip_pending = 0, skip_decl = 0, skip_prim = 0, skip_rt = 0, skip_pipeline = 0, skip_data = 0, skip_cull = 0, skip_memexport = 0;
       uint64_t memexport_draws = 0, memexport_run = 0, memexport_cached = 0, memexport_failed = 0;
+      uint64_t memexport_async = 0, memexport_waits = 0;
+      double memexport_wait_ms = 0;
       double memexport_ms = 0;
       uint64_t memexport_bad_outputs = 0, memexport_bad_logged = 0;
       uint64_t morph_consumers = 0, morph_consumer_overrun = 0, morph_consumer_stale = 0, morph_consumer_bad = 0, morph_consumer_bad_logged = 0;
@@ -291,8 +408,11 @@ namespace sst::native
       uint64_t clears = 0, clear_logged = 0, sample_logged = 0, depth_only = 0, shaders_from_objects = 0, skip_shader_logged = 0;
       uint64_t upload_bytes = 0;
       uint64_t textured_draws = 0, texture_placeholders = 0, shadow_placeholders = 0;
+      uint64_t constants_uploaded = 0, constants_reused = 0;
+      uint64_t geo_vertex_hits = 0, geo_index_hits = 0, geo_stores = 0, geo_store_bytes = 0, geo_dynamic = 0, geo_flushes = 0;
       uint64_t scissored_draws = 0, scissor_logged = 0;
-      uint64_t pipelines_created = 0, pipelines_failed = 0;
+      uint64_t pipelines_created = 0, pipelines_failed = 0, pipelines_from_cache = 0, skip_pipeline_pending = 0;
+      double pipeline_ms = 0;
       std::unordered_map<uint32_t, uint64_t> prims;          // xenos prim -> draws
       std::unordered_map<uint32_t, uint64_t> clear_flags;    // flags -> count
       std::unordered_map<uint64_t, uint64_t> render_targets; // (rt0 object<<32 | size word)

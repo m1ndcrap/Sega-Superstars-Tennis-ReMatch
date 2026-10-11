@@ -11,7 +11,6 @@
 
 namespace sst::native
 {
-
   struct DeclElement
   {
     uint16_t stream;
@@ -34,11 +33,13 @@ namespace sst::native
     bool r11g11b10 = false;     // packed normal: the VS needs SPEC_CONSTANT_R11G11B10_NORMAL
     const char *note = nullptr; // why the mapping is approximate (logged once per type)
   };
+
   ElementMapping MapElement(uint32_t type, uint8_t usage);
 
   const char *UsageSemantic(uint8_t usage); // "POSITION", "TEXCOORD", ...
   std::string DescribeType(uint32_t type);
 
+  // Byte-swaps `bytes` (a multiple of 4) from big-endian guest memory with the vertex buffer's endian mode (fetch constant dword 1, bits 0-1), as the Xenos vertex fetch does before extracting components
   void SwapVertexData(uint32_t endian, const uint8_t *src, uint8_t *dst, size_t bytes);
 
   // CPU vertex fetch
@@ -51,9 +52,9 @@ namespace sst::native
     int exp_adjust = 0;
     uint32_t offset = 0; // bytes inside the vertex
 
-    // Source for each component of the shader input: 0-3 fetched component,
-    // 4 = 0.0, 5 = 1.0.
+    // Source for each component of the shader input: 0-3 fetched component, 4 = 0.0, 5 = 1.0
     uint8_t sel[4] = {0, 1, 2, 3};
+
     enum class Out : uint8_t
     {
       kFloat,     // float4 input
@@ -65,4 +66,6 @@ namespace sst::native
   // Decodes one element of one vertex. `vertex` points at the vertex in guest memory (big-endian), `endian` is the fetch constant's mode.
   void DecodeElement(const FetchElement &e, uint32_t endian, const uint8_t *vertex, uint32_t out[4]);
 
+  // The straightforward implementation the fast DecodeElement must match (tests)
+  void DecodeElementReference(const FetchElement &e, uint32_t endian, const uint8_t *vertex, uint32_t out[4]);
 }
