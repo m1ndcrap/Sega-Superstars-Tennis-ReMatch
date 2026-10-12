@@ -31,6 +31,7 @@ struct PushConstants
 #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
 #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
 #define g_VertexIndexBase          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276)
+#define g_InvRenderScale           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 280)
 
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
@@ -43,7 +44,8 @@ struct PushConstants
     uint g_SwappedTexcoords : packoffset(c16.y); \
     float2 g_HalfPixelOffset : packoffset(c16.z); \
     float g_AlphaThreshold : packoffset(c17.x); \
-    uint g_VertexIndexBase : packoffset(c17.y);
+    uint g_VertexIndexBase : packoffset(c17.y); \
+    float g_InvRenderScale : packoffset(c17.z);
 
 uint g_SpecConstants();
 

@@ -17,6 +17,8 @@
 #include "gpu/frame_source.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <cmath>
 #include <mutex>
 
@@ -442,7 +444,13 @@ namespace sst::gpu
     if (frame_ == 1 || frame_ % 600 == 0)
       REXLOG_INFO("[sst-gpu] presented frame {} ({})", frame_, native_frame ? "native renderer" : "placeholder");
 
-    presenter->RefreshGuestOutput(width, height, width, height,
+    // VIDEO > ASPECT RATIO: the 16:9 frame is shown at the chosen aspect (the game's camera and the native renderer's UI fit match it)
+    uint32_t aspect_xy[2] = {16, 9};
+
+    if (g_has_source && g_source.struct_size >= sizeof(SstFrameSource) && g_source.display_aspect)
+      g_source.display_aspect(g_source.user, &aspect_xy[0], &aspect_xy[1]);
+
+    presenter->RefreshGuestOutput(width, height, aspect_xy[0], aspect_xy[1],
                                   [&](rex::ui::Presenter::GuestOutputRefreshContext &context) -> bool
                                   {
                                     auto &d3d12_context = static_cast<D3D12Presenter::D3D12GuestOutputRefreshContext &>(context);
@@ -515,9 +523,11 @@ extern "C" REX_GPU_PLUGIN_EXPORT void sst_gpu_set_frame_source(const SstFrameSou
 {
   std::lock_guard lock(sst::gpu::g_source_mutex);
 
-  if (source && source->struct_size >= sizeof(SstFrameSource) && source->acquire && source->release)
+  if (source && source->struct_size >= offsetof(SstFrameSource, display_aspect) && source->acquire && source->release)
   {
-    sst::gpu::g_source = *source;
+    sst::gpu::g_source = {};
+    std::memcpy(&sst::gpu::g_source, source, std::min<size_t>(source->struct_size, sizeof(SstFrameSource)));
+    sst::gpu::g_source.struct_size = sizeof(SstFrameSource);
     sst::gpu::g_has_source = true;
     REXLOG_INFO("[sst-gpu] native renderer attached");
   }

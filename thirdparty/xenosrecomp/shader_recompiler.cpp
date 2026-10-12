@@ -1598,7 +1598,12 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
 
       if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
       {
+#ifdef SST_RECOMP
+        // Screen position in guest pixels at any internal resolution
+        out += "float4((iPos.xy * g_InvRenderScale - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+#else
         out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+#endif
       }
 #ifdef UNLEASHED_RECOMP
       else if (!isPixelShader && hasIndexCount && i == 0)

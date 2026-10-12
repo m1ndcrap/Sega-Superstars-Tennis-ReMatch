@@ -4,6 +4,8 @@
 
 #include "gpu/frame_source.h"
 #include "gpu/native/hitch_profiler.h"
+#include "gpu/native/present_hook.h"
+#include "menu/graphics_menu.h"
 #include "gpu/native/renderer.h"
 #include "gpu/native/shader_cache.h"
 
@@ -15,6 +17,9 @@
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
+
+#include <dxgi1_4.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -28,14 +33,14 @@
 #include <unordered_map>
 #include <vector>
 
+REXCVAR_DECLARE(int32_t, sst_aspect);
+
 REXCVAR_DEFINE_INT32(sst_native_log_every, 600, "SST",
                      "Native renderer: print a status line every N frames (0 = never)");
-
 REXCVAR_DEFINE_BOOL(sst_native_game_thread_priority, true, "SST",
                     "Native renderer: raise the game's rendering thread (the one calling Swap) to "
                     "above-normal priority, so background work (morphs, shader / pipeline "
                     "compiles) never delays its frame");
-
 REXCVAR_DEFINE_BOOL(sst_native_render_thread, true, "SST",
                     "Native renderer: record and submit the game's draws on a separate render "
                     "thread (the game thread only snapshots each call's state). false = do all "
@@ -149,7 +154,6 @@ namespace sst::native
       const uint8_t *base = nullptr;
 
       bool threaded = false;
-
       // Render thread queue
       std::mutex queue_mutex;
       std::condition_variable queue_cv, done_cv;
@@ -165,7 +169,6 @@ namespace sst::native
       Batch batch;
       Arena *arena = nullptr;
       uint64_t frame = 0;
-
       struct UcodeCopy
       {
         uint32_t size;
@@ -173,12 +176,10 @@ namespace sst::native
       };
 
       std::unordered_map<uint32_t, UcodeCopy> ucode_copies; // live address -> this frame's copy
-
       // Game-thread cost, per logging period
       double capture_ms = 0, wait_ms = 0;
       double frame_capture_ms = 0, capture_max_ms = 0; // this frame's capture / worst per period
       uint64_t captured = 0, snapshot_bytes = 0, period_frames = 0, ucode_skipped = 0;
-
       // The game's own frame pacing (Swap to Swap)
       std::chrono::steady_clock::time_point last_swap{};
       double swap_max_ms = 0;
@@ -189,12 +190,24 @@ namespace sst::native
     State *g_state = nullptr;
     std::atomic<bool> g_active{false};
 
+    // VIDEO > ASPECT RATIO (sst_aspect: 4:3, 16:9, 16:10, 21:9, 32:9)
+    void DisplayAspectThunk(void *, uint32_t *x, uint32_t *y)
+    {
+      static constexpr uint32_t kAspectXY[5][2] = {{4, 3}, {16, 9}, {16, 10}, {21, 9}, {32, 9}};
+      const auto &a = kAspectXY[std::clamp(REXCVAR_GET(sst_aspect), 0, 4)];
+      *x = a[0];
+      *y = a[1];
+    }
+
     ID3D12Resource *AcquireThunk(void *user, uint32_t *slot, uint32_t *width, uint32_t *height)
     {
       return static_cast<Renderer *>(user)->Acquire(slot, width, height);
     }
 
-    void ReleaseThunk(void *user, uint32_t slot) { static_cast<Renderer *>(user)->Release(slot); }
+    void ReleaseThunk(void *user, uint32_t slot)
+    {
+      static_cast<Renderer *>(user)->Release(slot);
+    }
 
     HMODULE FindPlugin()
     {
@@ -219,7 +232,6 @@ namespace sst::native
 
       return lock;
     }
-
   }
 
   // render thread
@@ -231,8 +243,15 @@ namespace sst::native
       return base + addr + rex::memory::detail::PhysicalHostOffset(addr);
     }
 
-    uint32_t ToVirtual(uint32_t addr) { return addr < 0x20000000u ? (addr | 0xA0000000u) : addr; }
-    bool Plausible(uint32_t addr) { return addr >= 0x40000000u; }
+    uint32_t ToVirtual(uint32_t addr)
+    {
+      return addr < 0x20000000u ? (addr | 0xA0000000u) : addr;
+    }
+
+    bool Plausible(uint32_t addr)
+    {
+      return addr >= 0x40000000u;
+    }
 
     // Runs one command (render thread, or the game thread without one)
     void Execute(State &s, const Command &c)
@@ -277,7 +296,6 @@ namespace sst::native
           s.renderer.LogStats(frame);
           s.shaders.LogStats("so far");
         }
-
         break;
       }
       }
@@ -290,7 +308,6 @@ namespace sst::native
       for (;;)
       {
         Batch batch;
-
         {
           std::unique_lock lock(s->queue_mutex);
           s->queue_cv.wait(lock, [&]
@@ -298,11 +315,9 @@ namespace sst::native
 
           if (s->queue.empty())
             return; // stopping
-
           batch = std::move(s->queue.front());
           s->queue.pop_front();
         }
-
         {
           std::lock_guard lock(s->mutex);
 
@@ -328,7 +343,6 @@ namespace sst::native
     {
     public:
       explicit Capture(State &s) : s_(s), lock_(s.capture_mutex), start_(Clock::now()) {}
-
       ~Capture()
       {
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start_).count();
@@ -342,7 +356,6 @@ namespace sst::native
         cmd_.kind = kind;
         return cmd_;
       }
-
       // Copies guest [addr, addr + size) into the frame's arena and overlays it
       void Range(uint32_t addr, uint32_t size)
       {
@@ -362,7 +375,6 @@ namespace sst::native
         cmd_.overlays[cmd_.overlay_count++] = {addr, addr + size, data};
         s_.snapshot_bytes += size;
       }
-
       // The device state block, plus the bound vertex shader's live microcode
       void Device(uint32_t dev)
       {
@@ -374,7 +386,6 @@ namespace sst::native
 
         if (!Plausible(vs))
           return;
-
         // Microcode pointer (D3D may rebind the object to a differently patched copy) and the live microcode: the object keeps a copy of the container header at +0x368 (+8: physical part size)
         Range(vs + 0x20, 4);
         const uint32_t live = ToVirtual(Be32(vs + 0x20));
@@ -431,7 +442,6 @@ namespace sst::native
         s_.batch = Batch();
         s_.batch.commands.reserve(kBatchCommands);
       }
-
       // Ends the frame: hands its arena over and waits until the render thread is at most one frame behind, with an arena free for the next frame
       void EndFrame()
       {
@@ -442,7 +452,6 @@ namespace sst::native
         Flush();
         s_.ucode_copies.clear();
         const auto wait_start = Clock::now();
-
         {
           std::unique_lock lock(s_.queue_mutex);
           s_.done_cv.wait(lock, [&]
@@ -466,7 +475,6 @@ namespace sst::native
 
     private:
       using Clock = std::chrono::steady_clock;
-
       uint32_t Be32(uint32_t addr) const
       {
         uint32_t v;
@@ -523,7 +531,6 @@ namespace sst::native
       for (int i = 0; i < 3; ++i)
       {
         s.arenas.push_back(std::make_unique<Arena>());
-
         // A frame snapshots ~15-20 MB: allocate (and touch) it up front so the game thread doesn't page-fault fresh chunks mid-match
         s.arenas.back()->Alloc(size_t(32) << 20);
         s.arenas.back()->Reset();
@@ -551,7 +558,6 @@ namespace sst::native
       s.done_cv.notify_all();
       s.thread.join();
     }
-
   }
 
   // lifetime
@@ -569,9 +575,23 @@ namespace sst::native
 
     if (!set_source || !provider || !provider->GetDevice())
     {
-      REXLOG_ERROR("[sst-native] sst GPU plugin is loaded but {} - native renderer disabled",
-                   !set_source ? "has no frame-source export (old build?)" : "has no D3D12 device");
+      REXLOG_ERROR("[sst-native] sst GPU plugin is loaded but {} - native renderer disabled", !set_source ? "has no frame-source export (old build?)" : "has no D3D12 device");
       return;
+    }
+
+    InstallPresentHook(*provider);
+    {
+      // First boot: the VIDEO page's quality preset from the GPU's memory
+      DXGI_ADAPTER_DESC1 ad = {};
+      Microsoft::WRL::ComPtr<IDXGIFactory4> factory4;
+      Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+
+      if (provider->GetDXGIFactory() && SUCCEEDED(provider->GetDXGIFactory()->QueryInterface(IID_PPV_ARGS(&factory4))) && SUCCEEDED(factory4->EnumAdapterByLuid(provider->GetDevice()->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) && SUCCEEDED(adapter->GetDesc1(&ad)))
+      {
+        char name[128] = {};
+        WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+        sst::menu::OnGpuDetected(uint64_t(ad.DedicatedVideoMemory) >> 20, name);
+      }
     }
 
     auto state = std::make_unique<State>();
@@ -585,7 +605,7 @@ namespace sst::native
       return;
     }
 
-    const SstFrameSource source = {sizeof(SstFrameSource), &state->renderer, AcquireThunk, ReleaseThunk};
+    const SstFrameSource source = {sizeof(SstFrameSource), &state->renderer, AcquireThunk, ReleaseThunk, DisplayAspectThunk};
     set_source(&source);
 
     const bool threaded = REXCVAR_GET(sst_native_render_thread);
@@ -595,8 +615,7 @@ namespace sst::native
 
     g_state = state.release();
     g_active.store(true, std::memory_order_release);
-    REXLOG_INFO("[sst-native] native renderer active (1280x720), {}",
-                threaded ? "draws recorded on a separate render thread" : "draws recorded on the game thread");
+    REXLOG_INFO("[sst-native] native renderer active (1280x720), {}", threaded ? "draws recorded on a separate render thread" : "draws recorded on the game thread");
   }
 
   void Shutdown()
@@ -615,7 +634,10 @@ namespace sst::native
     // g_state is left allocated: a late hook call only sees g_active == false
   }
 
-  bool Active() { return g_active.load(std::memory_order_acquire); }
+  bool Active()
+  {
+    return g_active.load(std::memory_order_acquire);
+  }
 
   // hooks
 
@@ -648,7 +670,6 @@ namespace sst::native
       s.shaders.BindObject(object, entry);
       return;
     }
-
     // The container may be a temporary buffer: the command carries a copy
     Capture cap(s);
 
@@ -682,7 +703,6 @@ namespace sst::native
               cap.Range(call.up_data, call.up_stride * (call.start + call.count));
           });
     }
-
   }
 
   void OnDrawIndexed(const uint8_t *base, const HookArgs &a)
@@ -738,7 +758,6 @@ namespace sst::native
     };
 
     thread_local PendingVertices t_pending_vertices;
-
   }
 
   void OnBeginVertices(const HookArgs &a, uint32_t data)
@@ -749,7 +768,10 @@ namespace sst::native
     t_pending_vertices = {a.r3, a.r4, a.r5, a.r6, data};
   }
 
-  void OnDrawUPDone() { t_pending_vertices = {}; }
+  void OnDrawUPDone()
+  {
+    t_pending_vertices = {};
+  }
 
   void OnEndVertices(const uint8_t *base, const HookArgs &a)
   {
@@ -866,7 +888,6 @@ namespace sst::native
       cap.Device(device);
       cap.Submit();
     }
-
   }
 
   void OnResolveVariant(const uint8_t *base, const HookArgs &a)
@@ -874,7 +895,10 @@ namespace sst::native
     if (!Active())
       return;
 
-    IssueEvent(base, a.r3, fmt::format("resolve variant sub_82311120 r3-r10 {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} f1 {}", a.r3, a.r4, a.r5, a.r6, a.r7, a.r8, a.r9, a.r10, a.f1));
+    IssueEvent(base, a.r3,
+               fmt::format("resolve variant sub_82311120 r3-r10 {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                           "{:08X} f1 {}",
+                           a.r3, a.r4, a.r5, a.r6, a.r7, a.r8, a.r9, a.r10, a.f1));
   }
 
   void OnSetPredication(const uint8_t *base, const HookArgs &a)
@@ -915,11 +939,9 @@ namespace sst::native
       if (REXCVAR_GET(sst_native_game_thread_priority))
       {
         const BOOL ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-        REXLOG_INFO("[sst-native] game rendering thread priority raised to above normal{}",
-                    ok ? "" : " (failed)");
+        REXLOG_INFO("[sst-native] game rendering thread priority raised to above normal{}", ok ? "" : " (failed)");
       }
     }
-
     {
       const auto t = std::chrono::steady_clock::now();
 
@@ -936,7 +958,6 @@ namespace sst::native
     cap.New(Command::kSwap);
     cap.Submit();
     cap.EndFrame();
-
     // Game-thread cost of the hooks, every sst_native_log_every frames
     const int every = REXCVAR_GET(sst_native_log_every);
 
@@ -946,10 +967,7 @@ namespace sst::native
       REXLOG_INFO("[sst-native] perf: game thread per frame: {:.2f} ms capturing {} calls ({:.1f} MB "
                   "of snapshots), {:.2f} ms waiting for the render thread; game frames over 20 ms: "
                   "{} (longest {:.1f} ms); longest capture in one frame {:.2f} ms{}",
-                  s.capture_ms / frames, uint64_t(double(s.captured) / frames + 0.5),
-                  double(s.snapshot_bytes) / frames / (1 << 20), s.wait_ms / frames,
-                  s.swaps_over_20, s.swap_max_ms, s.capture_max_ms,
-                  s.ucode_skipped ? fmt::format("; {} draws without a microcode snapshot", s.ucode_skipped) : std::string());
+                  s.capture_ms / frames, uint64_t(double(s.captured) / frames + 0.5), double(s.snapshot_bytes) / frames / (1 << 20), s.wait_ms / frames, s.swaps_over_20, s.swap_max_ms, s.capture_max_ms, s.ucode_skipped ? fmt::format("; {} draws without a microcode snapshot", s.ucode_skipped) : std::string());
       s.capture_ms = s.wait_ms = 0;
       s.captured = s.snapshot_bytes = s.period_frames = s.ucode_skipped = 0;
       s.swap_max_ms = 0;

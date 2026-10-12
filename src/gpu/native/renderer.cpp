@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <bit>
 #include <condition_variable>
 #include <deque>
 #include <fstream>
@@ -114,6 +115,17 @@ REXCVAR_DEFINE_INT32(sst_native_capture_frame, 0, "SST",
 REXCVAR_DEFINE_BOOL(sst_native_scissor, true, "SST",
                     "Native renderer: apply the game's scissor rectangle (menus clip panels "
                     "with it)");
+// VIDEO page settings (src/menu/graphics_menu.cpp)
+REXCVAR_DECLARE(int32_t, sst_resolution);
+REXCVAR_DECLARE(int32_t, sst_render_scale);
+REXCVAR_DECLARE(int32_t, sst_shadow_size);
+REXCVAR_DECLARE(int32_t, sst_brightness);
+REXCVAR_DECLARE(int32_t, sst_fps_limit);
+REXCVAR_DECLARE(int32_t, sst_aa_type);
+REXCVAR_DECLARE(int32_t, sst_aa_level);
+REXCVAR_DECLARE(bool, sst_bloom);
+REXCVAR_DECLARE(bool, sst_fps_counter);
+REXCVAR_DECLARE(int32_t, sst_aspect);
 
 REXCVAR_DEFINE_STRING(sst_native_rt, "auto", "SST",
                       "Native renderer: which render targets draw into the output until render "
@@ -122,14 +134,12 @@ REXCVAR_DEFINE_STRING(sst_native_rt, "auto", "SST",
 
 namespace sst::native
 {
-
   using Microsoft::WRL::ComPtr;
   using rex::ui::d3d12::D3D12Presenter;
   using rex::ui::d3d12::D3D12Provider;
 
   namespace
   {
-
     constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     constexpr size_t kUploadPageSize = 32u << 20;
     constexpr uint32_t kMaxDrawVertices = 1u << 20;
@@ -166,7 +176,8 @@ namespace sst::native
     // Slot for VS inputs the declaration doesn't provide (reads zeros)
     constexpr UINT kZeroInputSlot = 31;
 
-    // guest memory On the render thread, the guest memory a command needs as it was when the game issued it (device state, patched microcode, vertex data from the caller) is read from snapshots taken by the hook (see native.cpp)
+    // guest memory
+    // On the render thread, the guest memory a command needs as it was when the game issued it (device state, patched microcode, vertex data from the caller) is read from snapshots taken by the hook (see native.cpp)
     thread_local const GuestOverlay *t_overlays = nullptr;
     thread_local uint32_t t_overlay_count = 0;
     const uint8_t *GuestPtr(const uint8_t *base, uint32_t addr)
@@ -206,6 +217,22 @@ namespace sst::native
       return addr >= 0x40000000u;
     }
 
+    // Guest pixels -> host pixels at an internal resolution scale (rounded, so adjacent rectangles stay adjacent)
+    LONG Px(LONG v, float s)
+    {
+      return LONG(std::lround(double(v) * s));
+    }
+
+    uint32_t PxU(uint32_t v, float s)
+    {
+      return std::max<uint32_t>(1, uint32_t(Px(LONG(v), s)));
+    }
+
+    D3D12_RECT Scaled(const D3D12_RECT &r, float s)
+    {
+      return {Px(r.left, s), Px(r.top, s), Px(r.right, s), Px(r.bottom, s)};
+    }
+
     // Device register mirror (see native-renderer-d3d-layer.md): packed blocks
     uint32_t Reg(const uint8_t *base, uint32_t dev, uint32_t reg)
     {
@@ -214,6 +241,7 @@ namespace sst::native
 
       if (reg >= 0x2200 && reg <= 0x220B)
         return be32(base, dev + 0x2934 + 4 * (reg - 0x2200));
+
       return 0;
     }
 
@@ -351,7 +379,6 @@ namespace sst::native
       const std::string size = std::to_string((size_word >> 18) + 1) + "x" + std::to_string(((size_word >> 3) & 0x7FFF) + 1);
       return filter == size;
     }
-
   }
 
   void SetGuestOverlays(const GuestOverlay *overlays, uint32_t count)
@@ -420,6 +447,7 @@ namespace sst::native
 
       while (saving.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
       Save();
     }
 
@@ -429,6 +457,7 @@ namespace sst::native
 
       if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1))))
         return;
+
       path = rex::filesystem::GetExecutableFolder() / "cache" / "pipelines.bin";
       {
         std::ifstream in(path, std::ios::binary);
@@ -480,6 +509,7 @@ namespace sst::native
     {
       if (!library)
         return false;
+
       const auto t0 = std::chrono::steady_clock::now();
       job.desc.InputLayout = {job.layout.data(), UINT(job.layout.size())};
       {
@@ -534,6 +564,7 @@ namespace sst::native
 
         if (!library || !dirty)
           return;
+
         dirty = false;
         data.resize(library->GetSerializedSize());
 
@@ -549,6 +580,7 @@ namespace sst::native
 
         if (!out)
           return;
+
         out.write(reinterpret_cast<const char *>(data.data()), std::streamsize(data.size()));
 
         if (!out)
@@ -565,6 +597,7 @@ namespace sst::native
     {
       if (!library || !dirty || saving.exchange(true))
         return;
+
       std::thread(
           [this]
           {
@@ -587,6 +620,7 @@ namespace sst::native
 
           if (quit)
             return;
+
           job = std::move(queue.front());
           queue.pop_front();
         }
@@ -620,6 +654,7 @@ namespace sst::native
 
       if (threads < 0)
         threads = std::clamp(int32_t(std::thread::hardware_concurrency()) / 2 - 1, 0, 6);
+
       memexport_ = std::make_unique<MemexportRunner>(const_cast<uint8_t *>(physical_membase), uint32_t(std::min(threads, 16)));
       REXLOG_INFO("[sst-native] memexport: {} worker threads", memexport_->worker_threads());
     }
@@ -636,6 +671,7 @@ namespace sst::native
 
     if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_))))
       return false;
+
     rtv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     D3D12_RESOURCE_DESC desc = {};
@@ -652,7 +688,9 @@ namespace sst::native
     {
       if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&outputs_[i]))))
         return false;
+
       device_->CreateRenderTargetView(outputs_[i].Get(), nullptr, Rtv(i));
+      output_scale_[i] = 1.0f;
     }
 
     for (uint32_t i = 0; i < kSlots; ++i)
@@ -667,6 +705,7 @@ namespace sst::native
 
     if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap_))))
       return false;
+
     desc.Format = kDepthFormat;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear = {};
@@ -675,14 +714,17 @@ namespace sst::native
 
     if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&depth_))))
       return false;
+
     device_->CreateDepthStencilView(depth_.Get(), nullptr, dsv_heap_->GetCPUDescriptorHandleForHeapStart());
 
     if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frames_[0].allocator.Get(), nullptr, IID_PPV_ARGS(&list_))))
       return false;
+
     list_->Close();
 
     if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_))))
       return false;
+
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     if (!event_)
@@ -751,6 +793,7 @@ namespace sst::native
     {
       if (error)
         REXLOG_ERROR("[sst-native] root signature: {}", std::string(static_cast<const char *>(error->GetBufferPointer()), error->GetBufferSize()));
+
       return false;
     }
 
@@ -771,6 +814,7 @@ namespace sst::native
 
     if (FAILED(provider_->DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
       return;
+
     const wchar_t *args[] = {L"-T", L"ps_6_0", L"-E", L"main", L"-Qstrip_reflect", L"-Qstrip_debug"};
     DxcBuffer buffer = {kSource, sizeof(kSource) - 1, DXC_CP_UTF8};
     Microsoft::WRL::ComPtr<IDxcResult> result;
@@ -778,10 +822,12 @@ namespace sst::native
 
     if (FAILED(compiler->Compile(&buffer, args, UINT32(std::size(args)), nullptr, IID_PPV_ARGS(&result))) || FAILED(result->GetStatus(&status)) || FAILED(status))
       return;
+
     Microsoft::WRL::ComPtr<IDxcBlob> object;
 
     if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) || !object)
       return;
+
     const auto *b = static_cast<const uint8_t *>(object->GetBufferPointer());
     debug_ps_ = std::make_unique<ShaderVariant>();
     debug_ps_->dxil.assign(b, b + object->GetBufferSize());
@@ -797,11 +843,13 @@ namespace sst::native
 
     if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_))))
       return false;
+
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
     hd.NumDescriptors = kSamplerHeapSize;
 
     if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&sampler_heap_))))
       return false;
+
     const UINT srv_size = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT sampler_size = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 
@@ -833,6 +881,7 @@ namespace sst::native
 
     if (FAILED(device_->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging))))
       return false;
+
     uint8_t *mapped = nullptr;
     staging->Map(0, nullptr, reinterpret_cast<void **>(&mapped));
     std::memset(mapped, 0xFF, 8 * 512);
@@ -843,6 +892,7 @@ namespace sst::native
 
     if (FAILED(device_->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&zero_buffer_))))
       return false;
+
     uint8_t *zero = nullptr;
     zero_buffer_->Map(0, nullptr, reinterpret_cast<void **>(&zero));
     std::memset(zero, 0, 256);
@@ -866,6 +916,7 @@ namespace sst::native
 
       if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex))))
         return false;
+
       const UINT subresources = k.dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : k.depth_or_array;
 
       for (UINT s = 0; s < subresources; ++s)
@@ -898,6 +949,7 @@ namespace sst::native
 
       if (k.view == D3D12_SRV_DIMENSION_TEXTURECUBE)
         sd.TextureCube.MipLevels = 1;
+
       D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
       h.ptr += size_t(k.heap_index) * srv_size;
       device_->CreateShaderResourceView(tex.Get(), &sd, h);
@@ -950,6 +1002,7 @@ namespace sst::native
 
     if (event_)
       CloseHandle(event_);
+
     event_ = nullptr;
     pipeline_workers_.reset(); // finishes compiles, saves the pipeline cache
     pending_pipelines_.clear();
@@ -957,6 +1010,7 @@ namespace sst::native
 
     if (textures_)
       textures_->Shutdown();
+
     geo_pool_.Reset();
     geo_entries_.clear();
     color_rts_.clear();
@@ -975,6 +1029,7 @@ namespace sst::native
 
     for (auto &o : outputs_)
       o.Reset();
+
     placeholder_textures_.clear();
     zero_buffer_.Reset();
     depth_.Reset();
@@ -1054,7 +1109,6 @@ namespace sst::native
 
   namespace
   {
-
     constexpr uint32_t kRtRtvCount = 256, kRtDsvCount = 64;
     constexpr uint32_t kRtSrvFirst = 16; // renderer-owned SRV slots: [16, kSrvReserved)
 
@@ -1130,7 +1184,6 @@ namespace sst::native
     }
 
     const D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
   }
 
   bool Renderer::RenderTargetsEnabled() const
@@ -1163,6 +1216,7 @@ namespace sst::native
   {
     if (rt_srv_next_ < kRtSrvFirst)
       rt_srv_next_ = kRtSrvFirst;
+
     return rt_srv_next_ < kSrvReserved ? rt_srv_next_++ : 0;
   }
 
@@ -1170,15 +1224,17 @@ namespace sst::native
   {
     if (rt.state == state)
       return;
+
     auto b = Transition(rt.resource.Get(), rt.state, state);
     list_->ResourceBarrier(1, &b);
     rt.state = state;
   }
 
-  Renderer::HostRT *Renderer::GetHostRT(const uint8_t *base, uint32_t surface, bool depth, uint32_t min_width, uint32_t min_height)
+  Renderer::HostRT *Renderer::GetHostRT(const uint8_t *base, uint32_t surface, bool depth, float scale, uint32_t samples, uint32_t min_width, uint32_t min_height)
   {
     if (!PlausibleAddress(surface))
       return nullptr;
+
     auto &map = depth ? depth_rts_ : color_rts_;
     // Logical size: the surface's own size (size word at +0x24) or what is drawn into it, whichever is larger
     const uint32_t size = be32(base, surface + 0x24);
@@ -1186,17 +1242,19 @@ namespace sst::native
     const uint32_t w = std::clamp(std::max(sw, min_width), 1u, 4096u);
     const uint32_t h = std::clamp(std::max(sh, min_height), 1u, 4096u);
     const uint32_t guest_format = (be32(base, surface + 0x1C) >> 16) & 0xF;
+    samples = UsableSamples(depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : ColorTargetFormat(guest_format), samples);
     auto it = map.find(surface);
 
     if (it != map.end())
     {
       HostRT &rt = it->second;
 
-      if (rt.width >= w && rt.height >= h && (depth || rt.guest_format == guest_format))
+      if (rt.width >= w && rt.height >= h && rt.scale == scale && rt.samples == samples && (depth || rt.guest_format == guest_format))
         return &rt;
       // Grows (or changes format): make a new one; the old one may still be in use by submitted frames, so keep it alive until the GPU is done
       if (!depth && rt.guest_format != guest_format && LogOnce(0xA800000000000000ull ^ (uint64_t(surface) << 8) ^ guest_format))
         REXLOG_INFO("[sst-native] render target {:08X} changed format {} -> {}", surface, rt.guest_format, guest_format);
+
       retired_rts_.push_back({fence_value_ + 1, rt.resource});
     }
 
@@ -1205,15 +1263,17 @@ namespace sst::native
     rt.width = std::max(w, it != map.end() ? it->second.width : 0u);
     rt.height = std::max(h, it != map.end() ? it->second.height : 0u);
     rt.guest_format = guest_format;
+    rt.scale = scale;
+    rt.samples = samples;
     rt.format = depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : ColorTargetFormat(guest_format);
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = rt.width;
-    desc.Height = rt.height;
+    desc.Width = PxU(rt.width, scale);
+    desc.Height = PxU(rt.height, scale);
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = depth ? DXGI_FORMAT_R32G8X24_TYPELESS : rt.format;
-    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = samples;
     desc.Flags = depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE clear = {};
     clear.Format = rt.format;
@@ -1223,6 +1283,7 @@ namespace sst::native
     {
       if (LogOnce(0xA900000000000000ull ^ surface))
         REXLOG_WARN("[sst-native] could not create the {}x{} {} target for surface {:08X}", rt.width, rt.height, depth ? "depth" : "colour", surface);
+
       return nullptr;
     }
     // Views: reuse the slots of the target being replaced
@@ -1240,6 +1301,7 @@ namespace sst::native
       {
         if (LogOnce(0xAA00000000000000ull))
           REXLOG_WARN("[sst-native] out of render-target descriptors");
+
         return nullptr;
       }
     }
@@ -1248,7 +1310,7 @@ namespace sst::native
     {
       D3D12_DEPTH_STENCIL_VIEW_DESC dd = {};
       dd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-      dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+      dd.ViewDimension = samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
       device_->CreateDepthStencilView(rt.resource.Get(), &dd, RtDsv(rt.view));
     }
     else
@@ -1258,14 +1320,14 @@ namespace sst::native
 
     D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
     sd.Format = depth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : rt.format;
-    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.ViewDimension = samples > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sd.Texture2D.MipLevels = 1;
     D3D12_CPU_DESCRIPTOR_HANDLE srv_handle = srv_heap_->GetCPUDescriptorHandleForHeapStart();
     srv_handle.ptr += size_t(rt.srv) * srv_size_;
     device_->CreateShaderResourceView(rt.resource.Get(), &sd, srv_handle);
     ++stats_.host_rts;
-    REXLOG_INFO("[sst-native] render target {:08X}: {}x{} {} (surface {}x{}, guest format {})", surface, rt.width, rt.height, depth ? "depth D32S8" : "colour", sw, sh, guest_format);
+    REXLOG_INFO("[sst-native] render target {:08X}: {}x{} {}{} (surface {}x{}, guest format {}){}", surface, rt.width, rt.height, depth ? "depth D32S8" : "colour", samples > 1 ? fmt::format(" {}x MSAA", samples) : std::string(), sw, sh, guest_format, scale != 1.0f ? fmt::format(", host {}x{}", PxU(rt.width, scale), PxU(rt.height, scale)) : std::string());
     bound_targets_ = 0;
     HostRT &stored = map[surface] = std::move(rt);
 
@@ -1285,7 +1347,7 @@ namespace sst::native
     return &stored;
   }
 
-  Renderer::ResolvedTexture *Renderer::GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume)
+  Renderer::ResolvedTexture *Renderer::GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, float scale)
   {
     const DXGI_FORMAT format = ResolveTextureFormat(guest_format);
     auto it = resolved_.find(page);
@@ -1294,8 +1356,9 @@ namespace sst::native
     {
       ResolvedTexture &t = *it->second;
 
-      if (t.format == format && t.width == width && t.height == height && t.slices == slices && t.volume == volume)
+      if (t.format == format && t.width == width && t.height == height && t.slices == slices && t.volume == volume && t.scale == scale)
         return &t;
+
       textures_->RemoveExternal(page);
       retired_rts_.push_back({fence_value_ + 1, t.resource});
     }
@@ -1307,10 +1370,11 @@ namespace sst::native
     t->slices = slices;
     t->volume = volume;
     t->guest_format = guest_format;
+    t->scale = scale;
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width;
-    desc.Height = height;
+    desc.Width = PxU(width, scale);
+    desc.Height = PxU(height, scale);
     desc.DepthOrArraySize = UINT16(slices);
     desc.MipLevels = 1;
     desc.Format = format;
@@ -1322,6 +1386,7 @@ namespace sst::native
     {
       if (LogOnce(0xAB00000000000000ull ^ page))
         REXLOG_WARN("[sst-native] could not create the {}x{}x{} resolve texture at {:08X}", width, height, slices, page << 12);
+
       resolved_.erase(page);
       return nullptr;
     }
@@ -1335,6 +1400,7 @@ namespace sst::native
     {
       if (rt_rtv_next_ >= kRtRtvCount)
         return nullptr;
+
       t->rtvs.push_back(rt_rtv_next_++);
     }
 
@@ -1407,13 +1473,21 @@ namespace sst::native
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {1, &range};
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC linear = {};
+    linear.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    linear.AddressU = linear.AddressV = linear.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    linear.MaxLOD = D3D12_FLOAT32_MAX;
+    linear.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs = {};
     rs.NumParameters = 2;
     rs.pParameters = params;
+    rs.NumStaticSamplers = 1;
+    rs.pStaticSamplers = &linear;
     ComPtr<ID3DBlob> blob, error;
 
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) || FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&blit_root_))))
       return false;
+
     static const char kVS[] = "float4 main(uint id : SV_VertexID) : SV_Position {\n"
                               "  float2 uv = float2((id << 1) & 2, id & 2);\n"
                               "  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
@@ -1422,12 +1496,62 @@ namespace sst::native
                               "Texture2D<float4> src : register(t0);\n"
                               "float4 main(float4 p : SV_Position) : SV_Target {\n"
                               "  float4 c = src.Load(int3(int2(p.xy) + offset.xy, 0));\n"
-                              "  return offset.z != 0 ? c.bgra : c;\n"
+                              "  if (offset.z & 1) c = c.bgra;\n"
+                              "  if (offset.w != 0) c.rgb = pow(saturate(c.rgb), asfloat(offset.w));\n"
+                              "  return c;\n"
                               "}\n";
+    // offset.z: bit 0 swap red / blue, bits 8-15 source samples, bit 16 depth
+    static const char kPSMS[] = "cbuffer C : register(b0) { int4 offset; };\n"
+                                "Texture2DMS<float4> src : register(t0);\n"
+                                "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                                "  int2 at = int2(p.xy) + offset.xy;\n"
+                                "  uint n = max((uint(offset.z) >> 8) & 0xFF, 1u);\n"
+                                "  float4 c = src.Load(at, 0);\n"
+                                "  if (((uint(offset.z) >> 16) & 1) == 0) {\n"
+                                "    for (uint i = 1; i < n; ++i) c += src.Load(at, i);\n"
+                                "    c /= float(n);\n"
+                                "  }\n"
+                                "  if (offset.z & 1) c = c.bgra;\n"
+                                "  if (offset.w != 0) c.rgb = pow(saturate(c.rgb), asfloat(offset.w));\n"
+                                "  return c;\n"
+                                "}\n";
+    // FXAA (the compact 'console' variant: 4 diagonal luma taps, one blur direction, two / four taps along it)
+    static const char kPSFxaa[] = "cbuffer C : register(b0) { int4 offset; };\n"
+                                  "Texture2D<float4> src : register(t0);\n"
+                                  "SamplerState lin : register(s0);\n"
+                                  "float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+                                  "float3 S(float2 uv) { return src.SampleLevel(lin, uv, 0).rgb; }\n"
+                                  "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                                  "  uint w, h; src.GetDimensions(w, h);\n"
+                                  "  float2 rcp = 1.0 / float2(w, h);\n"
+                                  "  float2 uv = (floor(p.xy) + float2(offset.xy) + 0.5) * rcp;\n"
+                                  "  float4 m = src.SampleLevel(lin, uv, 0);\n"
+                                  "  float nw = Luma(S(uv + float2(-0.5, -0.5) * rcp));\n"
+                                  "  float ne = Luma(S(uv + float2(0.5, -0.5) * rcp));\n"
+                                  "  float sw = Luma(S(uv + float2(-0.5, 0.5) * rcp));\n"
+                                  "  float se = Luma(S(uv + float2(0.5, 0.5) * rcp));\n"
+                                  "  float lm = Luma(m.rgb);\n"
+                                  "  float lo = min(lm, min(min(nw, ne), min(sw, se)));\n"
+                                  "  float hi = max(lm, max(max(nw, ne), max(sw, se)));\n"
+                                  "  float4 c = m;\n"
+                                  "  if (hi - lo >= max(0.0312, hi * 0.125)) {\n"
+                                  "    float2 dir = float2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));\n"
+                                  "    float reduce = max((nw + ne + sw + se) * (0.25 * 0.125), 1.0 / 128.0);\n"
+                                  "    float k = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);\n"
+                                  "    dir = clamp(dir * k, -8.0, 8.0) * rcp;\n"
+                                  "    float3 a = 0.5 * (S(uv + dir * (1.0 / 3.0 - 0.5)) + S(uv + dir * (2.0 / 3.0 - 0.5)));\n"
+                                  "    float3 b = a * 0.5 + 0.25 * (S(uv - dir * 0.5) + S(uv + dir * 0.5));\n"
+                                  "    float lb = Luma(b);\n"
+                                  "    c.rgb = (lb < lo || lb > hi) ? a : b;\n"
+                                  "  }\n"
+                                  "  if (offset.z & 1) c = c.bgra;\n"
+                                  "  return c;\n"
+                                  "}\n";
     ComPtr<IDxcCompiler3> compiler;
 
     if (FAILED(provider_->DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
       return false;
+
     auto compile = [&](const char *source, const wchar_t *profile, std::vector<uint8_t> &out)
     {
       const wchar_t *args[] = {L"-T", profile, L"-E", L"main", L"-Qstrip_reflect", L"-Qstrip_debug"};
@@ -1437,16 +1561,38 @@ namespace sst::native
 
       if (FAILED(compiler->Compile(&buffer, args, UINT32(std::size(args)), nullptr, IID_PPV_ARGS(&result))) || FAILED(result->GetStatus(&status)) || FAILED(status))
         return false;
+
       ComPtr<IDxcBlob> object;
 
       if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) || !object)
         return false;
+
       const auto *b = static_cast<const uint8_t *>(object->GetBufferPointer());
       out.assign(b, b + object->GetBufferSize());
       return true;
     };
 
-    if (!compile(kVS, L"vs_6_0", blit_vs_) || !compile(kPS, L"ps_6_0", blit_ps_))
+    // FPS counter: c.xy = top-left (host pixels), c.z = font pixel size, c.w = frames per second x 10. 3x5 digits, drawn on a dark box
+    static const char kPSText[] = "cbuffer C : register(b0) { int4 c; };\n"
+                                  "static const uint kFont[11] = {0x7b6f, 0x2c97, 0x73e7, 0x73cf, 0x5bc9, 0x79cf, 0x79ef,\n"
+                                  "                               0x7249, 0x7bef, 0x7bcf, 0x2};\n"
+                                  "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                                  "  int2 q = (int2(p.xy) - c.xy) / max(c.z, 1) - int2(1, 1);\n"
+                                  "  uint chars[5]; uint n = 0;\n"
+                                  "  uint v = uint(c.w) / 10, t = uint(c.w) % 10;\n"
+                                  "  if (v >= 100) chars[n++] = (v / 100) % 10;\n"
+                                  "  if (v >= 10) chars[n++] = (v / 10) % 10;\n"
+                                  "  chars[n++] = v % 10; chars[n++] = 10; chars[n++] = t;\n"
+                                  "  float4 col = float4(0, 0, 0, 0.55);\n"
+                                  "  if (q.x >= 0 && q.y >= 0 && q.y < 5) {\n"
+                                  "    uint i = uint(q.x) / 4, x = uint(q.x) % 4;\n"
+                                  "    if (i < n && x < 3 && ((kFont[chars[i]] >> (14 - (uint(q.y) * 3 + x))) & 1))\n"
+                                  "      col = float4(1, 1, 1, 1);\n"
+                                  "  }\n"
+                                  "  return col;\n"
+                                  "}\n";
+
+    if (!compile(kVS, L"vs_6_0", blit_vs_) || !compile(kPS, L"ps_6_0", blit_ps_) || !compile(kPSText, L"ps_6_0", blit_ps_text_) || !compile(kPSMS, L"ps_6_0", blit_ps_ms_) || !compile(kPSFxaa, L"ps_6_0", blit_ps_fxaa_))
     {
       blit_root_.Reset();
       return false;
@@ -1458,27 +1604,48 @@ namespace sst::native
 
     if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt_rtv_heap_))))
       return false;
+
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     hd.NumDescriptors = kRtDsvCount;
 
     if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt_dsv_heap_))))
       return false;
+
     dsv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     srv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return true;
   }
 
-  ID3D12PipelineState *Renderer::GetBlitPipeline(DXGI_FORMAT format)
+  ID3D12PipelineState *Renderer::GetBlitPipeline(DXGI_FORMAT format, uint32_t kind)
   {
-    auto it = blit_pipelines_.find(uint32_t(format));
+    const uint32_t pso_key = uint32_t(format) | (kind << 16);
+    auto it = blit_pipelines_.find(pso_key);
 
     if (it != blit_pipelines_.end())
       return it->second.Get();
+
+    const std::vector<uint8_t> &ps = kind == 1 ? blit_ps_ms_ : kind == 2 ? blit_ps_fxaa_
+                                                           : kind == 3   ? blit_ps_text_
+                                                                         : blit_ps_;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
     d.pRootSignature = blit_root_.Get();
     d.VS = {blit_vs_.data(), blit_vs_.size()};
-    d.PS = {blit_ps_.data(), blit_ps_.size()};
+    d.PS = {ps.data(), ps.size()};
     d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    if (kind == 3)
+    {
+      D3D12_RENDER_TARGET_BLEND_DESC &b = d.BlendState.RenderTarget[0];
+      b.BlendEnable = TRUE;
+      b.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+      b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+      b.BlendOp = D3D12_BLEND_OP_ADD;
+      b.SrcBlendAlpha = D3D12_BLEND_ONE;
+      b.DestBlendAlpha = D3D12_BLEND_ZERO;
+      b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+      b.LogicOp = D3D12_LOGIC_OP_NOOP;
+    }
+
     d.SampleMask = UINT_MAX;
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -1491,18 +1658,30 @@ namespace sst::native
 
     if (FAILED(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso))))
       pso = nullptr;
-    return blit_pipelines_.emplace(uint32_t(format), pso).first->second.Get();
+
+    return blit_pipelines_.emplace(pso_key, pso).first->second.Get();
   }
 
-  void Renderer::Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb)
+  void Renderer::Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb, float gamma, uint32_t src_samples, bool fxaa)
   {
-    ID3D12PipelineState *pso = GetBlitPipeline(format);
+    // src_samples: bits 0-7 MSAA samples of the source, 0x100 = depth source
+    const uint32_t samples = std::max(src_samples & 0xFF, 1u);
+    const uint32_t kind = samples > 1 ? 1 : fxaa ? 2
+                                                 : 0;
+    ID3D12PipelineState *pso = GetBlitPipeline(format, kind);
 
     if (!pso || dst.right <= dst.left || dst.bottom <= dst.top)
       return;
+
     list_->SetGraphicsRootSignature(blit_root_.Get());
     list_->SetPipelineState(pso);
-    const int32_t offset[4] = {src_x - dst.left, src_y - dst.top, swap_rb ? 1 : 0, 0};
+    int32_t gamma_bits = 0;
+
+    if (gamma > 0 && gamma != 1.0f)
+      std::memcpy(&gamma_bits, &gamma, 4);
+
+    const int32_t flags = (swap_rb ? 1 : 0) | int32_t(samples << 8) | int32_t((src_samples & 0x100) << 8);
+    const int32_t offset[4] = {src_x - dst.left, src_y - dst.top, flags, gamma_bits};
     list_->SetGraphicsRoot32BitConstants(0, 4, offset, 0);
     list_->SetGraphicsRootDescriptorTable(1, SrvGpu(src_srv));
     list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -1521,6 +1700,7 @@ namespace sst::native
 
     for (UINT i = 0; i < 3; ++i)
       list_->SetGraphicsRootDescriptorTable(kRootTextures2D + i, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+
     list_->SetGraphicsRootDescriptorTable(kRootSamplers, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
     bound_targets_ = 0;
   }
@@ -1528,7 +1708,7 @@ namespace sst::native
   // End of frame: show the game's front buffer (its last full-size resolve), or failing that the last colour target drawn to.
   void Renderer::PresentRenderTargets()
   {
-    const D3D12_RECT full = {0, 0, LONG(width_), LONG(height_)};
+    const D3D12_RECT full = Scaled({0, 0, LONG(width_), LONG(height_)}, output_scale_[target_]);
     // (Looked up by page: the texture may have been replaced since the resolve.)
     ResolvedTexture *present_source_ = nullptr;
 
@@ -1553,16 +1733,69 @@ namespace sst::native
         present_source_->state = kShaderRead;
       }
 
-      Blit(present_source_->srv, 0, 0, Rtv(target_), D3D12Presenter::kGuestOutputFormat, full, present_source_->rb_swapped);
+      Blit(present_source_->srv, 0, 0, Rtv(target_), D3D12Presenter::kGuestOutputFormat, full, present_source_->rb_swapped, gamma_);
     }
     else if (last_color_rt_ && last_color_rt_->srv)
     {
       SetRTState(*last_color_rt_, kShaderRead);
-      Blit(last_color_rt_->srv, 0, 0, Rtv(target_), D3D12Presenter::kGuestOutputFormat, full);
+      Blit(last_color_rt_->srv, 0, 0, Rtv(target_), D3D12Presenter::kGuestOutputFormat, full, false, gamma_, last_color_rt_->samples);
       SetRTState(*last_color_rt_, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
 
     last_color_rt_ = nullptr;
+
+    if (REXCVAR_GET(sst_fps_counter))
+      DrawFpsCounter(full);
+  }
+
+  void Renderer::DrawFpsCounter(const D3D12_RECT &output)
+  {
+    // Rate of new frames handed to the display, updated twice a second
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    const uint64_t now = uint64_t(qpc.QuadPart), frames = shown_frames_.load(std::memory_order_relaxed);
+    static const double kFreq = []
+    {
+      LARGE_INTEGER f;
+      QueryPerformanceFrequency(&f);
+      return double(f.QuadPart);
+    }();
+
+    if (!fps_last_tick_)
+    {
+      fps_last_tick_ = now;
+      fps_last_frames_ = frames;
+    }
+    else if (double(now - fps_last_tick_) >= kFreq * 0.5)
+    {
+      const double fps = double(frames - fps_last_frames_) * kFreq / double(now - fps_last_tick_);
+      fps_tenths_ = uint32_t(std::clamp(fps * 10.0 + 0.5, 0.0, 9999.0));
+      fps_last_tick_ = now;
+      fps_last_frames_ = frames;
+    }
+
+    ID3D12PipelineState *pso = GetBlitPipeline(D3D12Presenter::kGuestOutputFormat, 3);
+
+    if (!pso)
+      return;
+
+    const LONG out_h = output.bottom - output.top;
+    const int32_t px = std::max<int32_t>(2, int32_t(out_h / 240));
+    const int32_t chars = fps_tenths_ >= 1000 ? 5 : fps_tenths_ >= 100 ? 4
+                                                                       : 3;
+    const D3D12_RECT box = {px * 4, px * 4, px * 4 + px * (chars * 4 + 1), px * 4 + px * 7};
+    list_->SetGraphicsRootSignature(blit_root_.Get());
+    list_->SetPipelineState(pso);
+    const int32_t c[4] = {box.left, box.top, px, int32_t(fps_tenths_)};
+    list_->SetGraphicsRoot32BitConstants(0, 4, c, 0);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(target_);
+    list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT vp = {float(box.left), float(box.top), float(box.right - box.left), float(box.bottom - box.top), 0, 1};
+    list_->RSSetViewports(1, &vp);
+    list_->RSSetScissorRects(1, &box);
+    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list_->DrawInstanced(3, 1, 0, 0);
+    RestoreDrawState();
   }
 
   // render targets: resolves + trace
@@ -1605,6 +1838,7 @@ namespace sst::native
 
     if (!PlausibleAddress(surface))
       return fmt::format("{:08X}?", surface);
+
     const uint32_t info = be32(base, surface + 0x1C), size = be32(base, surface + 0x24);
     std::string s = fmt::format("{:08X} [edram base {} fmt {} size word {:08X}]", surface, info & 0xFFF, (info >> 16) & 0xF, size);
 
@@ -1614,6 +1848,7 @@ namespace sst::native
 
       for (uint32_t i = 0; i < 16; ++i)
         words += fmt::format(" {:08X}", be32(base, surface + 4 * i));
+
       rt_trace_.lines.push_back(fmt::format("  surface {:08X}:{}", surface, words));
     }
 
@@ -1626,14 +1861,17 @@ namespace sst::native
 
     if (!t.has_pass)
       return;
+
     std::string prims;
 
     for (auto &[p, n] : t.pass_prims)
       prims += fmt::format(" {:X}:{}", p, n);
+
     t.lines.push_back(fmt::format("  -> {} draws ({} morph) prims{}; {} pixel shaders", t.pass_draws, t.pass_morph, prims, t.pass_ps.size()));
 
     for (const std::string &tex : t.pass_textures)
       t.lines.push_back("     samples " + tex);
+
     t.has_pass = false;
   }
 
@@ -1650,12 +1888,14 @@ namespace sst::native
     words[n++] = be32(base, dev + 0x2888);            // RB_DEPTH_INFO
     for (uint32_t r = PA_CL_VPORT_XSCALE; r <= PA_CL_VPORT_ZOFFSET; ++r)
       words[n++] = Reg(base, dev, r);
+
     words[n++] = be32(base, dev + kDevScissorTL);
     words[n++] = be32(base, dev + kDevScissorBR);
     const uint64_t key = XXH3_64bits(words, n * 4);
 
     if (t.has_pass && key == t.pass_key)
       return;
+
     TraceClosePass();
     t.has_pass = true;
     t.pass_key = key;
@@ -1680,6 +1920,7 @@ namespace sst::native
 
     if (morph)
       ++t.pass_morph;
+
     ++t.pass_prims[call.prim];
     const uint32_t ps_obj = be32(base, dev + kDevPS);
     ShaderEntry *ps = ps_obj ? ResolveShader(base, ps_obj, false) : nullptr;
@@ -1716,6 +1957,7 @@ namespace sst::native
 
     if (!ps)
       return;
+
     t.pass_ps.insert(ps->hash);
     const TextureUsage &u = GetTextureUsage(ps);
 
@@ -1723,10 +1965,12 @@ namespace sst::native
     {
       if (!((u.mask >> i) & 1))
         continue;
+
       uint32_t fetch[6];
 
       for (uint32_t k = 0; k < 6; ++k)
         fetch[k] = be32(base, dev + kDevFetchConstants + 24 * i + 4 * k);
+
       const uint64_t key = (uint64_t(fetch[1]) << 32) ^ fetch[2] ^ (uint64_t(i) << 58);
 
       if (t.pass_textures.size() < 16 && t.pass_texture_keys.insert(key).second)
@@ -1738,6 +1982,7 @@ namespace sst::native
   {
     if (!rt_trace_.active)
       return;
+
     TraceState(base, device);
     rt_trace_.lines.push_back("  " + what);
   }
@@ -1755,6 +2000,7 @@ namespace sst::native
     if (PlausibleAddress(c.dst_texture))
       for (uint32_t k = 0; k < 6; ++k)
         fetch[k] = be32(base, c.dst_texture + 0x1C + 4 * k);
+
     int32_t rect[4] = {-1, -1, -1, -1}, point[2] = {-1, -1};
 
     if (PlausibleAddress(c.src_rect))
@@ -1764,12 +2010,14 @@ namespace sst::native
     if (PlausibleAddress(c.dst_point))
       for (int i = 0; i < 2; ++i)
         point[i] = int32_t(be32(base, c.dst_point + 4 * i));
+
     const uint32_t which = c.flags & 7; // 0-3 colour target, 4 depth
     const uint32_t surface = which == 4 ? be32(base, dev + kDevDepth) : be32(base, dev + kDevRT0 + 4 * (which & 3));
     std::string colour = "none";
 
     if (PlausibleAddress(c.clear_color))
       colour = fmt::format("{} {} {} {}", BeFloat(base, c.clear_color), BeFloat(base, c.clear_color + 4), BeFloat(base, c.clear_color + 8), BeFloat(base, c.clear_color + 12));
+
     const std::string line = fmt::format("resolve flags {:X} from {} rect {} {} {} {} -> texture {:08X} {} at {} {} level {} slice {} "
                                          "clear colour {} z {}",
                                          c.flags, which == 4 ? "depth" : fmt::format("RT{}", which & 3), rect[0], rect[1], rect[2], rect[3], c.dst_texture, fetch[0] ? DescribeTexture(fetch) : std::string("(none)"), point[0], point[1], c.level, c.slice, colour, c.clear_z);
@@ -1790,6 +2038,7 @@ namespace sst::native
 
     if (!recording_)
       BeginFrame();
+
     const bool depth = which == 4;
     auto &map = depth ? depth_rts_ : color_rts_;
     auto src_it = map.find(surface);
@@ -1802,6 +2051,7 @@ namespace sst::native
         REXLOG_INFO("[sst-native] resolve skipped ({}): {}", src_it == map.end() ? "nothing drawn to the source yet" : c.level != 0 ? "mip level"
                                                                                                                                     : "destination",
                     line);
+
       return;
     }
 
@@ -1810,7 +2060,24 @@ namespace sst::native
     const uint32_t dw = (fetch[2] & 0x1FFF) + 1, dh = ((fetch[2] >> 13) & 0x1FFF) + 1;
     const uint32_t slices = stacked ? (fetch[2] >> 26) + 1 : 1;
     const uint32_t page = (fetch[1] >> 12) & 0x1FFFF;
-    ResolvedTexture *dst = GetResolvedTexture(page, fetch[1] & 0x3F, dw, dh, slices, stacked);
+    // The shadow map: its depth is resolved into a stacked (3D) texture. Its targets get the shadow map scale from the next frame on
+    if (stacked && depth && shadow_surfaces_.insert(surface).second)
+    {
+      shadow_surfaces_.insert(be32(base, dev + kDevRT0));
+      REXLOG_INFO("[sst-native] shadow map surfaces: depth {:08X}, colour {:08X}", surface, be32(base, dev + kDevRT0));
+    }
+
+    ResolvedTexture *dst = GetResolvedTexture(page, fetch[1] & 0x3F, dw, dh, slices, stacked, src.scale);
+    // Full-screen images (the 3D scene, the glow chain, frame copies): draws that sample them are composites, not UI (aspect ratio fit)
+    {
+      const int32_t rw = (rect[0] >= 0 ? rect[2] - rect[0] : int32_t(dw));
+      const bool full = !depth && !stacked && (scene_surfaces_.count(surface) || BloomSurface(src, surface) || rw * 10 >= int32_t(width_) * 9);
+
+      if (full)
+        composite_pages_.insert(page);
+      else
+        composite_pages_.erase(page);
+    }
 
     if (!dst)
     {
@@ -1835,7 +2102,13 @@ namespace sst::native
     const uint32_t dst_swizzle = (fetch[3] >> 1) & 0xFFF;
     const bool swap_rb = !depth && (dst_swizzle & 7) == 2 && ((dst_swizzle >> 6) & 7) == 0;
     dst->rb_swapped = swap_rb;
-    Blit(src.srv, sx0 + (dr.left - px), sy0 + (dr.top - py), RtRtv(dst->rtvs[slice]), dst->format, dr, swap_rb);
+    {
+      const float k = src.scale;
+      const D3D12_RECT host = Scaled(dr, k);
+      // FXAA (VIDEO > ANTI-ALIASING): applied to the 3D scene's colour copies, before the UI is drawn over the final image
+      const bool fxaa = fxaa_ && !depth && !stacked && src.samples == 1 && scene_surfaces_.count(surface);
+      Blit(src.srv, Px(sx0 + (dr.left - px), k), Px(sy0 + (dr.top - py), k), RtRtv(dst->rtvs[slice]), dst->format, host, swap_rb, 0.0f, src.samples | (depth ? 0x100u : 0u), fxaa);
+    }
     {
       auto b = Transition(dst->resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
       list_->ResourceBarrier(1, &b);
@@ -1857,7 +2130,9 @@ namespace sst::native
         if (PlausibleAddress(c.clear_color))
           for (int i = 0; i < 4; ++i)
             col[i] = BeFloat(base, c.clear_color + 4 * i);
-        list_->ClearRenderTargetView(RtRtv(src.view), col, 1, &sr);
+
+        const D3D12_RECT host = Scaled(sr, src.scale);
+        list_->ClearRenderTargetView(RtRtv(src.view), col, 1, &host);
       }
 
       if (c.flags & 0x200)
@@ -1870,9 +2145,10 @@ namespace sst::native
           HostRT &d = dit->second;
           SetRTState(d, D3D12_RESOURCE_STATE_DEPTH_WRITE);
           const D3D12_RECT dsr = {sr.left, sr.top, std::min<LONG>(sr.right, d.width), std::min<LONG>(sr.bottom, d.height)};
+          const D3D12_RECT host = Scaled(dsr, d.scale);
 
           if (dsr.right > dsr.left && dsr.bottom > dsr.top)
-            list_->ClearDepthStencilView(RtDsv(d.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, std::clamp(c.clear_z, 0.0f, 1.0f), 0, 1, &dsr);
+            list_->ClearDepthStencilView(RtDsv(d.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, std::clamp(c.clear_z, 0.0f, 1.0f), 0, 1, &host);
         }
       }
     }
@@ -1935,6 +2211,7 @@ namespace sst::native
   {
     if (!geo_pool_ || !src.resource || !size)
       return;
+
     const uint64_t aligned = (uint64_t(size) + 255) & ~uint64_t(255);
 
     if (aligned > geo_pool_size_ / 4)
@@ -1969,12 +2246,14 @@ namespace sst::native
 
     if (auto it = constant_bytes_.find(e); it != constant_bytes_.end())
       return it->second;
+
     uint32_t result = 4096;
     const std::vector<uint8_t> &ct = e->container;
     auto ct32 = [&](size_t at) -> uint32_t
     {
       return at + 4 <= ct.size() ? (uint32_t(ct[at]) << 24) | (uint32_t(ct[at + 1]) << 16) | (uint32_t(ct[at + 2]) << 8) | ct[at + 3] : 0;
     };
+
     const uint32_t vsz = ct32(4), shader_off = ct32(0x18);
     const uint32_t phys_off = ct32(shader_off), bytes = ct32(size_t(shader_off) + 4);
 
@@ -1984,6 +2263,7 @@ namespace sst::native
 
       for (size_t i = 0; i < ucode.size(); ++i)
         ucode[i] = ct32(size_t(vsz) + phys_off + 4 * i);
+
       uint64_t used[4];
 
       if (FloatConstantsRead(ucode.data(), uint32_t(ucode.size()), used))
@@ -1993,6 +2273,7 @@ namespace sst::native
         for (int w = 3; w >= 0 && top < 0; --w)
           if (used[w])
             top = 64 * w + 63 - __builtin_clzll(used[w]);
+
         result = uint32_t(std::max(top + 1, 1)) * 16;
       }
     }
@@ -2016,6 +2297,7 @@ namespace sst::native
 
     if (!up.cpu)
       return 0;
+
     SwapVertexData(2, guest, up.cpu, bytes);
     constant_cache_.emplace(hash, up.gpu);
     ++stats_.constants_uploaded;
@@ -2026,12 +2308,14 @@ namespace sst::native
   {
     if (!timestamps_ || !timestamp_pending_[slot])
       return;
+
     timestamp_pending_[slot] = false;
     const D3D12_RANGE range = {16 * size_t(slot), 16 * size_t(slot) + 16};
     void *mapped = nullptr;
 
     if (FAILED(timestamp_readback_->Map(0, &range, &mapped)) || !mapped)
       return;
+
     uint64_t t[2];
     std::memcpy(t, static_cast<const uint8_t *>(mapped) + 16 * slot, 16);
     const D3D12_RANGE none = {0, 0};
@@ -2039,6 +2323,7 @@ namespace sst::native
 
     if (t[1] <= t[0] || !timestamp_frequency_)
       return;
+
     const double ms = double(t[1] - t[0]) * 1000.0 / double(timestamp_frequency_);
     prof_.gpu_ms_sum += ms;
     prof_.gpu_ms_max = std::max(prof_.gpu_ms_max, ms);
@@ -2049,12 +2334,14 @@ namespace sst::native
   {
     if (FAILED(provider_->GetDirectQueue()->GetTimestampFrequency(&timestamp_frequency_)))
       return;
+
     D3D12_QUERY_HEAP_DESC qd = {};
     qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qd.Count = 2 * kSlots;
 
     if (FAILED(device_->CreateQueryHeap(&qd, IID_PPV_ARGS(&timestamps_))))
       return;
+
     D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_READBACK};
     D3D12_RESOURCE_DESC bd = {};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -2085,11 +2372,13 @@ namespace sst::native
       {
         return double(p.ticks[ph]) * ms_per_tick / frames;
       };
+
       double renderer = 0;
 
       for (uint32_t i = 0; i < kPhCount; ++i)
         if (i != kPhFenceWait)
           renderer += ms(Phase(i));
+
       const double frame = p.frame_ms_sum / frames;
       REXLOG_INFO("[sst-native] perf: {:.1f} fps, frame {:.2f} ms avg / {:.1f} max ({:.0f}% over "
                   "1/60 s, {:.0f}% over 1/30 s); GPU {:.2f} ms avg / {:.1f} max",
@@ -2124,8 +2413,163 @@ namespace sst::native
 
   // frame
 
+  uint32_t Renderer::UsableSamples(DXGI_FORMAT format, uint32_t samples)
+  {
+    while (samples > 1)
+    {
+      const uint32_t key = (uint32_t(format) << 8) | samples;
+      auto it = msaa_support_.find(key);
+
+      if (it == msaa_support_.end())
+      {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {};
+        q.Format = format;
+        q.SampleCount = samples;
+        const bool ok = SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof(q))) && q.NumQualityLevels > 0;
+        it = msaa_support_.emplace(key, ok ? 1u : 0u).first;
+
+        if (!ok)
+          REXLOG_WARN("[sst-native] {}x MSAA not supported for DXGI format {}", samples, uint32_t(format));
+      }
+
+      if (it->second)
+        return samples;
+
+      samples /= 2;
+    }
+
+    return 1;
+  }
+
+  // The quarter-size glow / bloom chain (320x180 down to 20x11, 16:9 targets that are neither the 3D scene nor the shadow map)
+  bool Renderer::BloomSurface(const HostRT &rt, uint32_t surface) const
+  {
+    if (rt.depth || rt.width > 320 || rt.width < 16 || scene_surfaces_.count(surface) || shadow_surfaces_.count(surface))
+      return false;
+
+    const int64_t aspect = int64_t(rt.width) * 9 - int64_t(rt.height) * 16;
+    return std::abs(aspect) <= 16 * 2;
+  }
+
+  // Which scale a guest surface (and the depth buffer drawn with it) renders at: the shadow map's, the 3D scene's (surfaces drawn with MSAA, RB_SURFACE_INFO bits 16-17), or the UI / final image's. Remembered per surface so a target keeps its size between passes
+  float Renderer::SurfaceScale(const uint8_t *base, uint32_t dev, uint32_t color, uint32_t depth)
+  {
+    if ((color && shadow_surfaces_.count(color)) || (depth && shadow_surfaces_.count(depth)))
+      return shadow_scale_;
+
+    const bool msaa = (be32(base, dev + 0x2880) >> 16) & 3;
+
+    if (msaa)
+    {
+      if (color && scene_surfaces_.insert(color).second)
+        REXLOG_INFO("[sst-native] 3D scene surface {:08X}", color);
+
+      if (depth)
+        scene_surfaces_.insert(depth);
+    }
+
+    if ((color && scene_surfaces_.count(color)) || (depth && scene_surfaces_.count(depth)))
+      return scene_scale_;
+
+    return scale_;
+  }
+
+  // The output this frame renders into (and the output depth buffer) at the current scale; the old textures are released once the GPU is done with them. Called with slot_mutex_ held (Acquire reads output_scale_)
+  bool Renderer::ApplyScale()
+  {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = PxU(width_, scale_);
+    desc.Height = PxU(height_, scale_);
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+
+    if (output_scale_[target_] != scale_)
+    {
+      desc.Format = D3D12Presenter::kGuestOutputFormat;
+      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      Microsoft::WRL::ComPtr<ID3D12Resource> output;
+
+      if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&output))))
+      {
+        REXLOG_ERROR("[sst-native] could not create a {}x{} output", desc.Width, desc.Height);
+        scale_ = output_scale_[target_];
+        return false;
+      }
+
+      retired_rts_.push_back({fence_value_ + 1, outputs_[target_]});
+      outputs_[target_] = output;
+      device_->CreateRenderTargetView(output.Get(), nullptr, Rtv(target_));
+      output_scale_[target_] = scale_;
+    }
+
+    if (depth_scale_ != scale_)
+    {
+      desc.Format = kDepthFormat;
+      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+      D3D12_CLEAR_VALUE clear = {};
+      clear.Format = kDepthFormat;
+      clear.DepthStencil.Depth = 1.0f;
+      Microsoft::WRL::ComPtr<ID3D12Resource> depth;
+
+      if (SUCCEEDED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&depth))))
+      {
+        retired_rts_.push_back({fence_value_ + 1, depth_});
+        depth_ = depth;
+        device_->CreateDepthStencilView(depth_.Get(), nullptr, dsv_heap_->GetCPUDescriptorHandleForHeapStart());
+        depth_scale_ = scale_;
+      }
+    }
+
+    return true;
+  }
+
   void Renderer::BeginFrame()
   {
+    {
+      // VIDEO page settings. Targets / resolve textures are re-made at a new size on their next use
+      const float scale = float(std::clamp(REXCVAR_GET(sst_resolution), 240, 4320)) / 720.0f;
+      const float scene = scale * float(std::clamp(REXCVAR_GET(sst_render_scale), 25, 100)) / 100.0f;
+      // The stacked shadow map is a 3D texture: D3D12 caps those at 2048 texels
+      const int shadow = std::clamp(REXCVAR_GET(sst_shadow_size), 0, 2048);
+      const float shadow_scale = shadow ? float(shadow) / 1024.0f : 0.125f;
+
+      if (scale != scale_ || scene != scene_scale_ || shadow_scale != shadow_scale_ || shadows_off_ != (shadow == 0))
+      {
+        REXLOG_INFO("[sst-native] internal resolution {}x{}, 3D {}x{}, shadow map {}", PxU(width_, scale), PxU(height_, scale), PxU(width_, scene), PxU(height_, scene), shadow ? fmt::format("{0}x{0}", shadow) : "off");
+        scale_ = scale;
+        scene_scale_ = scene;
+        shadow_scale_ = shadow_scale;
+        shadows_off_ = shadow == 0;
+      }
+      // Brightness 0-100 (50 = as rendered): the game's own curve is x^(1 / (0.9 + 0.006 b)) (its gamma ramp, which the port does not emulate), applied relative to its default (b = 50)
+      const int b = std::clamp(REXCVAR_GET(sst_brightness), 0, 100);
+      gamma_ = (0.9f + 0.006f * 50) / (0.9f + 0.006f * float(b));
+      fps30_ = REXCVAR_GET(sst_fps_limit) <= 30;
+      const int aa_type = REXCVAR_GET(sst_aa_type);
+      const uint32_t msaa = aa_type == 2 ? uint32_t(std::clamp(REXCVAR_GET(sst_aa_level), 2, 8)) : 1;
+
+      if (msaa != msaa_ || fxaa_ != (aa_type == 1) || bloom_off_ != !REXCVAR_GET(sst_bloom))
+        REXLOG_INFO("[sst-native] anti-aliasing {}, bloom {}", aa_type == 1 ? std::string("FXAA") : msaa > 1 ? fmt::format("{}x MSAA", msaa)
+                                                                                                             : std::string("off"),
+                    REXCVAR_GET(sst_bloom) ? "on" : "off");
+
+      msaa_ = msaa;
+      fxaa_ = aa_type == 1;
+      bloom_off_ = !REXCVAR_GET(sst_bloom);
+      // Aspect ratio: 4:3, 16:9, 16:10, 21:9, 32:9
+      static constexpr float kAspects[5] = {4.0f / 3.0f, 16.0f / 9.0f, 1.6f, 21.0f / 9.0f, 32.0f / 9.0f};
+      const int aspect = std::clamp(REXCVAR_GET(sst_aspect), 0, 4);
+      const float s = kAspects[aspect] / (16.0f / 9.0f); // display stretch of the 16:9 frame
+      ui_fit_x_ = s > 1.0f ? 1.0f / s : 1.0f;
+      ui_fit_y_ = s < 1.0f ? s : 1.0f;
+
+      if (aspect != aspect_)
+        REXLOG_INFO("[sst-native] aspect ratio {}: UI fit {:.3f} x {:.3f}", std::array<const char *, 5>{"4:3", "16:9", "16:10", "21:9", "32:9"}[aspect], ui_fit_x_, ui_fit_y_);
+
+      aspect_ = aspect;
+    }
     {
       std::lock_guard lock(slot_mutex_);
       // A slot that holds nothing still to be shown: not the one being copied (pinned), not the last one shown (a swap may show it again), not a frame waiting its turn; else the oldest waiting frame (dropped)
@@ -2142,6 +2586,7 @@ namespace sst::native
         {
           if (oldest_waiting < 0 || output_seq_[i] < output_seq_[oldest_waiting])
             oldest_waiting = s;
+
           continue;
         }
 
@@ -2154,8 +2599,12 @@ namespace sst::native
 
       if (pick == pinned_)
         pick = (pick + 1) % int(kOutputs);
+
       target_ = uint32_t(pick);
       output_seq_[target_] = 0;
+
+      if (output_scale_[target_] != scale_ || depth_scale_ != scale_)
+        ApplyScale();
     }
 
     frame_res_ = uint32_t(submitted_ % kSlots);
@@ -2222,8 +2671,9 @@ namespace sst::native
 
     for (UINT i = 0; i < 3; ++i)
       list_->SetGraphicsRootDescriptorTable(kRootTextures2D + i, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+
     list_->SetGraphicsRootDescriptorTable(kRootSamplers, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
-    const D3D12_RECT scissor = {0, 0, LONG(width_), LONG(height_)};
+    const D3D12_RECT scissor = Scaled({0, 0, LONG(width_), LONG(height_)}, output_scale_[target_]);
     list_->RSSetScissorRects(1, &scissor);
     recording_ = true;
   }
@@ -2243,6 +2693,7 @@ namespace sst::native
 
         if (XXH3_64bits(g.ptr, g.size) == g.hash)
           continue;
+
         ++stats_.late_changed;
 
         if (g.index)
@@ -2264,6 +2715,7 @@ namespace sst::native
 
     if (RenderTargetsEnabled())
       PresentRenderTargets();
+
     auto to_src = Transition(outputs_[target_].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list_->ResourceBarrier(1, &to_src);
     const bool capturing = capture_active_;
@@ -2321,6 +2773,7 @@ namespace sst::native
 
       for (const std::string &line : rt_trace_.lines)
         REXLOG_INFO("[rt-trace] {}", line);
+
       REXLOG_INFO("[rt-trace] ---- end of frame {} ----", rt_trace_.frame);
       rt_trace_.active = false;
       rt_trace_.lines.clear();
@@ -2376,8 +2829,22 @@ namespace sst::native
 
     if (latest_ < 0)
       return nullptr;
-    // Threaded: every frame is shown once, in order. The render thread finishes frame N-1 around the game's swap N; when it is a little late, wait for it. If it is later than that, the last frame is shown again and the late one next time - the queue then holds a frame in reserve, which absorbs the next late frame instead of dropping it. More than 2 waiting: catch up
-    const bool queued = threaded_ && REXCVAR_GET(sst_native_present_queue);
+    // Threaded: every frame is shown once, in order. The render thread finishes frame N-1 around the game's swap N; when it is a little late, wait for it. If it is later than that, the last frame is shown again and the late one next time - the queue then holds a frame in reserve, which absorbs the next late frame instead of dropping it. More than 2 waiting: catch up. VIDEO > FPS LIMIT 30: every other display frame repeats the last one; the others show the newest frame
+    if (fps30_.load(std::memory_order_relaxed) && acquired_slot_ >= 0)
+    {
+      if (fps30_acquires_++ & 1)
+      {
+        ++acquires_;
+        ++acquire_repeats_;
+        pinned_ = acquired_slot_;
+        *slot = uint32_t(acquired_slot_);
+        *width = PxU(width_, output_scale_[acquired_slot_]);
+        *height = PxU(height_, output_scale_[acquired_slot_]);
+        return outputs_[acquired_slot_].Get();
+      }
+    }
+
+    const bool queued = threaded_ && REXCVAR_GET(sst_native_present_queue) && !fps30_.load(std::memory_order_relaxed);
     uint64_t want = latest_seq_;
 
     if (queued && acquired_seq_)
@@ -2418,14 +2885,16 @@ namespace sst::native
     {
       if (acquired_seq_ && output_seq_[pick] > acquired_seq_ + 1)
         acquire_skips_ += output_seq_[pick] - acquired_seq_ - 1;
+
       acquired_seq_ = output_seq_[pick];
       acquired_slot_ = pick;
+      shown_frames_.fetch_add(1, std::memory_order_relaxed);
     }
 
     pinned_ = pick;
     *slot = uint32_t(pick);
-    *width = width_;
-    *height = height_;
+    *width = PxU(width_, output_scale_[pick]);
+    *height = PxU(height_, output_scale_[pick]);
     return outputs_[pick].Get();
   }
 
@@ -2454,6 +2923,7 @@ namespace sst::native
 
     if (!recording_)
       BeginFrame();
+
     const uint32_t rt0 = be32(base, device + kDevRT0);
 
     if (RenderTargetsEnabled())
@@ -2478,21 +2948,29 @@ namespace sst::native
         }
       }
 
+      const uint32_t clear_ds = be32(base, device + kDevDepth);
+      const float rs = SurfaceScale(base, device, rt0, clear_ds);
+      const uint32_t samples = (scene_surfaces_.count(rt0) || scene_surfaces_.count(clear_ds)) ? msaa_ : 1;
       auto area = [&](const HostRT &rt)
       {
         D3D12_RECT r = {0, 0, LONG(rt.width), LONG(rt.height)};
 
         if (x1 > x0 && y1 > y0)
           r = {std::min(x0, r.right), std::min(y0, r.bottom), std::min(x1, r.right), std::min(y1, r.bottom)};
-        return r;
+
+        return Scaled(r, rt.scale);
       };
 
       if ((flags & 0xF) && rt0)
       {
-        if (HostRT *c = GetHostRT(base, rt0, false, vw, vh))
+        if (HostRT *c = GetHostRT(base, rt0, false, rs, samples, vw, vh))
         {
           SetRTState(*c, D3D12_RESOURCE_STATE_RENDER_TARGET);
-          const float col[4] = {float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f, float(color & 0xFF) / 255.0f, float((color >> 24) & 0xFF) / 255.0f};
+          float col[4] = {float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f, float(color & 0xFF) / 255.0f, float((color >> 24) & 0xFF) / 255.0f};
+
+          if (bloom_off_ && BloomSurface(*c, rt0))
+            col[0] = col[1] = col[2] = col[3] = 0;
+
           const D3D12_RECT r = area(*c);
 
           if (r.right > r.left && r.bottom > r.top)
@@ -2504,7 +2982,7 @@ namespace sst::native
 
       if ((flags & 0x30) && ds)
       {
-        if (HostRT *d = GetHostRT(base, ds, true, vw, vh))
+        if (HostRT *d = GetHostRT(base, ds, true, rs, samples, vw, vh))
         {
           SetRTState(*d, D3D12_RESOURCE_STATE_DEPTH_WRITE);
           D3D12_CLEAR_FLAGS cf = D3D12_CLEAR_FLAGS(0);
@@ -2514,6 +2992,7 @@ namespace sst::native
 
           if (flags & 0x20)
             cf |= D3D12_CLEAR_FLAG_STENCIL;
+
           const D3D12_RECT r = area(*d);
 
           if (r.right > r.left && r.bottom > r.top)
@@ -2570,10 +3049,12 @@ namespace sst::native
   {
     if (!v)
       return 0;
+
     auto [it, fresh] = dxil_hashes_.try_emplace(v, 0);
 
     if (fresh)
       it->second = XXH3_64bits(v->dxil.data(), v->dxil.size());
+
     return it->second;
   }
 
@@ -2588,6 +3069,7 @@ namespace sst::native
 
       if (job.from_library)
         ++stats_.pipelines_from_cache;
+
       stats_.pipeline_ms += job.ms;
       pipelines_.emplace(hash, std::move(job.pso));
       return;
@@ -2602,6 +3084,7 @@ namespace sst::native
 
       for (const auto &e : job.layout)
         inputs += fmt::format(" {}{}:{}@{}+{}", e.SemanticName, e.SemanticIndex, int(e.Format), e.InputSlot, e.AlignedByteOffset);
+
       REXLOG_WARN("[sst-native] pipeline creation failed ({:08X}): blend {:08X} topology {} "
                   "inputs{}",
                   uint32_t(job.hr), key.blend, key.topology_type, inputs);
@@ -2676,9 +3159,10 @@ namespace sst::native
     d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE(key.topology_type);
     d.NumRenderTargets = 1;
     d.RTVFormats[0] = key.rtv_format ? DXGI_FORMAT(key.rtv_format) : D3D12Presenter::kGuestOutputFormat;
-    d.DSVFormat = key.dsv == 0 ? kDepthFormat : key.dsv == 2 ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                                                             : DXGI_FORMAT_UNKNOWN;
-    d.SampleDesc.Count = 1;
+    const uint32_t dsv_kind = key.dsv & 0xF;
+    d.DSVFormat = dsv_kind == 0 ? kDepthFormat : dsv_kind == 2 ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                                               : DXGI_FORMAT_UNKNOWN;
+    d.SampleDesc.Count = 1u << (key.dsv >> 4);
 
     auto job = std::make_shared<PipelineJob>();
     job->hash = hash;
@@ -2732,6 +3216,7 @@ namespace sst::native
     // Already validated this frame with the same microcode: skip re-hashing the object (shader objects aren't re-created mid-frame)
     if (auto it = resolved_objects_.find(object); it != resolved_objects_.end() && it->second.frame == submitted_ && it->second.ucode == ucode_ptr && it->second.entry && shaders_->FindObject(object) == it->second.entry)
       return it->second.entry;
+
     ShaderEntry *resolved = ResolveShaderSlow(base, object, vertex, vcopy, vsize, ucode_ptr);
     resolved_objects_[object] = {submitted_, ucode_ptr, resolved};
     return resolved;
@@ -2746,10 +3231,12 @@ namespace sst::native
 
       if (ct.size() < 0x20)
         return false;
+
       auto ct32 = [&](size_t at) -> uint32_t
       {
         return at + 4 <= ct.size() ? (uint32_t(ct[at]) << 24) | (uint32_t(ct[at + 1]) << 16) | (uint32_t(ct[at + 2]) << 8) | ct[at + 3] : 0;
       };
+
       const uint32_t vsz = ct32(4);
       const uint32_t shader_off = ct32(0x18);
       const uint32_t phys_off = ct32(shader_off), bytes = ct32(size_t(shader_off) + 4);
@@ -2757,6 +3244,7 @@ namespace sst::native
 
       if (!PlausibleAddress(live) || !bytes || size_t(vsz) + phys_off + bytes > ct.size())
         return false;
+
       const uint8_t *a = ct.data() + vsz + phys_off;
       const uint8_t *b = GuestPtr(base, live + (vertex ? e->ucode_offset : phys_off));
       std::vector<bool> skip(bytes / 12 + 1, false);
@@ -2768,6 +3256,7 @@ namespace sst::native
       for (uint32_t i = 0; i * 12 + 12 <= bytes; ++i)
         if (!skip[i] && std::memcmp(a + 12 * i, b + 12 * i, 12) != 0)
           return false;
+
       return true;
     };
 
@@ -2788,10 +3277,12 @@ namespace sst::native
 
         if (known == ucode_ptr)
           return e;
+
         known = ucode_ptr;
 
         if (microcode_matches(e))
           return e;
+
         ++stats_.shader_rebinds;
 
         if (stats_.shader_rebinds_logged++ < 20)
@@ -2836,6 +3327,7 @@ namespace sst::native
     {
       if (LogOnce(0xA000000000000000ull | object))
         REXLOG_WARN("[sst-native] {} shader object {:08X} not recognised (flags {:08X})", vertex ? "vertex" : "pixel", object, flags);
+
       return nullptr;
     }
 
@@ -2856,11 +3348,13 @@ namespace sst::native
     {
       return at + 4 <= ct.size() ? (uint32_t(ct[at]) << 24) | (uint32_t(ct[at + 1]) << 16) | (uint32_t(ct[at + 2]) << 8) | ct[at + 3] : 0;
     };
+
     const uint32_t ucode_bytes = ct32(size_t(ct32(0x18)) + 4);
     const uint32_t live_ucode = ToVirtual(be32(base, vs_obj + 0x20));
 
     if (!PlausibleAddress(live_ucode) || !ucode_bytes || ucode_bytes > 0x10000 || (ucode_bytes % 12))
       return "microcode not found";
+
     const uint32_t dwords = ucode_bytes / 4;
     ucode.resize(dwords);
     const uint8_t *uc = GuestPtr(base, live_ucode + vs_entry->ucode_offset);
@@ -2940,6 +3434,7 @@ namespace sst::native
 
     if (literals_out)
       *literals_out = literals;
+
     return nullptr;
   }
 
@@ -2948,15 +3443,18 @@ namespace sst::native
   {
     if (call.up_data || vertex_count > 65536)
       return;
+
     uint32_t bools[8], fetch[192], loops[32];
     check_constants_.resize(1024);
 
     if (LoadVsState(base, call.device, vs_obj, vs_entry, check_ucode_, check_constants_.data(), bools, fetch, loops, nullptr))
       return;
+
     check_indices_.resize(vertex_count);
 
     for (uint32_t i = 0; i < vertex_count; ++i)
       check_indices_[i] = first_vertex + i;
+
     check_positions_.resize(size_t(vertex_count) * 4);
     VsConstants vc;
     vc.float_constants = check_constants_.data();
@@ -2967,6 +3465,7 @@ namespace sst::native
 
     if (!memexport_->RunPositions(check_ucode_.data(), uint32_t(check_ucode_.size()), vc, check_indices_.data(), vertex_count, check_positions_.data(), &ignored))
       return;
+
     uint32_t extreme = 0, first = 0, exported = 0;
 
     for (uint32_t v = 0; v < vertex_count; ++v)
@@ -2975,6 +3474,7 @@ namespace sst::native
 
       if (std::isnan(p[0]) && std::isnan(p[1]) && std::isnan(p[2]) && std::isnan(p[3]))
         continue;
+
       ++exported;
       const bool bad = !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) || !std::isfinite(p[3]) || std::max({std::fabs(p[0]), std::fabs(p[1]), std::fabs(p[2])}) > 1.0e6f || (p[3] > 1.0e-3f && (std::fabs(p[0]) > 64.0f * p[3] || std::fabs(p[1]) > 64.0f * p[3]));
 
@@ -3079,6 +3579,7 @@ namespace sst::native
 
     if (!extreme)
       return;
+
     ++e.flagged;
     ++stats_.check_flagged;
     // Detail: only once a key has also been seen sane (i.e. intermittent)
@@ -3130,6 +3631,7 @@ namespace sst::native
 
     if (pos < 0 || !host_inputs)
       return;
+
     const uint64_t key = vs_entry->hash ^ (uint64_t(stream0) << 24) ^ (uint64_t(first_vertex) << 52) ^ vertex_count;
     MorphHistory &h = morph_history_[key];
     std::vector<float> cur(size_t(vertex_count) * 3);
@@ -3163,6 +3665,7 @@ namespace sst::native
         {
           if (!jumps++)
             first = v;
+
           worst = std::max(worst, d);
         }
       }
@@ -3183,6 +3686,7 @@ namespace sst::native
             writes = fmt::format("output last written frame {} ({} frames ago), {} draws ago{}", it->second.frame, submitted_ - it->second.frame, draw_seq_ - it->second.draw, it->second.cached ? " (cached)" : "");
           else
             writes = "output never written by a morph";
+
           const float *a = &h.positions[3 * first];
           const float *b = &cur[3 * first];
           REXLOG_WARN("[sst-native] morph jump: VS {:016X} buffer {:08X} draw {} vertices from {}: "
@@ -3209,10 +3713,12 @@ namespace sst::native
 
     if (LoadVsState(base, call.device, vs_obj, vs_entry, check_ucode_, check_constants_.data(), bools, fetch, loops, nullptr))
       return false;
+
     check_indices_.resize(vertex_count);
 
     for (uint32_t i = 0; i < vertex_count; ++i)
       check_indices_[i] = first_vertex + i;
+
     VsConstants vc;
     vc.float_constants = check_constants_.data();
     vc.bool_constants = bools;
@@ -3240,6 +3746,7 @@ namespace sst::native
 
       if ((d0 >> 30) != 1 || d1 != 0x4B000000u || (d2 >> 20) != 0x4B0 || (d3 >> 23) != 0x96)
         continue;
+
       const uint32_t begin = (d0 & 0x3FFFFFFF) * 4;
       const uint32_t count = d3 & 0x7FFFFF;
       memexport_ranges_.push_back({begin, begin + count * 16}); // <= 16 bytes/element
@@ -3277,6 +3784,7 @@ namespace sst::native
 
     if (const char *why = LoadVsState(base, dev, vs_obj, vs_entry, memexport_ucode_, memexport_constants_.data(), bools, fetch, loops, &literals))
       return fail(why);
+
     const uint32_t dwords = uint32_t(memexport_ucode_.size());
 
     // Vertex indices (r0.x of each invocation)
@@ -3288,6 +3796,7 @@ namespace sst::native
 
       if (!ib)
         return fail("no index buffer");
+
       const uint32_t common = be32(base, ib);
       const bool index32 = (common >> 31) & 1;
       const uint32_t index_endian = (common >> 29) & 3;
@@ -3295,6 +3804,7 @@ namespace sst::native
 
       if (!PlausibleAddress(ib_addr))
         return fail("bad index buffer");
+
       const uint32_t isz = index32 ? 4 : 2;
       const uint32_t first_byte = call.start * isz;
       const uint32_t aligned_begin = first_byte & ~3u;
@@ -3321,6 +3831,7 @@ namespace sst::native
     {
       uint32_t begin, size, format;
     };
+
     Stream streams[4];
     uint32_t stream_count = 0;
 
@@ -3331,6 +3842,7 @@ namespace sst::native
 
       if ((d[0] >> 30) != 1 || d[1] != 0x4B000000u || (d[2] >> 20) != 0x4B0 || (d[3] >> 23) != 0x96)
         continue;
+
       const uint32_t format = (d[2] >> 8) & 0x3F;
       const uint32_t element = MemexportElementSize(format);
       streams[stream_count++] = {(d[0] << 2) & 0x1FFFFFFFu, (d[3] & 0x7FFFFF) * (element ? element : 16), format};
@@ -3341,6 +3853,7 @@ namespace sst::native
     {
       for (uint32_t i = 0; i < stream_count; ++i)
         WaitMemexports(streams[i].begin, streams[i].begin + streams[i].size);
+
       uint32_t slots[16];
       const uint32_t nslots = VertexFetchSlots(memexport_ucode_.data(), dwords, slots, 16);
 
@@ -3416,6 +3929,7 @@ namespace sst::native
   {
     if (pending_memexports_.empty())
       return;
+
     uint64_t need = 0;
 
     for (const PendingMemexport &p : pending_memexports_)
@@ -3445,11 +3959,13 @@ namespace sst::native
 
     if (all)
       memexport_->Wait(pending_memexports_.back().ticket);
+
     const uint64_t done = memexport_->finished();
     size_t n = 0;
 
     while (n < pending_memexports_.size() && pending_memexports_[n].ticket <= done)
       FinishMemexport(pending_memexports_[n++]);
+
     pending_memexports_.erase(pending_memexports_.begin(), pending_memexports_.begin() + n);
   }
 
@@ -3490,6 +4006,7 @@ namespace sst::native
 
       if (LogOnce(0xC400000000000000ull ^ p.vs_hash))
         REXLOG_WARN("[sst-native] memexport VS {:016X}: {}", p.vs_hash, !job.ok ? "interpreter refused the shader" : "shader wrote nothing");
+
       return;
     }
 
@@ -3533,6 +4050,7 @@ namespace sst::native
 
             for (uint32_t c = 1; c <= 4; ++c)
               weights += fmt::format(" ({:.3f} {:.3f} {:.3f} {:.3f})", job.constants[4 * c], job.constants[4 * c + 1], job.constants[4 * c + 2], job.constants[4 * c + 3]);
+
             REXLOG_WARN("[sst-native] memexport VS {:016X} at {:08X}: {} implausible values of {} "
                         "(first: float {} = {}); vertices {}; c1-c4{}",
                         p.vs_hash, p.begin[0], bad, p.size[0] / 4, first_bad, first_value, p.count, weights);
@@ -3565,6 +4083,7 @@ namespace sst::native
 
     if (!call.count)
       return;
+
     const uint32_t dev = call.device;
 
     // Memory-export (morph) passes: no rendering, they write vertices a later draw reads. Run them whatever the render target.
@@ -3689,6 +4208,7 @@ namespace sst::native
                     ps_obj, !ps_obj ? "none" : ps_entry ? "ok"
                                                         : "unknown",
                     call.prim, call.count);
+
       return;
     }
 
@@ -3709,6 +4229,7 @@ namespace sst::native
       uint32_t slot;   // fetch constant slot (2-dword units)
       uint32_t stride; // bytes
     };
+
     FetchStream fetch_streams[kMaxStreams];
     uint32_t fetch_stream_count = 0;
     auto stream_index = [&](uint32_t slot, uint32_t stride) -> int
@@ -3719,6 +4240,7 @@ namespace sst::native
 
       if (fetch_stream_count == kMaxStreams)
         return -1;
+
       fetch_streams[fetch_stream_count] = {slot, stride};
       return int(fetch_stream_count++);
     };
@@ -3732,6 +4254,7 @@ namespace sst::native
       int stream;          // -1: reads zeros
       uint32_t fetch_addr; // instruction index of the controlling full vfetch
     };
+
     // Shaders whose full vfetches don't fetch with the plain vertex index (r0.x) - e.g. particle quads reading one record per 4 vertices - get their element indices from running the shader on the CPU
     bool computed_fetch = false;
     uint32_t full_fetch_addr = 0;
@@ -3751,12 +4274,14 @@ namespace sst::native
       uint32_t addr, l0, l1, l2; // live (patched)
       uint32_t o0, o1;           // original (container)
     };
+
     std::vector<LiveFetch> live_fetches;
     live_fetches.reserve(inputs.size());
     auto container_dword = [&](size_t at) -> uint32_t
     {
       if (at + 4 > vs_entry->container.size())
         return 0;
+
       const uint8_t *p = vs_entry->container.data() + at;
       return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
     };
@@ -3775,8 +4300,10 @@ namespace sst::native
       for (int i = 0; i < 4; ++i)
         if (((swizzle_word >> (3 * i)) & 7) != 7)
           m |= 1u << i;
+
       return m;
     };
+
     bool remapped = false;
 
     for (const auto &in : inputs)
@@ -3797,6 +4324,7 @@ namespace sst::native
 
       if (!self)
         continue;
+
       const uint32_t o1 = self->o1 ? self->o1 : self->l1; // original swizzle
       // Live instruction writing the original destination register
       const LiveFetch *match = self;
@@ -3815,6 +4343,7 @@ namespace sst::native
           {
             if ((lf.l0 & 0x1F) != 0 || ((lf.l0 >> 12) & 0x3F) != dst)
               continue;
+
             const int score = __builtin_popcount(written_mask(lf.l1) & want);
 
             if (score > best_score)
@@ -3886,12 +4415,14 @@ namespace sst::native
 
           if ((set >> o) & 1)
             conflict |= f.sel[o] != hw;
+
           f.sel[o] = hw;
           set |= uint8_t(1u << o);
         }
 
         if (conflict && LogOnce(0xE100000000000000ull | (uint64_t(o1) << 24) | (l1 & 0xFFF)))
           REXLOG_WARN("[sst-native] {}{}: conflicting swizzles (original {:03X} patched {:03X})", d.SemanticName, d.SemanticIndex, o1 & 0xFFF, l1 & 0xFFF);
+
         f.out = !UsageIsUint(in.usage) ? FetchElement::Out::kFloat : in.usage == 2 ? FetchElement::Out::kUint
                                                                                    : FetchElement::Out::kFloatBits;
 
@@ -3915,6 +4446,7 @@ namespace sst::native
 
       if (h.stream < 0 && LogOnce(0xE000000000000000ull | (uint64_t(vs_entry->hash & 0xFFFFFFFF) << 16) | in.address))
         REXLOG_WARN("[sst-native] VS {:016X} input {}{} at {}: unusable fetch {:08X} {:08X} {:08X}", vs_entry->hash, d.SemanticName, d.SemanticIndex, in.address, l0, l1, l2);
+
       d.Format = UsageIsUint(in.usage) ? DXGI_FORMAT_R32G32B32A32_UINT : DXGI_FORMAT_R32G32B32A32_FLOAT;
 
       if (h.stream >= 0)
@@ -3924,6 +4456,7 @@ namespace sst::native
 
         if (in.usage == 0 && position_element < 0)
           position_element = int(host_elements.size());
+
         host_elements.push_back(h);
       }
       else
@@ -3976,7 +4509,17 @@ namespace sst::native
         }
       }
 
-      color_rt = GetHostRT(base, rt0, false, vw, vh);
+      const uint32_t ds_surface = be32(base, dev + kDevDepth);
+      const float rs = SurfaceScale(base, dev, rt0, ds_surface);
+
+      if (shadows_off_ && rs == shadow_scale_ && (shadow_surfaces_.count(rt0) || shadow_surfaces_.count(ds_surface)))
+      {
+        ++stats_.skip_cull; // VIDEO > SHADOWS OFF: nothing drawn into the shadow map
+        return;
+      }
+
+      const uint32_t samples = (scene_surfaces_.count(rt0) || scene_surfaces_.count(ds_surface)) ? msaa_ : 1;
+      color_rt = GetHostRT(base, rt0, false, rs, samples, vw, vh);
 
       if (!color_rt)
       {
@@ -3984,13 +4527,19 @@ namespace sst::native
         return;
       }
 
+      if (bloom_off_ && BloomSurface(*color_rt, rt0))
+      {
+        ++stats_.skip_cull; // VIDEO > BLOOM OFF: the glow / bloom targets stay black
+        return;
+      }
+
       const uint32_t ds = be32(base, dev + kDevDepth);
 
       if (ds && (depthcontrol & 3))
       { // stencil or depth test on
-        depth_rt = GetHostRT(base, ds, true, vw, vh);
+        depth_rt = GetHostRT(base, ds, true, rs, samples, vw, vh);
 
-        if (depth_rt && (depth_rt->width != color_rt->width || depth_rt->height != color_rt->height))
+        if (depth_rt && (depth_rt->width != color_rt->width || depth_rt->height != color_rt->height || depth_rt->samples != color_rt->samples))
         {
           if (LogOnce(0xAC00000000000000ull ^ (uint64_t(rt0) << 24) ^ ds))
             REXLOG_INFO("[sst-native] colour target {:08X} ({}x{}) and depth {:08X} ({}x{}) differ "
@@ -4005,6 +4554,7 @@ namespace sst::native
     }
 
     const bool has_depth = rt_mode ? depth_rt != nullptr : be32(base, dev + kDevDepth) != 0;
+    const float draw_scale = color_rt ? color_rt->scale : output_scale_[target_];
 
     uint32_t ps_spec = 0;
     const bool alpha_test = (colorcontrol >> 3) & 1;
@@ -4042,6 +4592,7 @@ namespace sst::native
 
     if (debug_shading && ps)
       ps = debug_ps_.get();
+
     key.vs = vs;
     key.ps = ps;
     key.layout_hash = XXH3_64bits(layout_hash_input, layout_words * sizeof(uint64_t));
@@ -4065,6 +4616,10 @@ namespace sst::native
     key.cull = rect_list ? 0 : uint8_t(mode & 3);
     key.rtv_format = rt_mode ? uint8_t(color_rt->format) : 0;
     key.dsv = rt_mode ? (depth_rt ? 2 : 1) : 0;
+    // MSAA: log2(samples) in bits 4-7 (0 without MSAA, so other keys are unchanged)
+    if (rt_mode && color_rt->samples > 1)
+      key.dsv |= uint8_t(std::countr_zero(color_rt->samples) << 4);
+
     key.front_ccw = ((mode >> 2) & 1) ? 0 : 1;
     // Polygon offset (the shadow pass's depth bias; without it surfaces shadow themselves in a dotted pattern). PA_SU_SC_MODE_CNTL bits 11-13 enable it for front / back / both; the device keeps PA_SU_POLY_OFFSET_FRONT_SCALE, _FRONT_OFFSET, _BACK_SCALE, _BACK_OFFSET at dev+0x2A50..+0x2A5C. Units as Xenia: scale in 1/16 subpixels, offset in float24 depth ULPs
     if (key.depth_enable && (mode & (7u << 11)))
@@ -4208,6 +4763,7 @@ namespace sst::native
         {
           if (strip && v == restart)
             continue;
+
           vmin = std::min(vmin, v);
           vmax = std::max(vmax, v);
         }
@@ -4258,6 +4814,7 @@ namespace sst::native
       uint32_t endian;
       uint32_t size; // bytes
     };
+
     ResolvedStream resolved[kMaxStreams] = {};
     bool reads_morph = false;
 
@@ -4291,6 +4848,7 @@ namespace sst::native
 
           if (LogOnce(0xF000000000000000ull | fs.slot))
             REXLOG_WARN("[sst-native] fetch constant {} is not a vertex buffer: {:08X} {:08X}", fs.slot, dw0, dw1);
+
           return;
         }
 
@@ -4392,6 +4950,7 @@ namespace sst::native
         {
           if (n + 3 > std::size(words))
             break;
+
           const FetchElement &f = h.fetch;
           words[n++] = (uint64_t(f.format) << 32) | (uint64_t(f.is_signed) << 24) | (uint64_t(f.normalized) << 16) | (uint64_t(f.no_zero) << 8) | uint64_t(uint8_t(f.out));
           words[n++] = (uint64_t(uint32_t(f.exp_adjust)) << 32) | f.offset;
@@ -4431,6 +4990,7 @@ namespace sst::native
 
           for (uint32_t i = 0; i < fetch_stream_count; ++i)
             XXH3_64bits_update(st, resolved[i].src + size_t(first_vertex) * fetch_streams[i].stride, size_t(vertex_count) * fetch_streams[i].stride);
+
           vhash = XXH3_64bits_digest(st);
 
           if (ventry->hash == vhash && ventry->generation == geo_generation_ && ventry->size)
@@ -4587,6 +5147,7 @@ namespace sst::native
 
           for (uint32_t i = 0; i < std::min<uint32_t>(9, call.count); ++i)
             idx += fmt::format(" {}", indices[i]);
+
           std::string verts;
 
           for (uint32_t v = 0; v < std::min<uint32_t>(3, vertex_count); ++v)
@@ -4701,6 +5262,7 @@ namespace sst::native
 
       if (!up.cpu)
         return;
+
       std::memcpy(up.cpu, rect_indices.data(), rect_indices.size() * 4);
       const D3D12_INDEX_BUFFER_VIEW ibv = {up.gpu, UINT(rect_indices.size() * 4), DXGI_FORMAT_R32_UINT};
       list_->IASetIndexBuffer(&ibv);
@@ -4728,10 +5290,12 @@ namespace sst::native
 
       if (converted.empty())
         return;
+
       const Upload up = Allocate(converted.size() * 4, 16);
 
       if (!up.cpu)
         return;
+
       std::memcpy(up.cpu, converted.data(), converted.size() * 4);
       const D3D12_INDEX_BUFFER_VIEW ibv = {up.gpu, UINT(converted.size() * 4), DXGI_FORMAT_R32_UINT};
       list_->IASetIndexBuffer(&ibv);
@@ -4786,6 +5350,7 @@ namespace sst::native
 
     if (!vsc_gpu || !psc_gpu || !shared.cpu)
       return;
+
     {
       uint32_t sc[72] = {};
 
@@ -4798,7 +5363,11 @@ namespace sst::native
       }
 
       clk.Switch(kPhTextures);
+      draw_composite_ = false;
       BindTextures(base, dev, vs_entry, ps ? ps_entry : nullptr, sc);
+      // Aspect ratio: UI draws (into the full-size UI / final targets) keep their proportions in a centred 16:9 box
+      const bool ui_fit = (ui_fit_x_ != 1.0f || ui_fit_y_ != 1.0f) && color_rt && !draw_composite_ && !color_rt->depth && color_rt->width * 10 >= width_ * 9 && !scene_surfaces_.count(rt0) && !shadow_surfaces_.count(rt0);
+      const float fit_cx = float(width_) * 0.5f, fit_cy = float(height_) * 0.5f;
       clk.Switch(kPhConstants);
       const uint32_t vs_bools = be32(base, dev + kDevBools);
       const uint32_t ps_bools = be32(base, dev + kDevBools + 16);
@@ -4837,12 +5406,28 @@ namespace sst::native
 
       if (REXCVAR_GET(sst_native_half_pixel) && vp.Width > 0 && vp.Height > 0)
       {
-        half_x = 1.0f / vp.Width;
+        half_x = 1.0f / vp.Width; // half a guest pixel in clip space
         half_y = -1.0f / vp.Height;
       }
 
       std::memcpy(&sc[66], &half_x, 4);
       std::memcpy(&sc[67], &half_y, 4);
+      // Internal resolution: host pixels = guest pixels x the target's scale. Pixel shaders that read their screen position get it in guest pixels
+      const float inv_scale = 1.0f / draw_scale;
+      std::memcpy(&sc[70], &inv_scale, 4);
+
+      if (ui_fit)
+      {
+        vp.TopLeftX = fit_cx + (vp.TopLeftX - fit_cx) * ui_fit_x_;
+        vp.Width *= ui_fit_x_;
+        vp.TopLeftY = fit_cy + (vp.TopLeftY - fit_cy) * ui_fit_y_;
+        vp.Height *= ui_fit_y_;
+      }
+
+      vp.TopLeftX *= draw_scale;
+      vp.TopLeftY *= draw_scale;
+      vp.Width *= draw_scale;
+      vp.Height *= draw_scale;
       cap_half_x = half_x;
       cap_half_y = half_y;
       std::memcpy(shared.cpu, sc, sizeof(sc));
@@ -4875,6 +5460,12 @@ namespace sst::native
           }
         }
 
+        if (ui_fit)
+        {
+          rect = {LONG(std::floor(fit_cx + (float(rect.left) - fit_cx) * ui_fit_x_)), LONG(std::floor(fit_cy + (float(rect.top) - fit_cy) * ui_fit_y_)), LONG(std::ceil(fit_cx + (float(rect.right) - fit_cx) * ui_fit_x_)), LONG(std::ceil(fit_cy + (float(rect.bottom) - fit_cy) * ui_fit_y_))};
+        }
+
+        rect = Scaled(rect, draw_scale);
         list_->RSSetScissorRects(1, &rect);
       }
     }
@@ -4889,6 +5480,7 @@ namespace sst::native
 
       if (depth_rt)
         SetRTState(*depth_rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
       const uint64_t pair = (uint64_t(color_rt->view + 1) << 32) | (depth_rt ? depth_rt->view + 1 : 0);
 
       if (pair != bound_targets_)
@@ -4914,6 +5506,7 @@ namespace sst::native
       list_->DrawIndexedInstanced(draw_count, 1, 0, convert || rect_list ? 0 : -int32_t(vmin), 0);
     else
       list_->DrawInstanced(draw_count, 1, 0, 0);
+
     ++stats_.drawn;
 
     if (!ps)
@@ -4945,12 +5538,14 @@ namespace sst::native
       CaptureDraw(base, call, vs_obj, vs_entry, vs, layout, key.layout_hash, first_vertex, vertex_count, fetch_stream_count ? uint32_t(resolved[0].src - physical_membase_) : 0, reads_morph, cap_half_x, cap_half_y);
   }
 
-  // F9 capture: GPU vertex positions (stream output) vs the CPU For one frame, every drawn draw is drawn a second time as a point list into a stream-output buffer with a pipeline that has no rasterizer, capturing SV_Position exactly as the GPU computed it from the translated shader. The original microcode is run on the CPU over the same vertices; at the end of the frame both are compared. Disagreeing draws are translation (or GPU input) bugs; agreeing draws with vertices far outside the view are data
+  // F9 capture: GPU vertex positions (stream output) vs the CPU
+  // For one frame, every drawn draw is drawn a second time as a point list into a stream-output buffer with a pipeline that has no rasterizer, capturing SV_Position exactly as the GPU computed it from the translated shader. The original microcode is run on the CPU over the same vertices; at the end of the frame both are compared. Disagreeing draws are translation (or GPU input) bugs; agreeing draws with vertices far outside the view are data
 
   bool Renderer::EnsureCaptureResources()
   {
     if (so_buffer_)
       return true;
+
     const size_t total = kSoDataBytes + kSoCounterBytes;
     D3D12_RESOURCE_DESC bd = {};
     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -4989,6 +5584,7 @@ namespace sst::native
 
     if (auto it = so_pipelines_.find(key); it != so_pipelines_.end())
       return it->second.Get();
+
     static const D3D12_SO_DECLARATION_ENTRY kEntry = {0, "SV_Position", 0, 0, 4, 0};
     static const UINT kStride = 16;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
@@ -5018,6 +5614,7 @@ namespace sst::native
     {
       if (LogOnce(0xCA00000000000000ull ^ key))
         REXLOG_WARN("[sst-native] capture: stream-output pipeline failed ({:08X})", uint32_t(hr));
+
       so_pipelines_.emplace(key, nullptr);
       return nullptr;
     }
@@ -5029,10 +5626,12 @@ namespace sst::native
   {
     if (captured_.size() >= kSoMaxDraws || so_used_ + size_t(vertex_count) * 16 > kSoDataBytes)
       return;
+
     ID3D12PipelineState *pso = GetSoPipeline(vs, layout_hash, layout);
 
     if (!pso)
       return;
+
     CapturedDraw c;
     c.vs_hash = vs_entry->hash;
     c.prim = call.prim;
@@ -5058,6 +5657,7 @@ namespace sst::native
 
       for (uint32_t i = 0; i < vertex_count; ++i)
         idx[i] = first_vertex + i;
+
       c.cpu.resize(size_t(vertex_count) * 4);
       VsConstants vc;
       vc.float_constants = check_constants_.data();
@@ -5100,6 +5700,7 @@ namespace sst::native
       float extent;
       size_t index;
     };
+
     std::vector<Reach> reach;
 
     for (size_t d = 0; d < captured_.size(); ++d)
@@ -5126,6 +5727,7 @@ namespace sst::native
 
         if (c.cpu.empty())
           continue;
+
         const float *cp = &c.cpu[4 * size_t(v)];
 
         if (std::isnan(cp[0]) && std::isnan(cp[3]))
@@ -5153,6 +5755,7 @@ namespace sst::native
         {
           if (!bad++)
             first_bad = v;
+
           worst = std::max(worst, diff);
         }
       }
@@ -5162,6 +5765,7 @@ namespace sst::native
 
       if (nan)
         ++gpu_nan;
+
       reach.push_back({extent, d});
 
       if (bad)
@@ -5184,6 +5788,7 @@ namespace sst::native
     {
       if (mismatched && capture_frames_logged_++ < 300)
         REXLOG_WARN("[sst-native] capture: frame {}: {} of {} draws differ between GPU and CPU", submitted_, mismatched, compared);
+
       const D3D12_RANGE none = {0, 0};
       so_readback_->Unmap(0, &none);
       return;
@@ -5218,21 +5823,25 @@ namespace sst::native
 
     if (!fresh)
       return it->second;
+
     TextureUsage &u = it->second;
     const std::vector<uint8_t> &ct = entry->container;
     auto ct32 = [&](size_t at) -> uint32_t
     {
       return at + 4 <= ct.size() ? (uint32_t(ct[at]) << 24) | (uint32_t(ct[at + 1]) << 16) | (uint32_t(ct[at + 2]) << 8) | ct[at + 3] : 0;
     };
+
     const uint32_t vsz = ct32(4), shader_off = ct32(0x18);
     const uint32_t phys_off = ct32(shader_off), bytes = ct32(size_t(shader_off) + 4);
 
     if (!bytes || size_t(vsz) + phys_off + bytes > ct.size())
       return u;
+
     std::vector<uint32_t> ucode(bytes / 4);
 
     for (size_t i = 0; i < ucode.size(); ++i)
       ucode[i] = ct32(size_t(vsz) + phys_off + 4 * i);
+
     u.mask = TextureFetchUsage(ucode.data(), uint32_t(ucode.size()), u.uses);
 
     for (uint32_t i = 0; i < 32; ++i)
@@ -5256,29 +5865,38 @@ namespace sst::native
   {
     if (!textures_)
       return;
+
     const TextureCache::AllocateFn allocate = [this](size_t size)
     {
       const Upload u = Allocate(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
       return TextureCache::UploadSpace{u.cpu, u.resource, u.offset};
     };
+
     bool textured = false, placeholder = false;
 
     for (const ShaderEntry *e : {vs_entry, ps_entry})
     {
       if (!e)
         continue;
+
       const TextureUsage &u = GetTextureUsage(e);
 
       for (uint32_t i = 0; i < 16; ++i)
       {
         if (!((u.mask >> i) & 1))
           continue;
+
         const TextureFetchUse &use = u.uses[i];
         uint32_t fetch[6];
 
         for (uint32_t k = 0; k < 6; ++k)
           fetch[k] = be32(base, dev + kDevFetchConstants + 24 * i + 4 * k);
+
         const uint32_t dimension = use.dimension ? use.dimension - 1u : 1u;
+
+        if (!composite_pages_.empty() && composite_pages_.count((fetch[1] >> 12) & 0x1FFFF))
+          draw_composite_ = true;
+
         const uint32_t slot = textures_->GetTexture(list_.Get(), allocate, fetch, dimension);
 
         if (slot != TextureCache::kNone)
@@ -5342,10 +5960,12 @@ namespace sst::native
 
     for (auto &[p, n] : s.prims)
       prims += fmt::format(" {:X}:{}", p, n);
+
     std::string clears;
 
     for (auto &[f, n] : s.clear_flags)
       clears += fmt::format(" {:X}:{}", f, n);
+
     REXLOG_INFO("[sst-native]   prims{} | clear flags{}", prims, clears);
     const MemexportStats &m = memexport_stats_;
     REXLOG_INFO("[sst-native]   memexport: {} draws, {} run ({} in the background, render thread "
@@ -5373,6 +5993,7 @@ namespace sst::native
 
     if (s.shader_rebinds)
       REXLOG_INFO("[sst-native]   shader objects reused for a different shader: {}", s.shader_rebinds);
+
     REXLOG_INFO("[sst-native]   morph checks: {} draws with implausible output; consumers {} "
                 "(reading past the output {}, stale {}, implausible inputs {}); jump checks {}, "
                 "draws with jumping vertices {}; output changed before use {}",
@@ -5380,6 +6001,7 @@ namespace sst::native
 
     if (morph_history_.size() > 4096)
       morph_history_.clear();
+
     last_stats_frame_ = frame;
 
     if (REXCVAR_GET(sst_native_check_late_writes))
@@ -5397,6 +6019,7 @@ namespace sst::native
       for (const auto &[k, e] : check_entries_)
         if (e.flagged && e.flagged < e.checked)
           sometimes.push_back(&e);
+
       std::sort(sometimes.begin(), sometimes.end(), [](auto *a, auto *b)
                 { return a->flagged > b->flagged; });
       REXLOG_INFO("[sst-native]   VS check: {} draws run on the CPU, {} with far-out vertices; {} "
@@ -5405,6 +6028,7 @@ namespace sst::native
 
       for (size_t i = 0; i < sometimes.size() && i < 12; ++i)
         REXLOG_INFO("[sst-native]     VS {:016X} buffer {:08X} prim {}{}: {} of {} draws", sometimes[i]->vs, sometimes[i]->stream, sometimes[i]->prim, sometimes[i]->morph ? " (morph output)" : "", sometimes[i]->flagged, sometimes[i]->checked);
+
       check_entries_.clear();
     }
 
@@ -5439,5 +6063,4 @@ namespace sst::native
     s.pipelines_from_cache = from_cache;
     s.skip_shader_logged = logged;
   }
-
 }

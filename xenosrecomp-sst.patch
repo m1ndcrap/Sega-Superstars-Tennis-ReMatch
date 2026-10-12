@@ -15,28 +15,30 @@ index e505a5e..efbd4d0 100644
      target_compile_definitions(XenosRecomp PRIVATE XENOS_RECOMP_DXIL)
      target_link_libraries(XenosRecomp PRIVATE Microsoft::DXIL)
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..38291d0 100644
+index 1c74034..0056357 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -30,6 +30,7 @@ struct PushConstants
+@@ -30,6 +30,8 @@ struct PushConstants
  #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
  #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
  #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
 +#define g_VertexIndexBase          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276)
++#define g_InvRenderScale           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 280)
  
  [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
  
-@@ -41,7 +42,8 @@ struct PushConstants
+@@ -41,7 +43,9 @@ struct PushConstants
      uint g_Booleans : packoffset(c16.x); \
      uint g_SwappedTexcoords : packoffset(c16.y); \
      float2 g_HalfPixelOffset : packoffset(c16.z); \
 -    float g_AlphaThreshold : packoffset(c17.x);
 +    float g_AlphaThreshold : packoffset(c17.x); \
-+    uint g_VertexIndexBase : packoffset(c17.y);
++    uint g_VertexIndexBase : packoffset(c17.y); \
++    float g_InvRenderScale : packoffset(c17.z);
  
  uint g_SpecConstants();
  
-@@ -65,6 +67,19 @@ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
+@@ -65,6 +69,19 @@ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
      return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
  }
  
@@ -56,7 +58,7 @@ index 1c74034..38291d0 100644
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-@@ -143,9 +158,10 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+@@ -143,9 +160,10 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
      return r;
  }
  
@@ -70,7 +72,7 @@ index 1c74034..38291d0 100644
  
  struct CubeMapData
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..67e0fb9 100644
+index 698a418..320b385 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -115,7 +115,14 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
@@ -315,7 +317,19 @@ index 698a418..67e0fb9 100644
  
          out += "\tout float4 oPos : SV_Position";
  
-@@ -1471,6 +1591,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1464,13 +1584,25 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             print("\tfloat4 r{} = ", i);
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+             {
++            #ifdef SST_RECOMP
++                // Screen position in guest pixels at any internal resolution.
++                out += "float4((iPos.xy * g_InvRenderScale - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++            #else
+                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++            #endif
+             }
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
              {
                  out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
              }
@@ -329,7 +343,7 @@ index 698a418..67e0fb9 100644
          #endif
              else
              {
-@@ -1479,6 +1606,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1479,6 +1611,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  
