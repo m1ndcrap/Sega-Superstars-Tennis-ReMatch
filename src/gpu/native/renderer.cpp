@@ -1464,11 +1464,11 @@ namespace sst::native
 
   bool Renderer::CreateBlitResources()
   {
-    // Root signature: b0 = 4 root constants (source offset), t0 = source.
+    // Root signature: b0 = 8 root constants (source offset, flags, gamma; source rectangle for FXAA), t0 = source
     D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
     D3D12_ROOT_PARAMETER params[2] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 4};
+    params[0].Constants = {0, 0, 8};
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {1, &range};
@@ -1516,14 +1516,18 @@ namespace sst::native
                                 "  return c;\n"
                                 "}\n";
     // FXAA (the compact 'console' variant: 4 diagonal luma taps, one blur direction, two / four taps along it)
-    static const char kPSFxaa[] = "cbuffer C : register(b0) { int4 offset; };\n"
+    static const char kPSFxaa[] = "cbuffer C : register(b0) { int4 offset; int4 rect; };\n"
                                   "Texture2D<float4> src : register(t0);\n"
                                   "SamplerState lin : register(s0);\n"
+                                  "static float2 lo_uv, hi_uv;\n"
                                   "float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
-                                  "float3 S(float2 uv) { return src.SampleLevel(lin, uv, 0).rgb; }\n"
+                                  // Taps stay inside the copied rectangle: with tiled rendering the rest of the source holds another tile's (older) pixels
+                                  "float3 S(float2 uv) { return src.SampleLevel(lin, clamp(uv, lo_uv, hi_uv), 0).rgb; }\n"
                                   "float4 main(float4 p : SV_Position) : SV_Target {\n"
                                   "  uint w, h; src.GetDimensions(w, h);\n"
                                   "  float2 rcp = 1.0 / float2(w, h);\n"
+                                  "  lo_uv = (float2(rect.xy) + 0.5) * rcp;\n"
+                                  "  hi_uv = (float2(rect.zw) - 0.5) * rcp;\n"
                                   "  float2 uv = (floor(p.xy) + float2(offset.xy) + 0.5) * rcp;\n"
                                   "  float4 m = src.SampleLevel(lin, uv, 0);\n"
                                   "  float nw = Luma(S(uv + float2(-0.5, -0.5) * rcp));\n"
@@ -1681,8 +1685,8 @@ namespace sst::native
       std::memcpy(&gamma_bits, &gamma, 4);
 
     const int32_t flags = (swap_rb ? 1 : 0) | int32_t(samples << 8) | int32_t((src_samples & 0x100) << 8);
-    const int32_t offset[4] = {src_x - dst.left, src_y - dst.top, flags, gamma_bits};
-    list_->SetGraphicsRoot32BitConstants(0, 4, offset, 0);
+    const int32_t offset[8] = {src_x - dst.left, src_y - dst.top, flags, gamma_bits, src_x, src_y, src_x + (dst.right - dst.left), src_y + (dst.bottom - dst.top)};
+    list_->SetGraphicsRoot32BitConstants(0, 8, offset, 0);
     list_->SetGraphicsRootDescriptorTable(1, SrvGpu(src_srv));
     list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     // The triangle covers the whole viewport; viewport + scissor = destination
@@ -2446,9 +2450,9 @@ namespace sst::native
   {
     if (rt.depth || rt.width > 320 || rt.width < 16 || scene_surfaces_.count(surface) || shadow_surfaces_.count(surface))
       return false;
-
-    const int64_t aspect = int64_t(rt.width) * 9 - int64_t(rt.height) * 16;
-    return std::abs(aspect) <= 16 * 2;
+    // Same shape as the frame (16:9, or 5:4 in the game's 4:3 mode)
+    const int64_t aspect = int64_t(rt.width) * height_ - int64_t(rt.height) * width_;
+    return std::abs(aspect) <= int64_t(width_) * 2;
   }
 
   // Which scale a guest surface (and the depth buffer drawn with it) renders at: the shadow map's, the 3D scene's (surfaces drawn with MSAA, RB_SURFACE_INFO bits 16-17), or the UI / final image's. Remembered per surface so a target keeps its size between passes
@@ -2528,8 +2532,8 @@ namespace sst::native
   void Renderer::BeginFrame()
   {
     {
-      // VIDEO page settings. Targets / resolve textures are re-made at a new size on their next use
-      const float scale = float(std::clamp(REXCVAR_GET(sst_resolution), 240, 4320)) / 720.0f;
+      // VIDEO page settings. Targets / resolve textures are re-made at a new size on their next use. Internal resolution in lines of the game's frame (720, or 1024 in its 4:3 mode)
+      const float scale = float(std::clamp(REXCVAR_GET(sst_resolution), 240, 4320)) / float(height_);
       const float scene = scale * float(std::clamp(REXCVAR_GET(sst_render_scale), 25, 100)) / 100.0f;
       // The stacked shadow map is a 3D texture: D3D12 caps those at 2048 texels
       const int shadow = std::clamp(REXCVAR_GET(sst_shadow_size), 0, 2048);
@@ -2560,8 +2564,15 @@ namespace sst::native
       bloom_off_ = !REXCVAR_GET(sst_bloom);
       // Aspect ratio: 4:3, 16:9, 16:10, 21:9, 32:9
       static constexpr float kAspects[5] = {4.0f / 3.0f, 16.0f / 9.0f, 1.6f, 21.0f / 9.0f, 32.0f / 9.0f};
-      const int aspect = std::clamp(REXCVAR_GET(sst_aspect), 0, 4);
-      const float s = kAspects[aspect] / (16.0f / 9.0f); // display stretch of the 16:9 frame
+      // 4:3: the game's own 4:3 mode (a 1280x1024 frame, from startup) needs no fit; 4:3 picked later waits for a restart (16:9 until then)
+      int aspect = std::clamp(REXCVAR_GET(sst_aspect), 0, 4);
+
+      if (height_ > 720)
+        aspect = 0;
+      else if (aspect == 0)
+        aspect = 1;
+
+      const float s = height_ > 720 ? 1.0f : kAspects[aspect] / (16.0f / 9.0f); // display stretch
       ui_fit_x_ = s > 1.0f ? 1.0f / s : 1.0f;
       ui_fit_y_ = s < 1.0f ? s : 1.0f;
 

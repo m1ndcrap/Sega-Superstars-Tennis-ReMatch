@@ -16,6 +16,7 @@ set(SSTREMATCH_SOURCES
     src/gpu/d3d_trace.cpp
     src/menu/graphics_menu.cpp
     src/menu/pause_patch.cpp
+    src/menu/restart.cpp
 )
 if(WIN32)
     # Native D3D12 renderer (active with --gpu_plugin=sst)

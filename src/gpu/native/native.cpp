@@ -37,10 +37,12 @@ REXCVAR_DECLARE(int32_t, sst_aspect);
 
 REXCVAR_DEFINE_INT32(sst_native_log_every, 600, "SST",
                      "Native renderer: print a status line every N frames (0 = never)");
+
 REXCVAR_DEFINE_BOOL(sst_native_game_thread_priority, true, "SST",
                     "Native renderer: raise the game's rendering thread (the one calling Swap) to "
                     "above-normal priority, so background work (morphs, shader / pipeline "
                     "compiles) never delays its frame");
+
 REXCVAR_DEFINE_BOOL(sst_native_render_thread, true, "SST",
                     "Native renderer: record and submit the game's draws on a separate render "
                     "thread (the game thread only snapshots each call's state). false = do all "
@@ -195,6 +197,15 @@ namespace sst::native
     {
       static constexpr uint32_t kAspectXY[5][2] = {{4, 3}, {16, 9}, {16, 10}, {21, 9}, {32, 9}};
       const auto &a = kAspectXY[std::clamp(REXCVAR_GET(sst_aspect), 0, 4)];
+      // 4:3 is the game's own mode, from startup; picked later it waits for a restart
+      int aspect = std::clamp(REXCVAR_GET(sst_aspect), 0, 4);
+
+      if (sst::menu::NativeFourThree())
+        aspect = 0;
+      else if (aspect == 0)
+        aspect = 1;
+
+      const auto &a = kAspectXY[aspect];
       *x = a[0];
       *y = a[1];
     }
@@ -597,8 +608,10 @@ namespace sst::native
     auto state = std::make_unique<State>();
     state->set_frame_source = set_source;
     state->shaders.Initialize(*provider, rex::filesystem::GetExecutableFolder() / "cache" / "shaders");
+    // The game's frame: 1280x720, or 1280x1024 in its own 4:3 mode
+    const uint32_t frame_h = sst::menu::NativeFourThree() ? 1024 : 720;
 
-    if (!state->renderer.Initialize(*provider, &state->shaders, runtime->memory()->physical_membase(), 1280, 720))
+    if (!state->renderer.Initialize(*provider, &state->shaders, runtime->memory()->physical_membase(), 1280, frame_h))
     {
       REXLOG_ERROR("[sst-native] renderer setup failed - native renderer disabled");
       state->shaders.Shutdown();
@@ -615,7 +628,7 @@ namespace sst::native
 
     g_state = state.release();
     g_active.store(true, std::memory_order_release);
-    REXLOG_INFO("[sst-native] native renderer active (1280x720), {}", threaded ? "draws recorded on a separate render thread" : "draws recorded on the game thread");
+    REXLOG_INFO("[sst-native] native renderer active (1280x{}), {}", frame_h, threaded ? "draws recorded on a separate render thread" : "draws recorded on the game thread");
   }
 
   void Shutdown()
@@ -895,10 +908,9 @@ namespace sst::native
     if (!Active())
       return;
 
-    IssueEvent(base, a.r3,
-               fmt::format("resolve variant sub_82311120 r3-r10 {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
-                           "{:08X} f1 {}",
-                           a.r3, a.r4, a.r5, a.r6, a.r7, a.r8, a.r9, a.r10, a.f1));
+    IssueEvent(base, a.r3, fmt::format("resolve variant sub_82311120 r3-r10 {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                                       "{:08X} f1 {}",
+                                       a.r3, a.r4, a.r5, a.r6, a.r7, a.r8, a.r9, a.r10, a.f1));
   }
 
   void OnSetPredication(const uint8_t *base, const HookArgs &a)

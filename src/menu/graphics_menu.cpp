@@ -2,6 +2,7 @@
 
 #include "menu/graphics_menu.h"
 #include "menu/pause_patch.h"
+#include "menu/restart.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -80,6 +81,7 @@ namespace sst::menu
       kPauseBegin = pause::kNativeBegin,
       kPauseLabel = pause::kNativeLabel,
       kPauseValue = pause::kNativeValue,
+      kRestart = 9, // the restart dialog was confirmed
     };
 
     static_assert(pause::kNativeResult == kResult);
@@ -192,6 +194,8 @@ namespace sst::menu
       }
     }
 
+    bool g_boot_four_three = false; // ASPECT RATIO 4:3 at startup (see NativeFourThree)
+
     std::string ValueText(const Settings &s, int row)
     {
       const int v = s.v[row];
@@ -215,8 +219,8 @@ namespace sst::menu
       case kResolution:
         return std::to_string(kResolutions[v]) + "P";
 
-      case kAspect:
-        return kAspects[v];
+      case kAspect: // 4:3 is the game's own mode: switching to or from it needs a restart
+        return (v == 0) != g_boot_four_three ? std::string(kAspects[v]) + " (RESTART)" : std::string(kAspects[v]);
 
       case kRenderScale:
         return std::to_string(50 + 5 * v) + "%";
@@ -385,9 +389,14 @@ namespace sst::menu
     Settings g_current, g_snapshot;
     bool g_loaded_from_file = false;
     std::function<void(bool)> g_set_fullscreen;
+    std::function<void()> g_request_quit;
     struct ListState
     {
       int visible = kVisible; // rows on screen
+      bool pause = false;     // in-match page: no ASPECT RATIO (cameras are set up per match)
+      bool dialog = false;    // this event: show the restart dialog (4:3 switched)
+      int Count() const { return pause ? kRows - 1 : kRows; }
+      int Row(int i) const { return pause && i >= kAspect ? i + 1 : i; } // list index -> Row
       int cursor = 0, top = 0;
       int old_visible = 0, new_visible = 0;
       bool redraw = false, leave = false;
@@ -553,6 +562,37 @@ namespace sst::menu
       }
     }
 
+    // Switching to or from 4:3 (the game's own mode) needs a restart
+    bool RestartNeeded()
+    {
+      return (g_current.v[kAspect] == 0) != g_boot_four_three;
+    }
+
+    // Restart dialog: the game's message box with a one-button (OK) message whose texts are swapped while it is up (see sub_82594AD0 below)
+    std::atomic<bool> g_restart_dialog{false};
+    constexpr uint32_t kDialogBody = 0x84D43E5B;  // "Unable to find any Superstars Channels"
+    constexpr uint32_t kDialogTitle = 0xEDDAB5CE; // "NO CHANNELS FOUND"
+    constexpr const char *kDialogBodyText = "The game will now restart to apply the new aspect ratio.";
+    constexpr const char *kDialogTitleText = "RESTART REQUIRED";
+
+    // The dialog was confirmed: start the new copy, then close this one (forced after a few seconds if the normal shutdown stalls)
+    void Restart()
+    {
+      REXLOG_INFO("[sst-menu] restarting for the aspect ratio change");
+
+      if (RestartGame())
+      {
+        if (g_request_quit)
+          g_request_quit();
+
+        ExitSoon(3000);
+      }
+      else
+      {
+        REXLOG_ERROR("[sst-menu] restart failed: the aspect ratio applies at the next start");
+      }
+    }
+
     void HandleEvent(int event)
     {
       ListState &l = g_list;
@@ -560,6 +600,7 @@ namespace sst::menu
       l.redraw = false;
       l.leave = false;
       l.sound = kNoSound;
+      l.dialog = false;
 
       switch (event)
       {
@@ -567,7 +608,7 @@ namespace sst::menu
       case kRight:
       {
         const Settings before = g_current;
-        Change(g_current, l.cursor, event == kRight ? 1 : -1);
+        Change(g_current, l.Row(l.cursor), event == kRight ? 1 : -1);
 
         if (g_current.v != before.v)
         {
@@ -582,7 +623,7 @@ namespace sst::menu
       case kUp:
       case kDown:
       {
-        const int n = kRows;
+        const int n = l.Count();
         l.cursor = (l.cursor + (event == kDown ? 1 : n - 1)) % n;
         const int top = std::clamp(l.top, std::max(0, l.cursor - l.visible + 1), std::min(l.cursor, n - l.visible));
 
@@ -599,8 +640,16 @@ namespace sst::menu
       case kSelect:
         Save(g_current);
         REXLOG_INFO("[sst-menu] VIDEO saved: {}", Describe(g_current));
-        l.leave = true;
         l.sound = kSelectSound;
+
+        if (!l.pause && RestartNeeded())
+        {
+          l.dialog = true;
+          g_restart_dialog = true;
+          break;
+        }
+
+        l.leave = true;
         break;
 
       case kBack:
@@ -665,6 +714,7 @@ namespace sst::menu
         g_snapshot = g_current;
         g_list = {};
         g_list.visible = (id & 0xFF) == kPauseBegin ? kPauseVisible : kVisible;
+        g_list.pause = (id & 0xFF) == kPauseBegin;
         REXLOG_INFO("[sst-menu] VIDEO page opened{}: {}", (id & 0xFF) == kPauseBegin ? " (pause menu)" : "", Describe(g_current));
         SetResult(base, out, 0, 2);
         break;
@@ -698,7 +748,7 @@ namespace sst::menu
       case kPauseLabel:
       case kPauseValue:
       {
-        const int row = g_list.top + std::clamp(ArgInt(base, values, types, count, 0), 0, kPauseVisible - 1);
+        const int row = g_list.Row(g_list.top + std::clamp(ArgInt(base, values, types, count, 0), 0, kPauseVisible - 1));
         const std::string text = (id & 0xFF) == kPauseLabel ? PauseLabel(row) : PauseValue(g_current, row);
         SetResult(base, out, TextId(base, text), 3);
         break;
@@ -716,16 +766,23 @@ namespace sst::menu
         const int v = k == 0 ? l.old_visible : k == 1 ? l.new_visible
                                            : k == 2   ? int(l.redraw)
                                            : k == 3   ? int(l.leave)
-                                                      : l.sound;
+                                           : k == 4   ? l.sound
+                                                      : int(l.dialog);
         SetResult(base, out, uint32_t(v), 2);
         break;
       }
+
+      case kRestart:
+        g_restart_dialog = false;
+        Restart();
+        SetResult(base, out, 0, 2);
+        break;
 
       case kLabel:
       case kValue:
       {
         const int row = g_list.top + std::clamp(ArgInt(base, values, types, count, 0), 0, 3);
-        const std::string text = (id & 0xFF) == kLabel ? std::string(kList[row].label) : ValueText(g_current, row);
+        std::string text = (id & 0xFF) == kLabel ? std::string(kList[row].label) : ValueText(g_current, row);
         SetResult(base, out, TextId(base, text), 3);
         break;
       }
@@ -780,10 +837,13 @@ namespace sst::menu
 
     void ApplyAspect(uint8_t *)
     {
-      const float want = kAspectValues[std::clamp(g_current.v[kAspect], 0, 4)];
+      // 4:3 runs as the game's own 4:3 mode (cameras already 4:3); a 4:3 picked since startup waits for the restart: meanwhile 16:9
+      const int v = std::clamp(g_current.v[kAspect], 0, 4);
+      const float want = g_boot_four_three || v == 0 ? 16.0f / 9.0f : kAspectValues[v];
 
       if (g_camera_aspect.exchange(want) != want)
-        REXLOG_INFO("[sst-menu] camera aspect {:.4f} ({})", want, kAspects[g_current.v[kAspect]]);
+        REXLOG_INFO("[sst-menu] camera aspect {:.4f} ({}{})", want, kAspects[v], g_boot_four_three ? ", game's 4:3 mode" : v == 0 ? ", after a restart"
+                                                                                                                                  : "");
     }
 
     // f2 of a perspective builder: 16:9 becomes the chosen aspect (other values, e.g. split views, are left alone)
@@ -798,7 +858,13 @@ namespace sst::menu
     // in-match pause menu (pause_patch.h)
     std::mutex g_pause_mutex;
     std::unordered_map<uint32_t, uint32_t> g_pause_modules; // game's module -> patched copy
-    std::unordered_map<uint32_t, uint32_t> g_pause_rooms;   // PauseMenu file buffer -> its size
+    // PauseMenu file buffer -> {its size, where the loader keeps the file's size}
+    struct PauseBuffer
+    {
+      uint32_t room, size_at;
+    };
+
+    std::unordered_map<uint32_t, PauseBuffer> g_pause_rooms;
     // A PauseMenu.DAT / .REL patch failed: the scene has no VIDEO row, so the script must not use it either
     bool g_pause_scene_failed = false;
 
@@ -897,15 +963,30 @@ namespace sst::menu
     }
   }
 
-  void Initialize(std::function<void(bool)> set_fullscreen)
+  void Initialize(std::function<void(bool)> set_fullscreen, std::function<void()> request_quit)
   {
     std::lock_guard lock(g_mutex);
     g_set_fullscreen = std::move(set_fullscreen);
+    g_request_quit = std::move(request_quit);
     Settings s = FromFlags();
     g_loaded_from_file = Load(s);
     g_current = s;
     Apply(g_current);
     REXLOG_INFO("[sst-menu] video settings{}: {}", g_loaded_from_file ? " (sst_settings.ini)" : "", Describe(g_current));
+    // ASPECT RATIO 4:3: a 4:3 video mode (1280x1024, the game's HD 4:3 mode) makes the game pick its 4:3 layouts and cameras at boot
+    g_boot_four_three = g_current.v[kAspect] == 0;
+
+    if (g_boot_four_three)
+    {
+      rex::cvar::SetFlagByName("video_mode_width", "1280");
+      rex::cvar::SetFlagByName("video_mode_height", "1024");
+      REXLOG_INFO("[sst-menu] aspect ratio 4:3: the game's own 4:3 mode (video mode 1280x1024)");
+    }
+  }
+
+  bool NativeFourThree()
+  {
+    return g_boot_four_three;
   }
 
   void OnGpuDetected(uint64_t video_memory_mb, const std::string &name)
@@ -981,6 +1062,18 @@ extern "C" REX_FUNC(sub_821DFBC0)
 // SumoTool: text tables r3, text id r4 -> string (0 if not found)
 extern "C" REX_FUNC(sub_82594AD0)
 {
+  if (g_restart_dialog && (ctx.r4.u32 == kDialogBody || ctx.r4.u32 == kDialogTitle))
+  {
+    SetupGuest(base);
+    std::lock_guard lock(g_mutex);
+
+    if (const uint32_t id = TextId(base, ctx.r4.u32 == kDialogBody ? kDialogBodyText : kDialogTitleText))
+    {
+      ctx.r3.u32 = g_guest.texts[id];
+      return;
+    }
+  }
+
   if ((ctx.r4.u32 & 0xFFFF0000u) == kTextIdBase)
   {
     SetupGuest(base);
@@ -1022,7 +1115,7 @@ void ReadPauseFile(PPCContext &ctx, uint8_t *base, int kind, bool async)
   if (buffer)
   {
     std::lock_guard lock(g_pause_mutex);
-    g_pause_rooms[buffer] = room;
+    g_pause_rooms[buffer] = {room, out_size};
   }
 
   ctx.r3.u32 = 0x82DB97A0; // the game's file system
@@ -1066,15 +1159,15 @@ extern "C" REX_FUNC(sub_82595158)
 {
   const uint32_t dat = uint32_t(ctx.r4.u64 >> 32), dat_size = uint32_t(ctx.r4.u64);
   const uint32_t rel = uint32_t(ctx.r5.u64 >> 32), rel_size = uint32_t(ctx.r5.u64);
-  uint32_t dat_room = 0, rel_room = 0;
+  uint32_t dat_room = 0, rel_room = 0, dat_size_at = 0, rel_size_at = 0;
   {
     std::lock_guard lock(g_pause_mutex);
 
     if (auto it = g_pause_rooms.find(dat); it != g_pause_rooms.end())
-      dat_room = it->second;
+      dat_room = it->second.room, dat_size_at = it->second.size_at;
 
     if (auto it = g_pause_rooms.find(rel); it != g_pause_rooms.end())
-      rel_room = it->second;
+      rel_room = it->second.room, rel_size_at = it->second.size_at;
 
     if (dat_room)
       g_pause_rooms.erase(dat);
@@ -1103,6 +1196,13 @@ extern "C" REX_FUNC(sub_82595158)
       std::memcpy(GuestPtr(base, rel), new_rel->data(), new_rel->size());
       ctx.r4.u64 = (uint64_t(dat) << 32) | uint32_t(new_dat->size());
       ctx.r5.u64 = (uint64_t(rel) << 32) | uint32_t(new_rel->size());
+      // The loader's own record of the sizes (used again when the scene is released) must match the patched files
+      if (Load32(base, dat_size_at) == dat_size)
+        Store32(base, dat_size_at, uint32_t(new_dat->size()));
+
+      if (Load32(base, rel_size_at) == rel_size)
+        Store32(base, rel_size_at, uint32_t(new_rel->size()));
+
       g_pause_scene_failed = false;
       REXLOG_INFO("[sst-menu] PauseMenu scene patched: VIDEO row (DAT {} -> {}, REL {} -> {} bytes)", dat_size, new_dat->size(), rel_size, new_rel->size());
     }

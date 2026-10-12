@@ -6,6 +6,7 @@
 
 #include "gpu/native/native.h"
 #include "menu/graphics_menu.h"
+#include "menu/restart.h"
 
 #include <rex/filesystem.h>
 #include <rex/rex_app.h>
@@ -19,6 +20,8 @@ public:
   static std::unique_ptr<rex::ui::WindowedApp> Create(
       rex::ui::WindowedAppContext &ctx)
   {
+    // Started by the VIDEO page's restart: let the previous run exit first.
+    sst::menu::WaitForRestartParent();
     return std::unique_ptr<SstRematchApp>(new SstRematchApp(ctx, "sst_rematch",
                                                             PPCImageConfig));
   }
@@ -48,7 +51,8 @@ public:
     sst::menu::Initialize([this](bool fullscreen)
                           { app_context().CallInUIThread([this, fullscreen]
                                                          {
-        if (auto* w = window(); w && w->IsFullscreen() != fullscreen) w->SetFullscreen(fullscreen); }); });
+        if (auto* w = window(); w && w->IsFullscreen() != fullscreen) w->SetFullscreen(fullscreen); }); }, [this]
+                          { app_context().RequestDeferredQuit(); });
     sst::native::Initialize(runtime());
   }
   void OnShutdown() override { sst::native::Shutdown(); }
