@@ -196,7 +196,6 @@ namespace sst::native
     void DisplayAspectThunk(void *, uint32_t *x, uint32_t *y)
     {
       static constexpr uint32_t kAspectXY[5][2] = {{4, 3}, {16, 9}, {16, 10}, {21, 9}, {32, 9}};
-      const auto &a = kAspectXY[std::clamp(REXCVAR_GET(sst_aspect), 0, 4)];
       // 4:3 is the game's own mode, from startup; picked later it waits for a restart
       int aspect = std::clamp(REXCVAR_GET(sst_aspect), 0, 4);
 

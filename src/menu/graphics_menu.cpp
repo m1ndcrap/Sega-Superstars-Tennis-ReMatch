@@ -1,6 +1,7 @@
 // sst_rematch - in-game VIDEO page
 
 #include "menu/graphics_menu.h"
+#include "menu/hud_anchor.h"
 #include "menu/pause_patch.h"
 #include "menu/restart.h"
 
@@ -28,47 +29,31 @@
 #include <unordered_map>
 #include <vector>
 
-REXCVAR_DEFINE_BOOL(sst_graphics_menu, true, "SST",
-                    "Replace Options > Settings > VIDEO with the port's VIDEO page");
-
-REXCVAR_DEFINE_INT32(sst_resolution, 720, "SST",
-                     "Internal resolution in lines: 480, 720, 1080, 1440, 2160 (VIDEO page)");
-
-REXCVAR_DEFINE_INT32(sst_render_scale, 100, "SST",
-                     "3D render scale in percent of the internal resolution, 50-100 (the "
-                     "UI stays at the internal resolution; VIDEO page)");
-
-REXCVAR_DEFINE_INT32(sst_shadow_size, 1024, "SST",
-                     "Shadow map size: 0 (shadows off), 128-2048 (the game's is 1024; 3D textures stop at 2048 in D3D12; VIDEO page)");
-
+REXCVAR_DEFINE_BOOL(sst_graphics_menu, true, "SST", "Replace Options > Settings > VIDEO with the port's VIDEO page");
+REXCVAR_DEFINE_INT32(sst_resolution, 720, "SST", "Internal resolution in lines: 480, 720, 1080, 1440, 2160 (VIDEO page)");
+REXCVAR_DEFINE_INT32(sst_render_scale, 100, "SST", "3D render scale in percent of the internal resolution, 50-100 (the "
+                                                   "UI stays at the internal resolution; VIDEO page)");
+REXCVAR_DEFINE_INT32(sst_shadow_size, 1024, "SST", "Shadow map size: 0 (shadows off), 128-2048 (the game's is 1024; 3D textures stop at 2048 in D3D12; VIDEO page)");
 REXCVAR_DEFINE_INT32(sst_aa_type, 0, "SST", "Anti-aliasing: 0 off, 1 FXAA, 2 MSAA (VIDEO page)");
-
 REXCVAR_DEFINE_INT32(sst_aa_level, 4, "SST", "MSAA samples: 2, 4, 8 (VIDEO page)");
-
-REXCVAR_DEFINE_INT32(sst_aspect, 1, "SST",
-                     "Aspect ratio: 0 4:3, 1 16:9, 2 16:10, 3 21:9, 4 32:9 (VIDEO page)");
-
+REXCVAR_DEFINE_INT32(sst_aspect, 1, "SST", "Aspect ratio: 0 4:3, 1 16:9, 2 16:10, 3 21:9, 4 32:9 (VIDEO page)");
 REXCVAR_DEFINE_INT32(sst_fps_limit, 60, "SST", "Frame rate limit: 30 or 60 (VIDEO page)");
-
 REXCVAR_DEFINE_BOOL(sst_vsync, true, "SST", "VSync (VIDEO page)");
-
-REXCVAR_DEFINE_INT32(sst_brightness, 50, "SST",
-                     "Brightness 0-100, 50 = the game's default (VIDEO page)");
-
+REXCVAR_DEFINE_INT32(sst_brightness, 50, "SST", "Brightness 0-100, 50 = the game's default (VIDEO page)");
 REXCVAR_DEFINE_BOOL(sst_fullscreen, false, "SST", "Borderless fullscreen (VIDEO page)");
-
 REXCVAR_DEFINE_BOOL(sst_bloom, true, "SST", "Bloom / glow (VIDEO page)");
-
 REXCVAR_DEFINE_BOOL(sst_fps_counter, false, "SST", "FPS counter in the top-left corner (VIDEO page)");
 
 namespace sst::menu
 {
   namespace
   {
+
 #include "menu/graphics_script.inc"
 
     constexpr uint32_t kVideoScript = 0x4B585196; // lookup2("video")
     constexpr uint32_t kNativeGroup = 0x53;
+
     enum Native : uint32_t
     {
       kBegin = 0,
@@ -85,6 +70,7 @@ namespace sst::menu
     };
 
     static_assert(pause::kNativeResult == kResult);
+
     enum Event : int
     {
       kLeft = 0,
@@ -145,6 +131,7 @@ namespace sst::menu
         {"vsync", "VSYNC", 2, false},
         {"brightness", "BRIGHTNESS", 21, true},
     }};
+
     constexpr int kVisible = 4;                 // Settings > VIDEO (GENERAL's four rows)
     constexpr int kPauseVisible = pause::kRows; // in-match pause menu
     constexpr int kPresetCustom = 3;
@@ -206,35 +193,26 @@ namespace sst::menu
         return v == 0 ? "LOW" : v == 1 ? "MEDIUM"
                             : v == 2   ? "HIGH"
                                        : "CUSTOM";
-
       case kFullscreen:
       case kBloom:
       case kFpsCounter:
       case kVSync:
         return v ? "ON" : "OFF";
-
       case kShadows:
         return v == 0 ? "OFF" : std::to_string(kShadowSizes[v]);
-
       case kResolution:
         return std::to_string(kResolutions[v]) + "P";
-
       case kAspect: // 4:3 is the game's own mode: switching to or from it needs a restart
         return (v == 0) != g_boot_four_three ? std::string(kAspects[v]) + " (RESTART)" : std::string(kAspects[v]);
-
       case kRenderScale:
         return std::to_string(50 + 5 * v) + "%";
-
       case kAaType:
         return v == 0 ? "OFF" : v == 1 ? "FXAA"
                                        : "MSAA";
-
       case kAaLevel:
         return s.v[kAaType] == 2 ? std::to_string(kAaLevels[v]) + "X" : "N/A";
-
       case kFpsLimit:
         return v ? "60" : "30";
-
       case kBrightness:
         return std::to_string(5 * v);
       }
@@ -274,6 +252,7 @@ namespace sst::menu
 
         if (c == ':')
           c = 'X'; // 16:9 -> 16X9
+
         const bool ok = (c >= 'A' && c <= 'Y' && c != 'J' && c != 'Q') || (c >= '1' && c <= '4') || (digits && c >= '0' && c <= '9') || c == ' ' || c == '(' || c == ')' || c == '.' || c == '?';
 
         if (ok)
@@ -287,6 +266,7 @@ namespace sst::menu
     {
       if (row == kPreset)
         return "PRESET"; // no Q in the font
+
       return PauseText(kList[row].label, false);
     }
 
@@ -319,6 +299,7 @@ namespace sst::menu
 
     constexpr uint32_t kPoolSize = 0x10000;
     constexpr uint32_t kTextIdBase = 0x53540000;
+
     struct Guest
     {
       uint32_t script = 0; // our "video" module
@@ -334,35 +315,34 @@ namespace sst::menu
 
     void SetupGuest(uint8_t *base)
     {
-      std::call_once(g_guest_once,
-                     [base]
+      std::call_once(g_guest_once, [base]
                      {
-                       const uint32_t script_size = (uint32_t(sizeof(kGraphicsScript)) + 31) & ~31u;
-                       auto *memory = rex::system::kernel_memory();
-                       const uint32_t block = memory ? memory->SystemHeapAlloc(script_size + kPoolSize) : 0;
+        const uint32_t script_size = (uint32_t(sizeof(kGraphicsScript)) + 31) & ~31u;
+        auto *memory = rex::system::kernel_memory();
+        const uint32_t block = memory ? memory->SystemHeapAlloc(script_size + kPoolSize) : 0;
 
-                       if (!block)
-                       {
-                         REXLOG_ERROR("[sst-menu] could not allocate guest memory for the VIDEO page");
-                         return;
-                       }
+        if (!block)
+        {
+          REXLOG_ERROR("[sst-menu] could not allocate guest memory for the VIDEO page");
+          return;
+        }
 
-                       std::memcpy(GuestPtr(base, block), kGraphicsScript, sizeof(kGraphicsScript));
-                       g_guest.script = block;
-                       g_guest.pool = block + script_size;
-                       g_guest.ok = true;
-                       // Fixed ids the patched pause scene uses
-                       for (auto [id, text] : {std::pair<uint32_t, const char *>{pause::kTextBlank, " "}, {pause::kTextVideo, "VIDEO"}})
-                       {
-                         const uint32_t n = uint32_t(std::strlen(text)) + 1;
-                         const uint32_t at = g_guest.pool + g_guest.pool_used;
-                         std::memcpy(GuestPtr(base, at), text, n);
-                         g_guest.pool_used += n;
-                         g_guest.texts.emplace(id, at);
-                       }
+        std::memcpy(GuestPtr(base, block), kGraphicsScript, sizeof(kGraphicsScript));
+        g_guest.script = block;
+        g_guest.pool = block + script_size;
+        g_guest.ok = true;
 
-                       REXLOG_INFO("[sst-menu] VIDEO page script ({} bytes) at {:08X}", sizeof(kGraphicsScript), block);
-                     });
+        // Fixed ids the patched pause scene uses
+        for (auto [id, text] : {std::pair<uint32_t, const char *>{pause::kTextBlank, " "}, {pause::kTextVideo, "VIDEO"}})
+        {
+          const uint32_t n = uint32_t(std::strlen(text)) + 1;
+          const uint32_t at = g_guest.pool + g_guest.pool_used;
+          std::memcpy(GuestPtr(base, at), text, n);
+          g_guest.pool_used += n;
+          g_guest.texts.emplace(id, at);
+        }
+
+        REXLOG_INFO("[sst-menu] VIDEO page script ({} bytes) at {:08X}", sizeof(kGraphicsScript), block); });
     }
 
     // Text id for a string (made once, kept in guest memory). Under g_mutex
@@ -390,13 +370,23 @@ namespace sst::menu
     bool g_loaded_from_file = false;
     std::function<void(bool)> g_set_fullscreen;
     std::function<void()> g_request_quit;
+
     struct ListState
     {
       int visible = kVisible; // rows on screen
       bool pause = false;     // in-match page: no ASPECT RATIO (cameras are set up per match)
       bool dialog = false;    // this event: show the restart dialog (4:3 switched)
-      int Count() const { return pause ? kRows - 1 : kRows; }
-      int Row(int i) const { return pause && i >= kAspect ? i + 1 : i; } // list index -> Row
+
+      int Count() const
+      {
+        return pause ? kRows - 1 : kRows;
+      }
+
+      int Row(int i) const
+      {
+        return pause && i >= kAspect ? i + 1 : i; // list index -> Row
+      }
+
       int cursor = 0, top = 0;
       int old_visible = 0, new_visible = 0;
       bool redraw = false, leave = false;
@@ -436,6 +426,7 @@ namespace sst::menu
     Settings FromFlags()
     {
       Settings s;
+
       auto index_of = [](const int *values, int n, int value)
       {
         int best = 0;
@@ -531,10 +522,12 @@ namespace sst::menu
 
       if (row == kAaLevel && s.v[kAaType] != 2)
         return; // only MSAA has levels
+
       int count = info.count;
 
       if (row == kPreset)
         count = 3; // CUSTOM is shown, not picked
+
       int v = s.v[row];
 
       if (row == kPreset && v == kPresetCustom)
@@ -617,9 +610,9 @@ namespace sst::menu
           l.sound = kMove;
           REXLOG_INFO("[sst-menu] {}", Describe(g_current));
         }
+
         break;
       }
-
       case kUp:
       case kDown:
       {
@@ -636,7 +629,6 @@ namespace sst::menu
         l.sound = kMove;
         break;
       }
-
       case kSelect:
         Save(g_current);
         REXLOG_INFO("[sst-menu] VIDEO saved: {}", Describe(g_current));
@@ -651,7 +643,6 @@ namespace sst::menu
 
         l.leave = true;
         break;
-
       case kBack:
         if (g_current.v != g_snapshot.v)
         {
@@ -683,8 +674,8 @@ namespace sst::menu
 
       const uint32_t raw = Load32(base, values + 4 * i);
 
-      if (*GuestPtr(base, types + i) == 1)
-      { // float
+      if (*GuestPtr(base, types + i) == 1) // float
+      {
         float f;
         std::memcpy(&f, &raw, 4);
         return int(f);
@@ -701,10 +692,15 @@ namespace sst::menu
       const uint32_t values = ctx.r8.u32, types = ctx.r9.u32, count = ctx.r10.u32;
       std::lock_guard lock(g_mutex);
       SetupGuest(base);
+
       struct AspectOnExit
       {
         uint8_t *base;
-        ~AspectOnExit() { ApplyAspect(base); }
+
+        ~AspectOnExit()
+        {
+          ApplyAspect(base);
+        }
       } aspect_on_exit{base};
 
       switch (id & 0xFF)
@@ -718,7 +714,6 @@ namespace sst::menu
         REXLOG_INFO("[sst-menu] VIDEO page opened{}: {}", (id & 0xFF) == kPauseBegin ? " (pause menu)" : "", Describe(g_current));
         SetResult(base, out, 0, 2);
         break;
-
       case kPauseEvent:
       {
         // The pause menu's input events (3:18): up, down, left, right, select, back
@@ -744,7 +739,6 @@ namespace sst::menu
         SetResult(base, out, 0, 2);
         break;
       }
-
       case kPauseLabel:
       case kPauseValue:
       {
@@ -753,12 +747,10 @@ namespace sst::menu
         SetResult(base, out, TextId(base, text), 3);
         break;
       }
-
       case kEvent:
         HandleEvent(ArgInt(base, values, types, count, 0));
         SetResult(base, out, 0, 2);
         break;
-
       case kResult:
       {
         const int k = ArgInt(base, values, types, count, 0);
@@ -771,13 +763,11 @@ namespace sst::menu
         SetResult(base, out, uint32_t(v), 2);
         break;
       }
-
       case kRestart:
         g_restart_dialog = false;
         Restart();
         SetResult(base, out, 0, 2);
         break;
-
       case kLabel:
       case kValue:
       {
@@ -786,7 +776,6 @@ namespace sst::menu
         SetResult(base, out, TextId(base, text), 3);
         break;
       }
-
       default:
         REXLOG_WARN("[sst-menu] unknown native {:04X}", id);
         SetResult(base, out, 0, 0);
@@ -835,7 +824,10 @@ namespace sst::menu
     constexpr float kAspectValues[5] = {4.0f / 3.0f, 16.0f / 9.0f, 1.6f, 21.0f / 9.0f, 32.0f / 9.0f};
     std::atomic<float> g_camera_aspect{16.0f / 9.0f};
 
-    void ApplyAspect(uint8_t *)
+    // The cameras also keep the aspect they were set up with (from the 16/9 constant at 0x82108440) and use it for more than the projection - e.g. the area the shadow maps cover. So the constant is changed too (in the xex's read-only data: its page is opened briefly)
+    constexpr uint32_t kCameraAspectConstant = 0x82108440;
+
+    void ApplyAspect(uint8_t *base)
     {
       // 4:3 runs as the game's own 4:3 mode (cameras already 4:3); a 4:3 picked since startup waits for the restart: meanwhile 16:9
       const int v = std::clamp(g_current.v[kAspect], 0, 4);
@@ -844,6 +836,34 @@ namespace sst::menu
       if (g_camera_aspect.exchange(want) != want)
         REXLOG_INFO("[sst-menu] camera aspect {:.4f} ({}{})", want, kAspects[v], g_boot_four_three ? ", game's 4:3 mode" : v == 0 ? ", after a restart"
                                                                                                                                   : "");
+
+      if (!base)
+        return;
+
+      uint32_t bits;
+      std::memcpy(&bits, &want, 4);
+
+      if (Load32(base, kCameraAspectConstant) == bits)
+        return;
+
+      auto *memory = rex::system::kernel_memory();
+      auto *heap = memory ? memory->LookupHeap(kCameraAspectConstant) : nullptr;
+      const uint32_t page = kCameraAspectConstant & ~0xFFFu;
+      uint32_t old_protect = 0;
+
+      if (!heap || !heap->Protect(page, 0x1000, rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite, &old_protect))
+      {
+        static bool warned = false;
+
+        if (!warned)
+          REXLOG_WARN("[sst-menu] camera aspect constant: could not unprotect {:08X}", page);
+
+        warned = true;
+        return;
+      }
+
+      Store32(base, kCameraAspectConstant, bits);
+      heap->Protect(page, 0x1000, old_protect);
     }
 
     // f2 of a perspective builder: 16:9 becomes the chosen aspect (other values, e.g. split views, are left alone)
@@ -858,6 +878,7 @@ namespace sst::menu
     // in-match pause menu (pause_patch.h)
     std::mutex g_pause_mutex;
     std::unordered_map<uint32_t, uint32_t> g_pause_modules; // game's module -> patched copy
+
     // PauseMenu file buffer -> {its size, where the loader keeps the file's size}
     struct PauseBuffer
     {
@@ -935,6 +956,27 @@ namespace sst::menu
         Store32(base, node + 0x18, patched);
     }
 
+    // In-match HUD scene buffers (DAT) -> file name, for the ultrawide anchoring
+    std::unordered_map<uint32_t, std::string> g_hud_buffers;
+
+    std::string GuestFileName(uint8_t *base, uint32_t path)
+    {
+      std::string s;
+
+      for (uint32_t i = 0; i < 260; ++i)
+      {
+        const char c = char(*GuestPtr(base, path + i));
+
+        if (!c)
+          break;
+
+        s += char(std::tolower(uint8_t(c)));
+      }
+
+      const size_t slash = s.find_last_of("\\/:");
+      return slash == std::string::npos ? s : s.substr(slash + 1);
+    }
+
     // Which pause scene file a path names: 1 PauseMenu.DAT, 2 PauseMenu.REL
     int PauseSceneFile(uint8_t *base, uint32_t path)
     {
@@ -961,6 +1003,7 @@ namespace sst::menu
 
       return kind;
     }
+
   }
 
   void Initialize(std::function<void(bool)> set_fullscreen, std::function<void()> request_quit)
@@ -975,6 +1018,7 @@ namespace sst::menu
     REXLOG_INFO("[sst-menu] video settings{}: {}", g_loaded_from_file ? " (sst_settings.ini)" : "", Describe(g_current));
     // ASPECT RATIO 4:3: a 4:3 video mode (1280x1024, the game's HD 4:3 mode) makes the game pick its 4:3 layouts and cameras at boot
     g_boot_four_three = g_current.v[kAspect] == 0;
+    ApplyAspect(nullptr); // scenes loaded at boot already see the aspect
 
     if (g_boot_four_three)
     {
@@ -995,6 +1039,7 @@ namespace sst::menu
 
     if (g_loaded_from_file)
       return;
+
     // First boot (no sst_settings.ini): pick a preset from the GPU's memory
     const int preset = video_memory_mb < 3000 ? 0 : video_memory_mb < 7000 ? 1
                                                                            : 2;
@@ -1134,12 +1179,27 @@ void ReadPauseFile(PPCContext &ctx, uint8_t *base, int kind, bool async)
   }
 }
 
+// Other scene files: HUD scenes are remembered by buffer (anchored later)
+template <void (*Original)(PPCContext &__restrict, uint8_t *)>
+void ReadOtherFile(PPCContext &ctx, uint8_t *base)
+{
+  const uint32_t path = ctx.r3.u32, out_buf = ctx.r4.u32;
+  const std::string name = GuestFileName(base, path);
+  Original(ctx, base);
+
+  if (name.ends_with(".dat")) // every scene: off-screen elements (all) / HUD sides
+  {
+    std::lock_guard lock(g_pause_mutex);
+    g_hud_buffers[Load32(base, out_buf)] = name;
+  }
+}
+
 extern "C" REX_FUNC(sub_82594618)
 {
   const int kind = REXCVAR_GET(sst_graphics_menu) ? PauseSceneFile(base, ctx.r3.u32) : 0;
 
   if (!kind)
-    return __imp__sub_82594618(ctx, base);
+    return ReadOtherFile<__imp__sub_82594618>(ctx, base);
 
   ReadPauseFile(ctx, base, kind, false);
 }
@@ -1149,7 +1209,7 @@ extern "C" REX_FUNC(sub_825946B0)
   const int kind = REXCVAR_GET(sst_graphics_menu) ? PauseSceneFile(base, ctx.r3.u32) : 0;
 
   if (!kind)
-    return __imp__sub_825946B0(ctx, base);
+    return ReadOtherFile<__imp__sub_825946B0>(ctx, base);
 
   ReadPauseFile(ctx, base, kind, true);
 }
@@ -1160,8 +1220,16 @@ extern "C" REX_FUNC(sub_82595158)
   const uint32_t dat = uint32_t(ctx.r4.u64 >> 32), dat_size = uint32_t(ctx.r4.u64);
   const uint32_t rel = uint32_t(ctx.r5.u64 >> 32), rel_size = uint32_t(ctx.r5.u64);
   uint32_t dat_room = 0, rel_room = 0, dat_size_at = 0, rel_size_at = 0;
+  std::string hud_name;
+
   {
     std::lock_guard lock(g_pause_mutex);
+
+    if (auto it = g_hud_buffers.find(dat); it != g_hud_buffers.end())
+    {
+      hud_name = it->second;
+      g_hud_buffers.erase(it);
+    }
 
     if (auto it = g_pause_rooms.find(dat); it != g_pause_rooms.end())
       dat_room = it->second.room, dat_size_at = it->second.size_at;
@@ -1174,6 +1242,27 @@ extern "C" REX_FUNC(sub_82595158)
 
     if (rel_room)
       g_pause_rooms.erase(rel);
+  }
+
+  // Ultrawide: in-match HUD elements to the screen edges
+  if (!hud_name.empty() && dat && dat_size && !NativeFourThree())
+  {
+    const float shift = hud::ShiftFor(g_camera_aspect.load());
+
+    if (shift > 0.0f)
+    {
+      std::vector<std::string> log;
+      const bool sides = hud::IsHudScene(hud_name);
+      const int moved = hud::Anchor(GuestPtr(base, dat), dat_size, shift, sides ? &log : nullptr, sides);
+
+      if (sides)
+      {
+        REXLOG_INFO("[sst-menu] {}: {} HUD elements to the screen edges (shift {:.3f})", hud_name, moved, shift);
+
+        for (const std::string &line : log)
+          REXLOG_INFO("[sst-menu]   {}", line);
+      }
+    }
   }
 
   if (dat_room && rel_room && dat_size <= dat_room && rel_size <= rel_room)
@@ -1196,6 +1285,7 @@ extern "C" REX_FUNC(sub_82595158)
       std::memcpy(GuestPtr(base, rel), new_rel->data(), new_rel->size());
       ctx.r4.u64 = (uint64_t(dat) << 32) | uint32_t(new_dat->size());
       ctx.r5.u64 = (uint64_t(rel) << 32) | uint32_t(new_rel->size());
+
       // The loader's own record of the sizes (used again when the scene is released) must match the patched files
       if (Load32(base, dat_size_at) == dat_size)
         Store32(base, dat_size_at, uint32_t(new_dat->size()));
@@ -1220,6 +1310,7 @@ extern "C" REX_FUNC(sub_82595158)
 extern "C" void __imp__sub_8231F950(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_822C2480(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_821227C0(PPCContext &__restrict, uint8_t *);
+
 extern "C" REX_FUNC(sub_8231F950)
 {
   FixCameraAspect(ctx);
