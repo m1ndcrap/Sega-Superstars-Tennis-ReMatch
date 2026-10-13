@@ -1,6 +1,7 @@
 // sst_rematch - in-game VIDEO page
 
 #include "menu/graphics_menu.h"
+#include "input/controls.h"
 #include "menu/hud_anchor.h"
 #include "menu/pause_patch.h"
 #include "menu/restart.h"
@@ -31,6 +32,7 @@
 #include <unordered_map>
 #include <vector>
 
+REXCVAR_DEFINE_BOOL(sst_controller_diagram, true, "SST", "Settings > CONTROLLER shows the DualShock 3 diagram while a PlayStation pad is in use");
 REXCVAR_DEFINE_BOOL(sst_wide_layouts, true, "SST",
                     "Ultrawide aspect ratios: menus, loading screens and backgrounds get "
                     "layouts that fill the extra width (generated from the 16:9 ones)");
@@ -1164,6 +1166,13 @@ extern "C" REX_FUNC(sub_821CCA28)
   __imp__sub_821CCA28(ctx, base);
 }
 
+// Settings > CONTROLLER (script "controller", scene abb4502d) holds two controller diagrams: the Xbox 360 pad (group 50034B87) and the DualShock 3 (3A12D8E8). The Xbox script shows the first and hides the second when the page opens (4:5 on 3A12D8E8), then animates the shown one (4:10, layout types A-D). With a PlayStation pad in use the two are swapped in every scene native the page calls: decided when the page opens, kept until it opens again
+namespace
+{
+  constexpr uint32_t kXboxPadGroup = 0x50034B87, kPs3PadGroup = 0x3A12D8E8;
+  bool g_controller_ps = false;
+}
+
 // Script VM: call native r5 (group << 8 | index)
 extern "C" REX_FUNC(sub_821DFBC0)
 {
@@ -1173,6 +1182,37 @@ extern "C" REX_FUNC(sub_821DFBC0)
   {
     HandleNative(ctx, base, id);
     return;
+  }
+
+  if ((id >> 8) == 4 && ctx.r10.u32 >= 1 && ctx.r10.u32 <= 8 && ctx.r8.u32)
+  {
+    const uint32_t values = ctx.r8.u32;
+    const uint32_t first = Load32(base, values);
+
+    if ((id & 0xFF) == 5 && first == kPs3PadGroup)
+    {
+      // The page opens: pick the diagram, show it (it may still be hidden from an earlier visit), hide the other
+      g_controller_ps = REXCVAR_GET(sst_controller_diagram) && sst::input::CurrentPromptStyle() == sst::input::PromptStyle::kPlayStation;
+      const uint32_t shown = g_controller_ps ? kPs3PadGroup : kXboxPadGroup, hidden = g_controller_ps ? kXboxPadGroup : kPs3PadGroup;
+      PPCContext saved = ctx;
+      Store32(base, values, shown);
+      ctx.r5.u64 = (ctx.r5.u64 & ~0xFFFFull) | 0x404; // 4:4 show
+      __imp__sub_821DFBC0(ctx, base);
+      ctx = saved;
+      Store32(base, values, hidden);
+      REXLOG_INFO("[sst-menu] controller page: {} diagram", g_controller_ps ? "DualShock 3" : "Xbox 360");
+      __imp__sub_821DFBC0(ctx, base);
+      return;
+    }
+
+    if (g_controller_ps)
+      for (uint32_t i = 0; i < ctx.r10.u32; ++i)
+      {
+        const uint32_t v = Load32(base, values + 4 * i);
+
+        if (v == kXboxPadGroup || v == kPs3PadGroup)
+          Store32(base, values + 4 * i, v == kXboxPadGroup ? kPs3PadGroup : kXboxPadGroup);
+      }
   }
 
   __imp__sub_821DFBC0(ctx, base);

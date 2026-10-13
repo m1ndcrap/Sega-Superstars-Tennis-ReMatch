@@ -24,7 +24,8 @@
 #include <utility>
 #include <vector>
 
-REXCVAR_DEFINE_STRING(sst_prompts, "auto", "SST", "Button prompts: auto (the device used last), xbox, playstation or keyboard");
+REXCVAR_DEFINE_STRING(sst_prompts, "auto", "SST",
+                      "Button prompts: auto (the device used last), xbox, playstation or keyboard");
 
 namespace sst::input
 {
@@ -39,7 +40,7 @@ namespace sst::input
     using rex::input::X_INPUT_STATE;
     using rex::input::X_INPUT_VIBRATION;
 
-    // SST's keyboard layout. Left hand: WASD moves, Q / E the bumpers (superstar mode, per the game's controller page), Space the left trigger. Right hand: the shot buttons on J K L O, I = right trigger (instruct partner in doubles), U = back (change view). Arrows = D-pad, Enter / Esc = start (pause), Backspace = B as well
+    // SST's keyboard layout. Left hand: WASD moves, Q / E the bumpers (instruct partner in doubles), Space the left trigger (superstar mode). Right hand: the shot buttons on J K L O, I = right trigger (superstar mode), U = back (change view). Arrows = D-pad, Enter / Esc = start (pause), Backspace = B as well
     constexpr std::pair<const char *, const char *> kDefaults[] = {
         {"mnk_mode", "true"},
         {"keybind_lstick_up", "W"},
@@ -160,10 +161,7 @@ namespace sst::input
                                        { return is_active(); });
       }
 
-      X_STATUS Setup() override
-      {
-        return inner_->Setup();
-      }
+      X_STATUS Setup() override { return inner_->Setup(); }
 
       void EnumerateDevices(std::vector<DeviceInfo> &out) override
       {
@@ -194,7 +192,6 @@ namespace sst::input
 
           kinds_[id] = kind;
         }
-
         // Pads that went away
         for (auto it = kinds_.begin(); it != kinds_.end();)
         {
@@ -225,12 +222,16 @@ namespace sst::input
       {
         const X_RESULT r = inner_->GetDeviceState(id, out_state);
 
-        if (r == X_ERROR_SUCCESS && out_state && !rex::input::IsNeutral(out_state->gamepad))
+        if (r == X_ERROR_SUCCESS && out_state)
         {
-          Kind kind = Kind::kNone;
+          // A device takes over the prompts when it starts being used (neutral -> pressed), not while it is held: two devices held at once (or a pad that rests off-centre) would otherwise trade the prompts every poll
+          const bool active = !rex::input::IsNeutral(out_state->gamepad);
+          std::lock_guard lock(g_mutex);
+          bool &was = active_[uint64_t(id)];
 
+          if (active && !was)
           {
-            std::lock_guard lock(g_mutex);
+            Kind kind = Kind::kNone;
 
             if (auto it = kinds_.find(uint64_t(id)); it != kinds_.end())
               kind = it->second;
@@ -238,34 +239,22 @@ namespace sst::input
             if (kind != Kind::kNone && g_last_used.exchange(uint32_t(kind)) != uint32_t(kind))
               Update();
           }
+
+          was = active;
         }
 
         return r;
       }
 
-      X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t flags, X_INPUT_CAPABILITIES *out_caps) override
-      {
-        return inner_->GetDeviceCapabilities(id, flags, out_caps);
-      }
-
-      X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION *vibration) override
-      {
-        return inner_->SetDeviceVibration(id, vibration);
-      }
-
-      X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags, X_INPUT_KEYSTROKE *out_keystroke) override
-      {
-        return inner_->GetDeviceKeystroke(id, flags, out_keystroke);
-      }
-
-      void OnWindowAvailable(rex::ui::Window *window) override
-      {
-        inner_->OnWindowAvailable(window);
-      }
+      X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t flags, X_INPUT_CAPABILITIES *out_caps) override { return inner_->GetDeviceCapabilities(id, flags, out_caps); }
+      X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION *vibration) override { return inner_->SetDeviceVibration(id, vibration); }
+      X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags, X_INPUT_KEYSTROKE *out_keystroke) override { return inner_->GetDeviceKeystroke(id, flags, out_keystroke); }
+      void OnWindowAvailable(rex::ui::Window *window) override { inner_->OnWindowAvailable(window); }
 
     private:
       std::unique_ptr<rex::input::InputDriver> inner_;
-      std::unordered_map<uint64_t, Kind> kinds_; // this driver's devices (guarded by g_mutex)
+      std::unordered_map<uint64_t, Kind> kinds_;  // this driver's devices (guarded by g_mutex)
+      std::unordered_map<uint64_t, bool> active_; // last state per device: pressed (guarded by g_mutex)
     };
 
     void Add(rex::input::InputSystem &system, std::unique_ptr<rex::input::InputDriver> driver)
@@ -281,8 +270,8 @@ namespace sst::input
       if (!rex::cvar::HasNonDefaultValue(name))
         rex::cvar::SetFlagByName(name, value);
 
-    REXLOG_INFO("[sst-input] keyboard {}: move W A S D, shots J K L O (X A B Y), superstar Q / E, "
-                "partner I / Space, back U, pause Enter / Esc, D-pad arrows",
+    REXLOG_INFO("[sst-input] keyboard {}: move W A S D, shots J K L O (X A B Y), superstar I / Space, "
+                "partner Q / E, back U, pause Enter / Esc, D-pad arrows",
                 rex::cvar::Query<bool>("mnk_mode") ? "on" : "off (--mnk_mode=false)");
   }
 
