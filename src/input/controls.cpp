@@ -108,7 +108,12 @@ namespace sst::input
     std::atomic<uint32_t> g_confirm_presses{0};
     std::atomic<uint32_t> g_y_presses{0};
     std::atomic<uint64_t> g_last_confirm_device{0}; // the device of the last Start / A press
-    std::atomic<int> g_primary_user{-1};            // the game's 1P: the player slot that pressed Start on the title screen (-1: not known yet, slot 0)
+    std::atomic<int> g_primary_user{-1};
+    std::atomic<bool> g_title{false};             // the title screen is up (the game picks its 1P from the Start press)
+    std::atomic<uint64_t> g_title_device{0};      // the device that pressed Start there: it plays on slot 0 (the slot with the signed-in profile)
+
+    int SlotOfDevice(uint64_t id);
+    void PromoteDevice(uint64_t id);            // the game's 1P: the player slot that pressed Start on the title screen (-1: not known yet, slot 0)
     std::atomic<uint32_t> g_style{uint32_t(PromptStyle::kKeyboard)};
 
     // Esc
@@ -312,6 +317,7 @@ namespace sst::input
         if (r == X_ERROR_SUCCESS && out_state)
         {
           Kind own = Kind::kNone;
+          bool promote = false;
           {
             std::lock_guard lock(g_mutex);
 
@@ -343,6 +349,7 @@ namespace sst::input
           // A device takes over the prompts when it starts being used (neutral -> pressed), not while it is held: two devices held at once (or a pad that rests off-centre) would otherwise trade the prompts every poll
           const bool active = !rex::input::IsNeutral(out_state->gamepad);
           const uint16_t buttons = uint16_t(out_state->gamepad.buttons);
+          {
           std::lock_guard lock(g_mutex);
           bool &was = active_[uint64_t(id)];
           // Start / A presses (new presses only), for skipping the intro
@@ -352,6 +359,13 @@ namespace sst::input
           {
             g_confirm_presses.fetch_add(1);
             g_last_confirm_device = uint64_t(id);
+
+            // Title screen: Start / A from a device on another slot than the first. The game would make that slot its 1P, and only slot 0 has the (local) profile - any other is a guest ("Gamer Profile Warning", no saving). The device moves to slot 0 first; this press is held back, and the game sees it on slot 0 at the next poll
+            if (g_title.load() && SlotOfDevice(uint64_t(id)) > 0)
+            {
+              promote = true;
+              out_state->gamepad.buttons = uint16_t(uint16_t(out_state->gamepad.buttons) & ~(rex::input::X_INPUT_GAMEPAD_START | rex::input::X_INPUT_GAMEPAD_A));
+            }
           }
 
           if (buttons & ~held & rex::input::X_INPUT_GAMEPAD_Y)
@@ -371,6 +385,10 @@ namespace sst::input
           }
 
           was = active;
+          }
+
+          if (promote)
+            PromoteDevice(uint64_t(id));
         }
 
         return r;
@@ -447,6 +465,24 @@ namespace sst::input
           g_keyboard_player = user;
         }
 
+        // The device that started the game from the title screen plays on slot 0 (the slot with the profile); whatever was there takes its slot
+        if (const uint64_t title = g_title_device.load())
+          for (uint32_t u = 1; u < rex::input::kMaxGuestUsers; ++u)
+            if (std::find(users_[u].begin(), users_[u].end(), DeviceId(title)) != users_[u].end())
+            {
+              std::swap(users_[0], users_[u]);
+
+              for (LightbarPad &p : pads)
+                p.slot = p.slot == u ? 0 : p.slot == 0 ? u : p.slot;
+
+              if (g_keyboard_player == u)
+                g_keyboard_player = 0;
+              else if (g_keyboard_player == 0)
+                g_keyboard_player = u;
+
+              break;
+            }
+
         std::string desc;
 
         for (uint32_t u = 0; u < rex::input::kMaxGuestUsers; ++u)
@@ -510,6 +546,20 @@ namespace sst::input
     };
 
     PlayerAssignment *g_assignment = nullptr;
+
+    int SlotOfDevice(uint64_t id)
+    {
+      return g_assignment ? g_assignment->UserOf(id) : -1;
+    }
+
+    void PromoteDevice(uint64_t id)
+    {
+      if (g_title_device.exchange(id) == id || !g_assignment)
+        return;
+
+      REXLOG_INFO("[sst-input] title screen: the device that pressed Start moves to player slot 1 (the profile's)");
+      g_assignment->Reassign();
+    }
 
     void Add(rex::input::InputSystem &system, std::unique_ptr<rex::input::InputDriver> driver)
     {
@@ -1057,6 +1107,11 @@ namespace sst::input
   void MainMenuFrame(bool category_list)
   {
     g_main_menu_beat = category_list ? NowMs() : 0;
+  }
+
+  void SetTitleScreen(bool up)
+  {
+    g_title = up;
   }
 
   void PauseMenuFrame()

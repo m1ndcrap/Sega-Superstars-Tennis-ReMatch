@@ -36,6 +36,7 @@ namespace sst::input
   void SetInMatch(bool in_match);       // from the front-end's script starts (HUD scripts: match; menu scripts: not)
   bool InMatch();
   void MainMenuFrame(bool category_list); // every main menu frame: on its category list or not
+  void SetTitleScreen(bool up);          // the title screen ("startscreen") is up: a Start press from a device on another slot moves it to slot 1 first (the game's 1P must be the profile's slot)
   void PauseMenuFrame();                 // every frame the in-match pause menu reads input (Esc: back instead of pause)
   void SetDialogUp(bool up);            // the port's YES / NO box (Esc = B = NO)
   uint32_t EscapePresses();              // Esc presses counted on the main menu's category list

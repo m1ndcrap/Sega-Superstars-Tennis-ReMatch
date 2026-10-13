@@ -1520,10 +1520,14 @@ extern "C" REX_FUNC(sub_821CCA28)
     static bool title = false;
 
     if (ctx.r4.u32 == 0x1187AE2B) // startscreen
+    {
       title = true;
+      sst::input::SetTitleScreen(true);
+    }
     else if (ctx.r4.u32 == quit::kScriptHash && title) // mainmenu
     {
       title = false;
+      sst::input::SetTitleScreen(false);
       sst::input::MarkGameStarted();
     }
   }
