@@ -22,6 +22,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -63,6 +64,12 @@ namespace sst::native
 
     // render thread
     constexpr uint32_t kDevSnapBegin = 0x480, kDevSnapEnd = 0x31A0;
+    constexpr uint32_t kDevSnapSize = kDevSnapEnd - kDevSnapBegin;
+    // The device block is captured as a delta: 256-byte chunks that changed since the previous call's capture (a draw typically changes a few constants and pointers, not all 11.5 KB). The render thread keeps the block up to date and overlays its own copy
+    constexpr uint32_t kDevChunk = 256;
+    constexpr uint32_t kDevChunks = (kDevSnapSize + kDevChunk - 1) / kDevChunk; // 46
+    static_assert(kDevChunks <= 64);
+    constexpr uint32_t ChunkSize(uint32_t i) { return std::min(kDevChunk, kDevSnapSize - i * kDevChunk); }
     constexpr size_t kBatchCommands = 128;
 
     // Bump allocator for one frame's snapshots (chunks are kept between frames)
@@ -138,6 +145,10 @@ namespace sst::native
       float z = 0;
       const uint8_t *data = nullptr; // event text / shader container (arena)
       uint32_t size = 0, object = 0;
+      // Device block delta (threaded): chunks set in dev_mask, packed in dev_delta (arena)
+      uint32_t dev_addr = 0;
+      uint64_t dev_mask = 0;
+      const uint8_t *dev_delta = nullptr;
     };
 
     struct Batch
@@ -178,6 +189,10 @@ namespace sst::native
       };
 
       std::unordered_map<uint32_t, UcodeCopy> ucode_copies; // live address -> this frame's copy
+      // Device block as last captured (game thread) / as of the command being run (render thread)
+      uint32_t dev_snap_addr = 0, rt_dev_addr = 0;
+      std::unique_ptr<uint8_t[]> dev_snap{new uint8_t[kDevSnapSize]}, rt_dev{new uint8_t[kDevSnapSize]};
+      uint64_t dev_chunks_copied = 0, dev_chunks_total = 0;
       // Game-thread cost, per logging period
       double capture_ms = 0, wait_ms = 0;
       double frame_capture_ms = 0, capture_max_ms = 0; // this frame's capture / worst per period
@@ -264,9 +279,35 @@ namespace sst::native
     }
 
     // Runs one command (render thread, or the game thread without one)
+    // Brings the render thread's copy of the device block up to this command (every command, run or not, so it stays in step with the game thread's)
+    void ApplyDevice(State &s, const Command &c)
+    {
+      if (!c.dev_addr)
+        return;
+
+      s.rt_dev_addr = c.dev_addr;
+      const uint8_t *src = c.dev_delta;
+
+      for (uint64_t m = c.dev_mask; m; m &= m - 1)
+      {
+        const uint32_t i = uint32_t(std::countr_zero(m));
+        std::memcpy(s.rt_dev.get() + i * kDevChunk, src, ChunkSize(i));
+        src += ChunkSize(i);
+      }
+    }
+
     void Execute(State &s, const Command &c)
     {
-      SetGuestOverlays(c.overlays, c.overlay_count);
+      GuestOverlay overlays[9];
+      uint32_t count = 0;
+
+      for (uint32_t i = 0; i < c.overlay_count; ++i)
+        overlays[count++] = c.overlays[i];
+
+      if (c.dev_addr && c.dev_addr == s.rt_dev_addr)
+        overlays[count++] = {c.dev_addr + kDevSnapBegin, c.dev_addr + kDevSnapEnd, s.rt_dev.get()};
+
+      SetGuestOverlays(overlays, count);
       const uint8_t *base = s.base;
 
       switch (c.kind)
@@ -331,9 +372,15 @@ namespace sst::native
         {
           std::lock_guard lock(s->mutex);
 
-          if (g_active.load(std::memory_order_acquire))
-            for (const Command &c : batch.commands)
+          const bool active = g_active.load(std::memory_order_acquire);
+
+          for (const Command &c : batch.commands)
+          {
+            ApplyDevice(*s, c);
+
+            if (active)
               Execute(*s, c);
+          }
         }
 
         if (batch.arena)
@@ -391,7 +438,7 @@ namespace sst::native
         if (!Plausible(dev))
           return;
 
-        Range(dev + kDevSnapBegin, kDevSnapEnd - kDevSnapBegin);
+        DeviceDelta(dev);
         const uint32_t vs = Be32(dev + 0x3198);
 
         if (!Plausible(vs))
@@ -420,6 +467,53 @@ namespace sst::native
         std::memcpy(copy, host, size);
         s_.ucode_copies[live] = {size, copy};
         Overlay(live, size, copy);
+      }
+
+      // The device block's chunks that changed since the last capture
+      void DeviceDelta(uint32_t dev)
+      {
+        const uint8_t *host = HostPtr(s_.base, dev + kDevSnapBegin);
+        uint8_t *snap = s_.dev_snap.get();
+        uint64_t mask = 0;
+        uint32_t bytes = 0;
+
+        if (s_.dev_snap_addr != dev)
+        {
+          mask = kDevChunks == 64 ? ~uint64_t(0) : (uint64_t(1) << kDevChunks) - 1;
+          bytes = kDevSnapSize;
+          s_.dev_snap_addr = dev;
+        }
+        else
+        {
+          for (uint32_t i = 0; i < kDevChunks; ++i)
+            if (std::memcmp(snap + i * kDevChunk, host + i * kDevChunk, ChunkSize(i)) != 0)
+            {
+              mask |= uint64_t(1) << i;
+              bytes += ChunkSize(i);
+            }
+        }
+
+        cmd_.dev_addr = dev;
+        cmd_.dev_mask = mask;
+        s_.dev_chunks_total += kDevChunks;
+
+        if (!mask)
+          return;
+
+        uint8_t *delta = s_.arena->Alloc(bytes);
+        uint8_t *out = delta;
+
+        for (uint64_t m = mask; m; m &= m - 1)
+        {
+          const uint32_t i = uint32_t(std::countr_zero(m));
+          std::memcpy(out, host + i * kDevChunk, ChunkSize(i));
+          std::memcpy(snap + i * kDevChunk, out, ChunkSize(i));
+          out += ChunkSize(i);
+          ++s_.dev_chunks_copied;
+        }
+
+        cmd_.dev_delta = delta;
+        s_.snapshot_bytes += bytes;
       }
 
       const uint8_t *Bytes(const void *data, size_t size)
@@ -536,6 +630,7 @@ namespace sst::native
     void StartRenderThread(State &s)
     {
       s.threaded = true;
+      s.dev_snap_addr = s.rt_dev_addr = 0; // the first capture sends the whole device block
       s.renderer.SetThreaded(true);
 
       for (int i = 0; i < 3; ++i)
@@ -977,8 +1072,12 @@ namespace sst::native
       const double frames = double(s.period_frames);
       REXLOG_INFO("[sst-native] perf: game thread per frame: {:.2f} ms capturing {} calls ({:.1f} MB "
                   "of snapshots), {:.2f} ms waiting for the render thread; game frames over 20 ms: "
-                  "{} (longest {:.1f} ms); longest capture in one frame {:.2f} ms{}",
-                  s.capture_ms / frames, uint64_t(double(s.captured) / frames + 0.5), double(s.snapshot_bytes) / frames / (1 << 20), s.wait_ms / frames, s.swaps_over_20, s.swap_max_ms, s.capture_max_ms, s.ucode_skipped ? fmt::format("; {} draws without a microcode snapshot", s.ucode_skipped) : std::string());
+                  "{} (longest {:.1f} ms); longest capture in one frame {:.2f} ms; device block chunks "
+                  "copied {:.1f}%{}",
+                  s.capture_ms / frames, uint64_t(double(s.captured) / frames + 0.5), double(s.snapshot_bytes) / frames / (1 << 20), s.wait_ms / frames, s.swaps_over_20, s.swap_max_ms, s.capture_max_ms,
+                  s.dev_chunks_total ? 100.0 * double(s.dev_chunks_copied) / double(s.dev_chunks_total) : 0.0,
+                  s.ucode_skipped ? fmt::format("; {} draws without a microcode snapshot", s.ucode_skipped) : std::string());
+      s.dev_chunks_copied = s.dev_chunks_total = 0;
       s.capture_ms = s.wait_ms = 0;
       s.captured = s.snapshot_bytes = s.period_frames = s.ucode_skipped = 0;
       s.swap_max_ms = 0;

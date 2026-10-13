@@ -146,6 +146,7 @@ namespace sst::native
       kPhVertices,
       kPhConstants,
       kPhTextures,
+      kPhUiFit,
       kPhRecord,
       kPhClear,
       kPhSubmit,
@@ -572,6 +573,7 @@ namespace sst::native
       uint64_t memexport_bad_outputs = 0, memexport_bad_logged = 0;
       uint64_t morph_consumers = 0, morph_consumer_overrun = 0, morph_consumer_stale = 0, morph_consumer_bad = 0, morph_consumer_bad_logged = 0;
       uint64_t check_draws = 0, check_flagged = 0, check_logged = 0;
+      uint64_t measured_draws = 0, measured_3d_early = 0, measured_sampled = 0; // UI fit (MeasureDraw)
       uint64_t morph_jump_checks = 0, morph_jump_draws = 0, morph_jump_logged = 0;
       uint64_t morph_modified = 0, morph_modified_logged = 0;
       uint64_t check_jump_checks = 0, check_jump_draws = 0, check_jump_logged = 0;

@@ -2465,9 +2465,9 @@ namespace sst::native
       REXLOG_INFO("[sst-native] perf: {} per frame: {:.2f} ms in the renderer, {:.2f} ms "
                   "{}; renderer: memexport {:.2f}, shaders {:.2f}, "
                   "inputs {:.2f}, indices {:.2f}, pipelines {:.2f}, vertices {:.2f}, constants "
-                  "{:.2f}, textures {:.2f}, recording {:.2f}, other {:.2f}, clears {:.2f}, "
+                  "{:.2f}, textures {:.2f}, ui fit {:.2f}, recording {:.2f}, other {:.2f}, clears {:.2f}, "
                   "submit {:.2f}; waits: GPU {:.2f}, morphs {:.2f}",
-                  threaded_ ? "render thread" : "game thread", renderer, std::max(0.0, frame - renderer), threaded_ ? "idle (waiting for the game's next frame)" : "in the game (and its own D3D)", ms(kPhMemexport), ms(kPhShaders), ms(kPhInputs), ms(kPhIndices), ms(kPhPipeline), ms(kPhVertices), ms(kPhConstants), ms(kPhTextures), ms(kPhRecord), ms(kPhOther), ms(kPhClear), ms(kPhSubmit), ms(kPhFenceWait), stats_.memexport_wait_ms / frames);
+                  threaded_ ? "render thread" : "game thread", renderer, std::max(0.0, frame - renderer), threaded_ ? "idle (waiting for the game's next frame)" : "in the game (and its own D3D)", ms(kPhMemexport), ms(kPhShaders), ms(kPhInputs), ms(kPhIndices), ms(kPhPipeline), ms(kPhVertices), ms(kPhConstants), ms(kPhTextures), ms(kPhUiFit), ms(kPhRecord), ms(kPhOther), ms(kPhClear), ms(kPhSubmit), ms(kPhFenceWait), stats_.memexport_wait_ms / frames);
       uint64_t acquires, repeats, skips;
       {
         std::lock_guard lock(slot_mutex_);
@@ -3544,8 +3544,8 @@ namespace sst::native
   Renderer::DrawExtent Renderer::MeasureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count)
   {
     DrawExtent e;
-    // (Up to 4096 vertices: the star background at 32:9 batches ~1200 into one draw; unmeasured, it would not be fitted and would show stretched.)
-    if (call.up_data || !vertex_count || vertex_count > 4096 || !vs_entry)
+    // (Big batches too: the star background at 32:9 batches ~1200 vertices into one draw; unmeasured, it would not be fitted and would show stretched. 3D draws stop after a 4-vertex probe and big flat batches are sampled, so this stays cheap.)
+    if (call.up_data || !vertex_count || vertex_count > 65536 || !vs_entry)
       return e;
 
     uint32_t bools[8], fetch[192], loops[32];
@@ -3554,39 +3554,90 @@ namespace sst::native
     if (LoadVsState(base, call.device, vs_obj, vs_entry, check_ucode_, check_constants_.data(), bools, fetch, loops, nullptr))
       return e;
 
-    check_indices_.resize(vertex_count);
-
-    for (uint32_t i = 0; i < vertex_count; ++i)
-      check_indices_[i] = first_vertex + i;
-
-    check_positions_.resize(size_t(vertex_count) * 4);
     VsConstants vc;
     vc.float_constants = check_constants_.data();
     vc.bool_constants = bools;
     vc.loop_constants = loops;
     vc.fetch_constants = fetch;
     MemexportStats ignored;
-
-    if (!memexport_->RunPositions(check_ucode_.data(), uint32_t(check_ucode_.size()), vc, check_indices_.data(), vertex_count, check_positions_.data(), &ignored))
-      return e;
-
     bool any = false, flat = true;
     float x0 = FLT_MAX, x1 = -FLT_MAX, y0 = FLT_MAX, y1 = -FLT_MAX;
-
-    for (uint32_t v = 0; v < vertex_count; ++v)
+    // Runs the shader for check_indices_ and folds the positions into the extent
+    auto run = [&]() -> bool
     {
-      const float *p = &check_positions_[4 * size_t(v)];
+      const uint32_t n = uint32_t(check_indices_.size());
+      check_positions_.resize(size_t(n) * 4);
 
-      if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[3]) || p[3] <= 1e-6f)
-        continue;
+      if (!memexport_->RunPositions(check_ucode_.data(), uint32_t(check_ucode_.size()), vc, check_indices_.data(), n, check_positions_.data(), &ignored))
+        return false;
 
-      any = true;
+      for (uint32_t v = 0; v < n; ++v)
+      {
+        const float *p = &check_positions_[4 * size_t(v)];
 
-      if (std::fabs(p[3] - 1.0f) > 1e-3f)
-        flat = false;
+        if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[3]) || p[3] <= 1e-6f)
+          continue;
 
-      const float x = p[0] / p[3], y = p[1] / p[3];
-      x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+        any = true;
+
+        if (std::fabs(p[3] - 1.0f) > 1e-3f)
+          flat = false;
+
+        const float x = p[0] / p[3], y = p[1] / p[3];
+        x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+      }
+
+      return true;
+    };
+
+    // A few vertices first: most draws measured here are 3D (blended effects, particles - no depth writes), and one projected vertex (w != 1) already rules out fitting; only flat (2D) draws are measured in full
+    constexpr uint32_t kProbe = 4;
+    check_indices_.clear();
+
+    for (uint32_t i = 0; i < std::min(vertex_count, kProbe); ++i)
+      check_indices_.push_back(first_vertex + i);
+
+    if (!run())
+      return e;
+
+    ++stats_.measured_draws;
+
+    if (any && !flat)
+    {
+      ++stats_.measured_3d_early;
+      e = {true, false, x0, x1, y0, y1};
+      return e;
+    }
+
+    if (vertex_count > kProbe)
+    {
+      // Big flat batches (the star fields: up to ~1200 vertices) are sampled: whole quads (4 vertices) spread over the batch, the first and last included
+      constexpr uint32_t kMaxMeasured = 512;
+      check_indices_.clear();
+
+      if (vertex_count <= kMaxMeasured)
+      {
+        for (uint32_t i = kProbe; i < vertex_count; ++i)
+          check_indices_.push_back(first_vertex + i);
+      }
+      else
+      {
+        const uint32_t groups = (vertex_count + 3) / 4, want = kMaxMeasured / 4;
+
+        for (uint32_t g = 0; g < want; ++g)
+        {
+          const uint32_t q = uint32_t((uint64_t(g) * (groups - 1)) / (want - 1));
+
+          for (uint32_t k = 0; k < 4; ++k)
+            if (q * 4 + k < vertex_count && q * 4 + k >= kProbe)
+              check_indices_.push_back(first_vertex + q * 4 + k);
+        }
+
+        ++stats_.measured_sampled;
+      }
+
+      if (!check_indices_.empty() && !run())
+        return e;
     }
 
     if (!any)
@@ -5558,6 +5609,7 @@ namespace sst::native
       draw_composite_ = false;
       draw_textures_.clear();
       BindTextures(base, dev, vs_entry, ps ? ps_entry : nullptr, sc);
+      clk.Switch(kPhUiFit);
 
       // Aspect ratio: UI draws (into the full-size UI / final targets) keep their proportions in a centred 16:9 box.
       // 2D draws (w = 1, measured on the CPU) into full-size targets - UI and the 2D layers of menus drawn into the 3D scene's target - are fitted, except full-width layers (backgrounds, fades, full-screen copies), which stretch to fill the screen. Draws that cannot be measured: the UI targets' draws that don't sample a full-screen copy.
@@ -6244,6 +6296,8 @@ namespace sst::native
                 "pending {} fetch {} prim {} rt {} pipeline {} data {} cull {} memexport-target {}; {} clears; "
                 "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB; resolves {}",
                 frame, s.draws, s.drawn, s.depth_only, s.skip_shader, s.skip_pending, s.skip_decl, s.skip_prim, s.skip_rt, s.skip_pipeline, s.skip_data, s.skip_cull, s.skip_memexport, s.clears, s.pipelines_created, s.pipelines_failed, s.shaders_from_objects, double(s.upload_bytes) / (1 << 20), s.resolves);
+    if (s.measured_draws)
+      REXLOG_INFO("[sst-native] ui fit: {} draws measured on the CPU ({} 3D, stopped after the probe; {} big batches sampled)", s.measured_draws, s.measured_3d_early, s.measured_sampled);
     std::string prims;
 
     for (auto &[p, n] : s.prims)
