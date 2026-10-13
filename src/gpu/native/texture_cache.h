@@ -76,6 +76,8 @@ namespace sst::native
       uint64_t bytes = 0;
       uint32_t base_size = 0, mip_size = 0;         // guest extents (bytes) from base / mip address
       bool resident = false;                        // uploaded at least once
+      int prompt_page = -1;                         // a button-icon atlas page (prompts.h), else -1
+      uint32_t prompt_generation = 0;               // prompts::Generation() it was uploaded with
       std::unordered_map<uint32_t, uint32_t> views; // swizzle | view kind << 12 -> SRV slot
     };
 

@@ -5,8 +5,11 @@
 #pragma once
 
 #include "gpu/native/native.h"
+#include "input/controls.h"
 #include "menu/graphics_menu.h"
 #include "menu/restart.h"
+
+#include <filesystem>
 
 #include <rex/filesystem.h>
 #include <rex/rex_app.h>
@@ -34,13 +37,23 @@ public:
     }
   }
 
-  // The GPU is now a runtime-loaded plugin and the gpu_plugin cvar defaults to empty (= no GPU emulation)
+  // The GPU is a runtime-loaded plugin and the gpu_plugin cvar defaults to empty (= no GPU emulation). Without --gpu_plugin the port's own native renderer ("sst") is used when its plugin sits next to the exe, so double-clicking the exe starts it; else the SDK's emulated GPU ("xenos")
   void OnPreSetup(rex::RuntimeConfig &config) override
   {
     if (config.gpu_plugin.empty())
     {
-      config.gpu_plugin = "xenos";
+      const auto dir = rex::filesystem::GetExecutableFolder();
+      bool have_sst = false;
+
+      for (const char *name : {"rexgpu-sst.dll", "rexgpu-sstd.dll", "rexgpu-sstrd.dll", "librexgpu-sst.so", "librexgpu-sst.dylib"})
+        have_sst = have_sst || std::filesystem::exists(dir / name);
+
+      config.gpu_plugin = have_sst ? "sst" : "xenos";
     }
+    // Keyboard controls (on by default) and the input system that tracks which device is in use, for the button prompts
+    sst::input::ApplyDefaults();
+    config.input_factory = [](bool tool_mode)
+    { return sst::input::CreateInputSystem(tool_mode); };
   }
 
   // Video settings (sst_settings.ini, VIDEO page), then the native
