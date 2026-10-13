@@ -15,8 +15,19 @@
 #endif
 #include <rex/logging.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <mutex>
 #include <string>
@@ -40,7 +51,7 @@ namespace sst::input
     using rex::input::X_INPUT_STATE;
     using rex::input::X_INPUT_VIBRATION;
 
-    // SST's keyboard layout. Left hand: WASD moves, Q / E the bumpers (instruct partner in doubles), Space the left trigger (superstar mode). Right hand: the shot buttons on J K L O, I = right trigger (superstar mode), U = back (change view). Arrows = D-pad, Enter / Esc = start (pause), Backspace = B as well
+    // SST's keyboard layout. Left hand: WASD moves, Q / E the bumpers (instruct partner in doubles), Space the left trigger (superstar mode). Right hand: the shot buttons on J K L O, I = right trigger (superstar mode), U = back (change view). Arrows = D-pad, Enter = start, Backspace = B as well. Esc is handled by the port (EscapeMode): pause in a match, back in menus, QUIT on the main menu
     constexpr std::pair<const char *, const char *> kDefaults[] = {
         {"mnk_mode", "true"},
         {"keybind_lstick_up", "W"},
@@ -56,7 +67,7 @@ namespace sst::input
         {"keybind_left_shoulder", "Q"},
         {"keybind_right_shoulder", "E"},
         {"keybind_back", "U"},
-        {"keybind_start", "Return,Escape"},
+        {"keybind_start", "Return"},
         {"keybind_dpad_up", "Up"},
         {"keybind_dpad_down", "Down"},
         {"keybind_dpad_left", "Left"},
@@ -84,7 +95,61 @@ namespace sst::input
     std::vector<uint64_t> g_pad_order;          // pads in the order they were first seen
     std::atomic<uint32_t> g_last_used{uint32_t(Kind::kNone)};
     std::atomic<uint32_t> g_generation{0};
+    std::atomic<uint32_t> g_confirm_presses{0};
     std::atomic<uint32_t> g_style{uint32_t(PromptStyle::kKeyboard)};
+
+    // Esc
+    std::atomic<bool> g_in_match{false};
+    std::atomic<int64_t> g_main_menu_beat{0}; // steady clock ms of the main menu's last frame on its category list (0: none)
+    std::atomic<bool> g_dialog_up{false};
+    std::atomic<uint32_t> g_escape_presses{0};
+
+    int64_t NowMs()
+    {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    enum class EscapeMode : uint8_t
+    {
+      kBack,     // B: menus
+      kPause,    // START: in a match
+      kMainMenu, // no button; counted for the main menu's QUIT (native 0x53:17)
+    };
+
+    EscapeMode CurrentEscapeMode()
+    {
+      if (g_dialog_up.load())
+        return EscapeMode::kBack; // (the YES / NO box: B = NO)
+
+      if (const int64_t beat = g_main_menu_beat.load(); beat && NowMs() - beat < 250)
+        return EscapeMode::kMainMenu;
+
+      return g_in_match.load() ? EscapeMode::kPause : EscapeMode::kBack;
+    }
+
+    // Esc state, shared by every keyboard poll (guarded by g_mutex)
+    bool g_esc_down = false;
+    EscapeMode g_esc_mode = EscapeMode::kBack; // decided when Esc goes down, kept while held
+
+    // True while Esc is held and this window has the focus
+    bool EscapeHeld(bool active)
+    {
+#if defined(_WIN32)
+      if (!active)
+        return false;
+
+      HWND fg = GetForegroundWindow();
+      DWORD pid = 0;
+
+      if (!fg || !GetWindowThreadProcessId(fg, &pid) || pid != GetCurrentProcessId())
+        return false;
+
+      return (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+#else
+      (void)active;
+      return false;
+#endif
+    }
 
     std::string Lower(std::string s)
     {
@@ -224,10 +289,47 @@ namespace sst::input
 
         if (r == X_ERROR_SUCCESS && out_state)
         {
+          Kind own = Kind::kNone;
+          {
+            std::lock_guard lock(g_mutex);
+
+            if (auto it = kinds_.find(uint64_t(id)); it != kinds_.end())
+              own = it->second;
+
+            // Esc (keyboard only): START in a match, nothing on the main menu's category list (the script asks to QUIT), B elsewhere
+            if (own == Kind::kKeyboard)
+            {
+              const bool down = EscapeHeld(is_active());
+
+              if (down && !g_esc_down)
+              {
+                g_esc_mode = CurrentEscapeMode();
+
+                if (g_esc_mode == EscapeMode::kMainMenu)
+                  g_escape_presses.fetch_add(1);
+
+                g_confirm_presses.fetch_add(1); // (skips the intro too)
+              }
+
+              g_esc_down = down;
+
+              if (down && g_esc_mode != EscapeMode::kMainMenu)
+                out_state->gamepad.buttons = uint16_t(uint16_t(out_state->gamepad.buttons) | (g_esc_mode == EscapeMode::kPause ? rex::input::X_INPUT_GAMEPAD_START : rex::input::X_INPUT_GAMEPAD_B));
+            }
+          }
+
           // A device takes over the prompts when it starts being used (neutral -> pressed), not while it is held: two devices held at once (or a pad that rests off-centre) would otherwise trade the prompts every poll
           const bool active = !rex::input::IsNeutral(out_state->gamepad);
+          const uint16_t buttons = uint16_t(out_state->gamepad.buttons);
           std::lock_guard lock(g_mutex);
           bool &was = active_[uint64_t(id)];
+          // Start / A presses (new presses only), for skipping the intro
+          uint16_t &held = buttons_[uint64_t(id)];
+
+          if (buttons & ~held & (rex::input::X_INPUT_GAMEPAD_START | rex::input::X_INPUT_GAMEPAD_A))
+            g_confirm_presses.fetch_add(1);
+
+          held = buttons;
 
           if (active && !was)
           {
@@ -255,6 +357,7 @@ namespace sst::input
       std::unique_ptr<rex::input::InputDriver> inner_;
       std::unordered_map<uint64_t, Kind> kinds_;  // this driver's devices (guarded by g_mutex)
       std::unordered_map<uint64_t, bool> active_; // last state per device: pressed (guarded by g_mutex)
+      std::unordered_map<uint64_t, uint16_t> buttons_; // last buttons per device (guarded by g_mutex)
     };
 
     void Add(rex::input::InputSystem &system, std::unique_ptr<rex::input::InputDriver> driver)
@@ -271,7 +374,7 @@ namespace sst::input
         rex::cvar::SetFlagByName(name, value);
 
     REXLOG_INFO("[sst-input] keyboard {}: move W A S D, shots J K L O (X A B Y), superstar I / Space, "
-                "partner Q / E, back U, pause Enter / Esc, D-pad arrows",
+                "partner Q / E, back U, start Enter, Esc pause / back / quit, D-pad arrows",
                 rex::cvar::Query<bool>("mnk_mode") ? "on" : "off (--mnk_mode=false)");
   }
 
@@ -296,18 +399,42 @@ namespace sst::input
 
     system->AddDriver(std::make_unique<rex::input::nop::NopInputDriver>(nullptr, tool_mode ? 0 : 1));
     system->SetDeviceAssignment(std::make_unique<rex::input::SlotAssignment>());
-
     {
       std::lock_guard lock(g_mutex);
       Update();
     }
-
     return system;
   }
 
   PromptStyle CurrentPromptStyle()
   {
     return PromptStyle(g_style.load(std::memory_order_relaxed));
+  }
+
+  uint32_t ConfirmPresses()
+  {
+    return g_confirm_presses.load(std::memory_order_relaxed);
+  }
+
+  void SetInMatch(bool in_match)
+  {
+    if (g_in_match.exchange(in_match) != in_match)
+      REXLOG_INFO("[sst-input] Esc: {}", in_match ? "pause (match)" : "back (menus)");
+  }
+
+  void MainMenuFrame(bool category_list)
+  {
+    g_main_menu_beat = category_list ? NowMs() : 0;
+  }
+
+  void SetDialogUp(bool up)
+  {
+    g_dialog_up = up;
+  }
+
+  uint32_t EscapePresses()
+  {
+    return g_escape_presses.load(std::memory_order_relaxed);
   }
 
   uint32_t PromptStyleGeneration()

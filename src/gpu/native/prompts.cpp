@@ -470,15 +470,12 @@ namespace sst::native::prompts
       case 0:
         p[0] = {cx, cy - r}, p[1] = {cx - r, cy + r * 2 / 3}, p[2] = {cx + r, cy + r * 2 / 3};
         break;
-
       case 1:
         p[0] = {cx, cy + r}, p[1] = {cx - r, cy - r * 2 / 3}, p[2] = {cx + r, cy - r * 2 / 3};
         break;
-
       case 2:
         p[0] = {cx - r, cy}, p[1] = {cx + r * 2 / 3, cy - r}, p[2] = {cx + r * 2 / 3, cy + r};
         break;
-
       default:
         p[0] = {cx + r, cy}, p[1] = {cx - r * 2 / 3, cy - r}, p[2] = {cx - r * 2 / 3, cy + r};
         break;
@@ -597,31 +594,22 @@ namespace sst::native::prompts
       {
       case kA:
         return "keybind_a";
-
       case kB:
         return "keybind_b";
-
       case kX:
         return "keybind_x";
-
       case kY:
         return "keybind_y";
-
       case kStart:
         return "keybind_start";
-
       case kLB:
         return "keybind_left_shoulder";
-
       case kRB:
         return "keybind_right_shoulder";
-
       case kLT:
         return "keybind_left_trigger";
-
       case kRT:
         return "keybind_right_trigger";
-
       default:
         return nullptr;
       }
@@ -729,10 +717,10 @@ namespace sst::native::prompts
 
       if (icon == kDpad)
       {
-        // Arrow keys: up on top, left / down / right below
+        // The movement keys (W A S D by default; the arrows work too): up on top, left / down / right below
         const int kw = int(w) / 3, kh = int(h) / 2;
         const int top = (int(h) - 2 * kh) / 2, left = (int(w) - 3 * kw) / 2;
-        return DrawKeys(w, h, {{left + kw, top, left + 2 * kw, top + kh, L"", 0}, {left, top + kh, left + kw, top + 2 * kh, L"", 2}, {left + kw, top + kh, left + 2 * kw, top + 2 * kh, L"", 1}, {left + 2 * kw, top + kh, left + 3 * kw, top + 2 * kh, L"", 3}});
+        return DrawKeys(w, h, {{left + kw, top, left + 2 * kw, top + kh, KeyLabel("keybind_lstick_up")}, {left, top + kh, left + kw, top + 2 * kh, KeyLabel("keybind_lstick_left")}, {left + kw, top + kh, left + 2 * kw, top + 2 * kh, KeyLabel("keybind_lstick_down")}, {left + 2 * kw, top + kh, left + 3 * kw, top + 2 * kh, KeyLabel("keybind_lstick_right")}});
       }
 
       const char *bind = BindingFor(icon);
@@ -755,7 +743,7 @@ namespace sst::native::prompts
 
     // state
 
-    std::array<Image, kIconCount> g_art;                    // captured PlayStation art (decoded)
+    std::array<Image, kIconCount> g_art; // captured PlayStation art (decoded)
     std::array<std::vector<uint8_t>, kIconCount> g_capture; // blocks being captured (host BC2)
     uint32_t g_art_generation = 0;
 
@@ -796,28 +784,20 @@ namespace sst::native::prompts
       {
       case kA:
         return kPsCross;
-
       case kB:
         return kPsCircle;
-
       case kX:
         return kPsSquare;
-
       case kY:
         return kPsTriangle;
-
       case kLB:
         return kPsL1;
-
       case kRB:
         return kPsR1;
-
       case kLT:
         return kPsL2;
-
       case kRT:
         return kPsR2;
-
       default:
         return kIconCount; // Start, D-pad: the same on both
       }

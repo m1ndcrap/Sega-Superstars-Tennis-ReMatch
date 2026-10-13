@@ -3,6 +3,7 @@
 #include "menu/scene_widen.h"
 
 #include <algorithm>
+#include <tuple>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -1123,6 +1124,218 @@ namespace sst::menu::widen
 
       return added;
     }
+  }
+
+  // Main menu (SSTMainMenu.DAT, scene 83D07B85): a seventh category row, QUIT, below OPTIONS (see scene_widen.h)
+  bool AddMainMenuRow(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, const MainMenuRow &row, Bytes &out_dat, Bytes &out_rel, std::string &error)
+  {
+    // The Xbox LIVE row (a category without sub-items): parent group (position) -> row group (accordion keys) + highlight group
+    constexpr uint32_t kLiveParent = 0x244E79C8, kLiveRow = 0xDE3CBB75, kLiveHighlight = 0x028A51FF;
+    constexpr uint32_t kOptionsParent = 0xADD85F3F; // OPTIONS, the last row
+    constexpr uint32_t kCursorBar = 0x67B9D635;     // one key per category (labels: the script's table)
+    constexpr uint32_t kDescription = 0xC2B6DFEA;   // description panel below the rows
+    constexpr uint32_t kOptionsBarLabel = 0xD90AE79C;
+    constexpr uint32_t kScene = 0x83D07B85;
+    Scene s;
+
+    if (!Parse(dat, dat_size, s, error))
+      return false;
+
+    for (uint32_t h : {kLiveParent, kLiveRow, kLiveHighlight, kOptionsParent, kCursorBar, kDescription})
+      if (!s.objects.count(h) || !s.tracks.count(h))
+        return error = fmt::format("object {:08X} missing", h), false;
+
+    if (s.objects.count(row.parent))
+      return error = "already added", false;
+
+    auto key_y = [&](uint32_t h, int k = 0)
+    { return RdF(s.tracks[h].Key(k) + 0x10); };
+    // Row spacing: OPTIONS' position minus Xbox LIVE's (both parents have one key)
+    const float dy = key_y(kOptionsParent) - key_y(kLiveParent);
+
+    if (!(dy > 0.05f && dy < 0.1f))
+      return error = fmt::format("row spacing {:.3f}", dy), false;
+    // The cursor bar's OPTIONS key; the new key goes one row below it
+    Track &bar = s.tracks[kCursorBar];
+    int bar_options = -1;
+
+    for (int k = 0; k < bar.count; ++k)
+      if (Rd32(bar.Key(k)) == kOptionsBarLabel)
+        bar_options = k;
+
+    if (bar_options < 0 || bar.kind != 0)
+      return error = "cursor bar keys", false;
+    // Clone the Xbox LIVE subtree with the row's hashes
+    std::vector<uint32_t> new_hashes = {row.parent, row.row, row.highlight};
+
+    for (uint32_t i = 0; i < 8; ++i)
+      new_hashes.push_back(row.first_child + i);
+
+    for (uint32_t h : new_hashes)
+      if (s.used.count(h))
+        return error = fmt::format("hash {:08X} in use", h), false;
+
+    uint32_t next_child = row.first_child;
+    std::function<bool(uint32_t, uint32_t)> clone = [&](uint32_t from, uint32_t to) -> bool
+    {
+      Object o = s.objects[from];
+      o.order = s.next_order++;
+      const bool at8 = o.type == Tag("TEXT") || o.type == Tag("TXTR");
+
+      if (o.blob.size() < (at8 ? 12u : 4u))
+        return false;
+
+      Wr32(o.blob.data() + (at8 ? 8 : 0), to);
+
+      if (o.type == Tag("TEXT"))
+        Wr32(o.blob.data() + 4, row.text);
+
+      std::vector<uint32_t> kids = o.children;
+      o.children.clear();
+      s.objects[to] = std::move(o);
+      s.used.insert(to);
+
+      if (s.tracks.count(from))
+      {
+        Track t = s.tracks[from];
+        t.order = s.next_order++;
+        s.tracks[to] = std::move(t);
+      }
+
+      for (uint32_t k : kids)
+      {
+        uint32_t nk;
+
+        if (k == kLiveRow)
+          nk = row.row;
+        else if (k == kLiveHighlight)
+          nk = row.highlight;
+        else if (next_child < row.first_child + 8)
+          nk = next_child++;
+        else
+          return false;
+
+        if (!s.objects.count(k) || !clone(k, nk))
+          return false;
+
+        s.objects[to].children.push_back(nk);
+        s.parent[nk] = to;
+      }
+
+      return true;
+    };
+
+    if (!clone(kLiveParent, row.parent))
+      return error = "clone", false;
+    // One row below OPTIONS
+    {
+      Track &t = s.tracks[row.parent];
+
+      for (int k = 0; k < t.count; ++k)
+        WrF(t.Key(k) + 0x10, key_y(kOptionsParent) + dy);
+    }
+    // How far OPTIONS' sub-items push what is below: the description panel's OPTIONS keys (closed 1F47BC9D -> open 6893313A)
+    float options_shift = row.options_shift;
+    {
+      Track &t = s.tracks[kDescription];
+      float closed = -1, open = -1;
+
+      for (int k = 0; k < t.count; ++k)
+      {
+        if (Rd32(t.Key(k)) == 0x1F47BC9Du)
+          closed = RdF(t.Key(k) + 0x10);
+
+        if (Rd32(t.Key(k)) == 0x6893313Au)
+          open = RdF(t.Key(k) + 0x10);
+      }
+
+      if (closed >= 0 && open > closed + 0.05f && open < closed + 0.4f)
+        options_shift = open - closed;
+
+      // The game pushes the panel further for OPTIONS (3 sub-items) than the rows below a category need: with a row below OPTIONS that leaves a gap and puts the panel under the button bar. A two-item category pushes by ebd48b4c's distance; one more sub-item (0.041 apart) makes the natural distance, used for the new row and the panel alike
+      float two = -1;
+
+      for (int k = 0; k < t.count; ++k)
+        if (Rd32(t.Key(k)) == 0xEBD48B4Cu)
+          two = RdF(t.Key(k) + 0x10) - closed;
+
+      if (closed >= 0 && two > 0.05f && two + 0.041f < options_shift)
+      {
+        options_shift = two + 0.041f;
+
+        for (int k = 0; k < t.count; ++k)
+          if (Rd32(t.Key(k)) == 0x6893313Au)
+            WrF(t.Key(k) + 0x10, closed + options_shift);
+      }
+    }
+    // Pushed down by OPTIONS' sub-items: keys from_label (y 0) and to_label (y shift) at frames past the row's own animations
+    {
+      Track &t = s.tracks[row.row];
+
+      if (t.kind != 0 || !t.count)
+        return error = "row keys", false;
+
+      Bytes key(t.Key(0), t.Key(0) + t.KeySize());
+
+      for (int k = 0; k < t.count; ++k)
+        if (RdF(t.Key(k) + 0x10) == 0.0f)
+          key.assign(t.Key(k), t.Key(k) + t.KeySize());
+
+      for (auto [label, frame, y] : {std::tuple{row.options_from, 40u, 0.0f}, std::tuple{row.options_to, 50u, options_shift}})
+      {
+        Wr32(key.data(), label);
+        Wr32(key.data() + 4, frame);
+        WrF(key.data() + 0x10, y);
+        t.keys.insert(t.keys.end(), key.begin(), key.end());
+        ++t.count;
+      }
+    }
+    // Cursor bar: a key for the new row
+    {
+      Bytes key(bar.Key(bar_options), bar.Key(bar_options) + bar.KeySize());
+      uint32_t last_frame = 0;
+
+      for (int k = 0; k < bar.count; ++k)
+        last_frame = std::max(last_frame, Rd32(bar.Key(k) + 4));
+
+      const float bar_dy = key_y(kCursorBar, bar_options) - key_y(kCursorBar, std::max(bar_options - 1, 0));
+      Wr32(key.data(), row.bar_label);
+      Wr32(key.data() + 4, last_frame + 1);
+      WrF(key.data() + 0x10, key_y(kCursorBar, bar_options) + (bar_dy > 0.05f && bar_dy < 0.1f ? bar_dy : dy));
+      bar.keys.insert(bar.keys.end(), key.begin(), key.end());
+      ++bar.count;
+    }
+    // The description panel moves down one row (all its keys)
+    {
+      Track &t = s.tracks[kDescription];
+
+      for (int k = 0; k < t.count; ++k)
+        WrF(t.Key(k) + 0x10, RdF(t.Key(k) + 0x10) + dy);
+    }
+    // The new row is a top-level object of the main menu scene
+    bool listed = false;
+
+    for (SceneEntry &se : s.scenes)
+      if (se.hash == kScene && std::find(se.list.begin(), se.list.end(), kLiveParent) != se.list.end())
+      {
+        se.list.push_back(row.parent);
+        std::sort(se.list.begin(), se.list.end());
+        listed = true;
+      }
+
+    if (!listed)
+      return error = "scene list", false;
+
+    std::vector<std::pair<uint32_t, std::vector<uint32_t>>> relocs;
+    Write(s, relocs);
+    Bytes new_rel;
+
+    if (!PatchRel(rel, rel_size, relocs, new_rel, error))
+      return false;
+
+    out_dat = WriteChunks(s.chunks);
+    out_rel = std::move(new_rel);
+    return true;
   }
 
   bool RoundTrip(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, Bytes &out_dat, Bytes &out_rel, std::string &error)

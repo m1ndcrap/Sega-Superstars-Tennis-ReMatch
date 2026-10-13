@@ -19,6 +19,7 @@ set(SSTREMATCH_SOURCES
     src/menu/restart.cpp
     src/menu/hud_anchor.cpp
     src/menu/scene_widen.cpp
+    src/menu/main_menu_quit.cpp
     src/movie/movie_debug.cpp
     src/input/controls.cpp
 )

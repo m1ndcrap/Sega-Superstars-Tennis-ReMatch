@@ -3,6 +3,7 @@
 #include "menu/graphics_menu.h"
 #include "input/controls.h"
 #include "menu/hud_anchor.h"
+#include "menu/main_menu_quit.h"
 #include "menu/pause_patch.h"
 #include "menu/restart.h"
 #include "menu/scene_widen.h"
@@ -20,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -32,6 +34,10 @@
 #include <unordered_map>
 #include <vector>
 
+REXCVAR_DEFINE_BOOL(sst_skip_intro, true, "SST", "The boot intro (SEGA movie, logo cards) can be skipped with Start / A (Enter on the keyboard)");
+REXCVAR_DEFINE_BOOL(sst_online_play_name, true, "SST", "Main menu: the Xbox LIVE item is called ONLINE PLAY");
+REXCVAR_DEFINE_BOOL(sst_quit_item, true, "SST", "Main menu: a QUIT item below OPTIONS (asks, then closes the game; Esc on the main menu asks too)");
+REXCVAR_DEFINE_BOOL(sst_controls_name, true, "SST", "Settings: the CONTROLLER page is called CONTROLS");
 REXCVAR_DEFINE_BOOL(sst_controller_diagram, true, "SST", "Settings > CONTROLLER shows the DualShock 3 diagram while a PlayStation pad is in use");
 REXCVAR_DEFINE_BOOL(sst_wide_layouts, true, "SST",
                     "Ultrawide aspect ratios: menus, loading screens and backgrounds get "
@@ -75,6 +81,7 @@ namespace sst::menu
   namespace
   {
 #include "menu/graphics_script.inc"
+#include "menu/intro_script.inc"
 
     constexpr uint32_t kVideoScript = 0x4B585196; // lookup2("video")
     constexpr uint32_t kNativeGroup = 0x53;
@@ -92,7 +99,17 @@ namespace sst::menu
       kPauseValue = pause::kNativeValue,
       kRestart = 9, // the restart dialog was confirmed
       kPauseStep = pause::kNativeStep,
+      // The port's boot intro script (tools/gen_intro_script.py)
+      kIntroBegin = 11, // () forget earlier Start / A presses
+      kIntroSkip = 12,  // (ms) -> 1 on a new Start / A press, or once ms have passed since kIntroTimer (ms > 0)
+      kIntroTimer = 13, // () start the hold timer
+      // QUIT (main_menu_quit.h)
+      kQuitDialogBegin = quit::kNativeDialogBegin,
+      kQuitDialogEnd = quit::kNativeDialogEnd,
+      kQuit = quit::kNativeQuit,
+      kQuitEscape = quit::kNativeEscape,
     };
+    constexpr uint32_t kSplashScript = 0x0ED21739; // lookup2("splash")
 
     static_assert(pause::kNativeResult == kResult);
     enum Event : int
@@ -330,6 +347,9 @@ namespace sst::menu
 
     constexpr uint32_t kPoolSize = 0x10000;
     constexpr uint32_t kTextIdBase = 0x53540000;
+    constexpr uint32_t kTextQuitQuestion = 0x5354FF12; // QUIT dialog body
+    // "CONTROLLER" -> "CONTROLS": the Settings page title, the Settings list item (same id as the page's layer hash), the pause menu row
+    constexpr uint32_t kTextController[] = {0x2E29AD95, 0xABB4502D, 0x193DCBAD};
     struct Guest
     {
       uint32_t script = 0; // our "video" module
@@ -363,7 +383,7 @@ namespace sst::menu
                        g_guest.pool = block + script_size;
                        g_guest.ok = true;
                        // Fixed ids the patched pause scene uses
-                       for (auto [id, text] : {std::pair<uint32_t, const char *>{pause::kTextBlank, " "}, {pause::kTextVideo, "VIDEO"}})
+                       for (auto [id, text] : {std::pair<uint32_t, const char *>{pause::kTextBlank, " "}, {pause::kTextVideo, "VIDEO"}, {quit::kTextLabel, "QUIT"}, {quit::kTextDescription, "Close the game and return to the desktop."}, {kTextQuitQuestion, "Are you sure you want to quit to the desktop?"}})
                        {
                          const uint32_t n = uint32_t(std::strlen(text)) + 1;
                          const uint32_t at = g_guest.pool + g_guest.pool_used;
@@ -395,6 +415,18 @@ namespace sst::menu
       g_guest.texts.emplace(id, at);
       return id;
     }
+
+    // QUIT: its dialog is up (texts swapped); the row is pushed down by OPTIONS' sub-items
+    bool g_quit_dialog = false;
+    bool g_quit_row_pushed = false;
+    uint32_t g_escape_seen = 0; // sst::input::EscapePresses() at the main menu's last frame
+    bool g_quit_scene_failed = false;
+    std::unordered_map<uint32_t, uint32_t> g_quit_modules; // original mainmenu module -> patched copy (0: failed)
+
+    // boot intro (kIntro* natives)
+    uint32_t g_intro_presses = 0;
+    std::chrono::steady_clock::time_point g_intro_timer{};
+    uint32_t g_intro_script = 0; // guest copy of kIntroScript
 
     // settings
     Settings g_current, g_snapshot;
@@ -789,6 +821,72 @@ namespace sst::menu
         break;
       }
 
+      case kQuitDialogBegin:
+      case kQuitDialogEnd:
+        g_quit_dialog = (id & 0xFF) == kQuitDialogBegin;
+        sst::input::SetDialogUp(g_quit_dialog);
+        SetResult(base, out, 0, 2);
+        break;
+
+      case kQuit:
+        REXLOG_INFO("[sst-menu] QUIT confirmed: closing the game");
+        SetResult(base, out, 0, 2);
+
+        if (g_request_quit)
+          g_request_quit();
+
+        // (The normal shutdown, asked for from the script thread, does not finish on its own: end the process once the log is out)
+        ExitSoon(1000);
+        break;
+
+      case kQuitEscape:
+      {
+        // Every main menu frame (argument: menu level, 1 = category list): Esc on the category list asks to QUIT
+        const bool category_list = ArgInt(base, values, types, count, 0) == 1;
+        sst::input::MainMenuFrame(category_list && !g_quit_dialog);
+        const uint32_t presses = sst::input::EscapePresses();
+        const bool ask = category_list && !g_quit_dialog && presses != g_escape_seen;
+        g_escape_seen = presses;
+
+        if (ask)
+          REXLOG_INFO("[sst-menu] Esc on the main menu: QUIT?");
+
+        SetResult(base, out, ask ? 1 : 0, 2);
+        break;
+      }
+
+      case kIntroBegin:
+        g_intro_presses = sst::input::ConfirmPresses();
+        g_intro_timer = std::chrono::steady_clock::now();
+        SetResult(base, out, 0, 2);
+        break;
+
+      case kIntroTimer:
+        g_intro_timer = std::chrono::steady_clock::now();
+        SetResult(base, out, 0, 2);
+        break;
+
+      case kIntroSkip:
+      {
+        const int ms = ArgInt(base, values, types, count, 0);
+        const uint32_t presses = sst::input::ConfirmPresses();
+        bool skip = false;
+
+        if (presses != g_intro_presses)
+        {
+          g_intro_presses = presses;
+          skip = true;
+          REXLOG_INFO("[sst-menu] intro: skipped");
+        }
+        else if (ms > 0)
+        {
+          skip = std::chrono::steady_clock::now() - g_intro_timer >= std::chrono::milliseconds(ms);
+        }
+
+        SetResult(base, out, skip ? 1 : 0, 2);
+        break;
+      }
+
       case kPauseStep:
       {
         // Pause menu up / down: the next row in screen order (pause::kVisualOrder) among rows first .. first + count - 1, wrapping
@@ -872,7 +970,7 @@ namespace sst::menu
       if (Load32(base, node + 0x18) != module)
       {
         Store32(base, node + 0x18, module);
-        REXLOG_INFO("[sst-menu] \"video\" script -> the port's VIDEO page");
+        REXLOG_INFO("[sst-menu] script {:08X} -> the port's version", hash);
       }
 
       return true;
@@ -1034,6 +1132,69 @@ namespace sst::menu
         Store32(base, node + 0x18, patched);
     }
 
+    // Main menu: the QUIT row (main_menu_quit.h). The patched script needs the patched scene
+    void RedirectMainMenuScript(uint8_t *base, uint32_t fe)
+    {
+      const uint32_t node = FindNode(base, fe, quit::kScriptHash);
+
+      if (!node)
+        return;
+
+      const uint32_t module = Load32(base, node + 0x18);
+      std::lock_guard lock(g_pause_mutex);
+
+      for (auto &[orig, patched] : g_quit_modules)
+        if (module == patched && patched)
+        {
+          if (g_quit_scene_failed || !REXCVAR_GET(sst_quit_item))
+            Store32(base, node + 0x18, orig);
+
+          return;
+        }
+
+      if (g_quit_scene_failed || !REXCVAR_GET(sst_quit_item))
+        return;
+
+      uint32_t patched = 0;
+
+      if (auto it = g_quit_modules.find(module); it != g_quit_modules.end())
+      {
+        patched = it->second;
+      }
+      else
+      {
+        g_quit_modules[module] = 0; // tried (no retry on failure)
+        const uint32_t debug = Load32(base, module + 28);
+
+        if (debug < 0x20 || debug > 0x100000)
+          return;
+
+        std::vector<uint8_t> bytes(debug + 0x400);
+        std::memcpy(bytes.data(), GuestPtr(base, module), bytes.size());
+        std::string error;
+        auto out = quit::PatchScript(bytes.data(), bytes.size(), error);
+
+        if (!out)
+        {
+          REXLOG_WARN("[sst-menu] QUIT disabled (script: {})", error);
+          return;
+        }
+
+        auto *memory = rex::system::kernel_memory();
+        patched = memory ? memory->SystemHeapAlloc(uint32_t(out->size())) : 0;
+
+        if (!patched)
+          return;
+
+        std::memcpy(GuestPtr(base, patched), out->data(), out->size());
+        g_quit_modules[module] = patched;
+        REXLOG_INFO("[sst-menu] mainmenu patched: QUIT ({} bytes at {:08X})", out->size(), patched);
+      }
+
+      if (patched)
+        Store32(base, node + 0x18, patched);
+    }
+
     // In-match HUD scene buffers (DAT) -> file name, for the ultrawide anchoring
     std::unordered_map<uint32_t, std::string> g_hud_buffers;
 
@@ -1138,6 +1299,9 @@ extern "C" void __imp__sub_825946B0(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_82595158(PPCContext &__restrict, uint8_t *);
 extern "C" void sub_82128A90(PPCContext &__restrict, uint8_t *); // start reading (fs, path, buffer, 0)
 extern "C" void sub_82594820(PPCContext &__restrict, uint8_t *); // file size (path)
+extern "C" void sub_82282BB8(PPCContext &__restrict, uint8_t *); // scene native 4:4 show
+extern "C" void sub_82282C28(PPCContext &__restrict, uint8_t *); // scene native 4:5 hide
+extern "C" void sub_82282AA0(PPCContext &__restrict, uint8_t *); // scene native 4:10 animate (object, from label, to label, flags)
 extern "C" void sub_82122480(PPCContext &__restrict, uint8_t *); // allocate (size, align)
 extern "C" void sub_821289D8(PPCContext &__restrict, uint8_t *); // read file (fs, path, buffer)
 
@@ -1149,10 +1313,47 @@ extern "C" REX_FUNC(sub_821CCA28)
     ApplyAspect(base);
   }
 
+  // Esc on the keyboard: pause once a match's HUD starts, back once a menu starts
+  {
+    // lookup2: mainhud, ballgamehuds, tvhud
+    constexpr uint32_t kMatchScripts[] = {0x2AF836AB, 0x8A7D60F5, 0x4D80CE71};
+    // lookup2: mainmenu, startscreen, charselect, posselect, results_match, results_mission, results_scoreattack, results_scoreattack_retry, challengemap, challengetourntree, tournament_ladder_offline, tournament_ladder_intro, tournament_lose_retry, tournament_special_match, tournresultsrankandscore, trophy_sequence, trophy_sequence_loser, trophy_sequence_special, onlinemenu, options_settings, awards, credits, nameentry, waitbeforespecialmatch, tournament_hiscores, challengeinit
+    constexpr uint32_t kMenuScripts[] = {0x9E754704, 0x1187AE2B, 0x4BC618A9, 0x2EC0986E, 0x1CC9C24A, 0x0BE84691, 0xB504251A, 0xF40FB5E4, 0x394ED102, 0x93F12D2E, 0x7BC4731A, 0x63C234A3, 0x5B3870AF, 0x5C03314A, 0x1F4FCE03, 0x96420D5C, 0x6552C391, 0x962D4940, 0xDD7C9C15, 0x10701090, 0xE33D3780, 0xCF7FABD5, 0x2EDF05C6, 0x104664B1, 0xC85542DA, 0xAA7B77F8};
+    const uint32_t h = ctx.r4.u32;
+
+    if (std::find(std::begin(kMatchScripts), std::end(kMatchScripts), h) != std::end(kMatchScripts))
+      sst::input::SetInMatch(true);
+    else if (std::find(std::begin(kMenuScripts), std::end(kMenuScripts), h) != std::end(kMenuScripts))
+      sst::input::SetInMatch(false);
+  }
+
   if (ctx.r4.u32 == pause::kScriptHash && REXCVAR_GET(sst_graphics_menu))
   {
     SetupGuest(base);
     RedirectPauseScript(base, ctx.r3.u32);
+  }
+
+  if (ctx.r4.u32 == quit::kScriptHash && REXCVAR_GET(sst_graphics_menu))
+    RedirectMainMenuScript(base, ctx.r3.u32);
+
+  // Boot intro: the port's skippable version of "splash"
+  if (ctx.r4.u32 == kSplashScript && REXCVAR_GET(sst_skip_intro))
+  {
+    SetupGuest(base);
+    static std::once_flag once;
+    std::call_once(once, [base]
+                   {
+      auto* memory = rex::system::kernel_memory();
+      const uint32_t block = memory ? memory->SystemHeapAlloc((uint32_t(sizeof(kIntroScript)) + 31) & ~31u) : 0;
+
+      if (block)
+      {
+        std::memcpy(GuestPtr(base, block), kIntroScript, sizeof(kIntroScript));
+        g_intro_script = block;
+      } });
+
+    if (g_intro_script && !Redirect(base, ctx.r3.u32, kSplashScript, g_intro_script))
+      REXLOG_WARN("[sst-menu] \"splash\" not found in the script directory");
   }
 
   if (ctx.r4.u32 == kVideoScript && REXCVAR_GET(sst_graphics_menu))
@@ -1170,7 +1371,82 @@ extern "C" REX_FUNC(sub_821CCA28)
 namespace
 {
   constexpr uint32_t kXboxPadGroup = 0x50034B87, kPs3PadGroup = 0x3A12D8E8;
-  bool g_controller_ps = false;
+  constexpr uint32_t kControllerLayer = 0xABB4502D; // lookup2("SETTINGS_CONTROLLER"): the page's layer, closed (4:3) by the script's Exit
+  bool g_controller_ps = false;   // the DualShock 3 diagram is shown (the two groups are swapped in the page's natives)
+  bool g_controller_open = false; // the page is up: the diagram follows the device in use
+  uint32_t g_scratch = 0;         // guest buffer for the direct native calls: +0 result (8), +8 values (8 x 4), +40 types (8)
+  // The page's last animation (4:10: object, from, to, flags) on the shown diagram, played on the other one when it takes over
+  struct PadAnim
+  {
+    uint32_t count = 0;
+    uint32_t values[8]{};
+    uint8_t types[8]{};
+  } g_pad_anim;
+
+  bool WantPs3Diagram()
+  {
+    return REXCVAR_GET(sst_controller_diagram) && sst::input::CurrentPromptStyle() == sst::input::PromptStyle::kPlayStation;
+  }
+
+  // Calls a scene native directly, as the dispatcher would (r3 result, r4 kept, r5 values, r6 types, r7 count) - not through the dispatcher, which pushes the result on the calling script's stack
+  void SceneCall(PPCContext &ctx, uint8_t *base, void (*native)(PPCContext &__restrict, uint8_t *), const uint32_t *values, const uint8_t *types, uint32_t count)
+  {
+    if (!g_scratch)
+    {
+      auto *memory = rex::system::kernel_memory();
+      g_scratch = memory ? memory->SystemHeapAlloc(64) : 0;
+
+      if (!g_scratch)
+        return;
+    }
+
+    count = std::min(count, 8u);
+    std::memset(GuestPtr(base, g_scratch), 0, 48);
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+      Store32(base, g_scratch + 8 + 4 * i, values[i]);
+      *GuestPtr(base, g_scratch + 40 + i) = types[i];
+    }
+
+    PPCContext c = ctx;
+    c.r3.u64 = g_scratch;
+    c.r5.u64 = g_scratch + 8;
+    c.r6.u64 = g_scratch + 40;
+    c.r7.u64 = count;
+    c.r8.u64 = ctx.r6.u64;
+    c.r9.u64 = ctx.r7.u64;
+    native(c, base);
+  }
+
+  void SceneShow(PPCContext &ctx, uint8_t *base, uint32_t object, bool show)
+  {
+    const uint8_t hash = 3;
+    SceneCall(ctx, base, show ? sub_82282BB8 : sub_82282C28, &object, &hash, 1);
+  }
+
+  // Shows the diagram for the device in use (keyboard: the Xbox pad's, drawn as a keyboard by the prompt textures)
+  void UpdateControllerDiagram(PPCContext &ctx, uint8_t *base, bool force)
+  {
+    const bool ps = WantPs3Diagram();
+
+    if (!force && ps == g_controller_ps)
+      return;
+
+    g_controller_ps = ps;
+    const uint32_t shown = ps ? kPs3PadGroup : kXboxPadGroup;
+    SceneShow(ctx, base, shown, true);
+    SceneShow(ctx, base, ps ? kXboxPadGroup : kPs3PadGroup, false);
+
+    // (Live switch: the newly shown diagram plays the page's last animation, so it has the same layout)
+    if (!force && g_pad_anim.count)
+    {
+      PadAnim a = g_pad_anim;
+      a.values[0] = shown;
+      SceneCall(ctx, base, sub_82282AA0, a.values, a.types, a.count);
+    }
+    REXLOG_INFO("[sst-menu] controls page: {} diagram", ps ? "DualShock 3" : "Xbox 360 / keyboard");
+  }
 }
 
 // Script VM: call native r5 (group << 8 | index)
@@ -1184,6 +1460,10 @@ extern "C" REX_FUNC(sub_821DFBC0)
     return;
   }
 
+  // Controls page up: the diagram follows the device in use (checked at each native the page's frame calls)
+  if (g_controller_open)
+    UpdateControllerDiagram(ctx, base, false);
+
   if ((id >> 8) == 4 && ctx.r10.u32 >= 1 && ctx.r10.u32 <= 8 && ctx.r8.u32)
   {
     const uint32_t values = ctx.r8.u32;
@@ -1191,18 +1471,59 @@ extern "C" REX_FUNC(sub_821DFBC0)
 
     if ((id & 0xFF) == 5 && first == kPs3PadGroup)
     {
-      // The page opens: pick the diagram, show it (it may still be hidden from an earlier visit), hide the other
-      g_controller_ps = REXCVAR_GET(sst_controller_diagram) && sst::input::CurrentPromptStyle() == sst::input::PromptStyle::kPlayStation;
-      const uint32_t shown = g_controller_ps ? kPs3PadGroup : kXboxPadGroup, hidden = g_controller_ps ? kXboxPadGroup : kPs3PadGroup;
-      PPCContext saved = ctx;
-      Store32(base, values, shown);
-      ctx.r5.u64 = (ctx.r5.u64 & ~0xFFFFull) | 0x404; // 4:4 show
-      __imp__sub_821DFBC0(ctx, base);
-      ctx = saved;
-      Store32(base, values, hidden);
-      REXLOG_INFO("[sst-menu] controller page: {} diagram", g_controller_ps ? "DualShock 3" : "Xbox 360");
+      // The page opens (its script hides the DualShock 3 diagram): show the one for the device in use (it may still be hidden from an earlier visit), hide the other. The script's own call stays (on the hidden one) for its result
+      g_controller_open = true;
+      g_pad_anim = {};
+      UpdateControllerDiagram(ctx, base, true);
+      Store32(base, values, g_controller_ps ? kXboxPadGroup : kPs3PadGroup);
       __imp__sub_821DFBC0(ctx, base);
       return;
+    }
+
+    // The page closes
+    if ((id & 0xFF) == 3 && first == kControllerLayer)
+    {
+      g_controller_open = false;
+      g_controller_ps = false;
+    }
+
+    // An animation on the diagram (layout type): remembered for a live switch (hashes and numbers only)
+    if (g_controller_open && (id & 0xFF) == 10 && (first == kXboxPadGroup || first == kPs3PadGroup))
+    {
+      PadAnim a;
+      a.count = ctx.r10.u32;
+
+      for (uint32_t i = 0; i < a.count; ++i)
+      {
+        a.values[i] = Load32(base, values + 4 * i);
+        a.types[i] = *GuestPtr(base, ctx.r9.u32 + i);
+
+        if (a.types[i] > 3)
+          a.count = 0;
+      }
+
+      g_pad_anim = a;
+    }
+
+    // QUIT row: closing OPTIONS plays (dd6c3c34 -> f5fda6b0) on the rows below it, which for this row is the wrong distance; it goes back from where OPTIONS put it instead
+    if ((id & 0xFF) == 19 && first == quit::kRow && ctx.r10.u32 >= 3)
+    {
+      const uint32_t from = Load32(base, values + 4), to = Load32(base, values + 8);
+
+      if (to == quit::kOptionsTo)
+      {
+        g_quit_row_pushed = true;
+      }
+      else if (g_quit_row_pushed && from == 0xDD6C3C34u && to == 0xF5FDA6B0u)
+      {
+        Store32(base, values + 4, quit::kOptionsTo);
+        Store32(base, values + 8, quit::kOptionsFrom);
+        g_quit_row_pushed = false;
+      }
+      else
+      {
+        g_quit_row_pushed = false;
+      }
     }
 
     if (g_controller_ps)
@@ -1227,6 +1548,45 @@ extern "C" REX_FUNC(sub_82594AD0)
     std::lock_guard lock(g_mutex);
 
     if (const uint32_t id = TextId(base, ctx.r4.u32 == kDialogBody ? kDialogBodyText : kDialogTitleText))
+    {
+      ctx.r3.u32 = g_guest.texts[id];
+      return;
+    }
+  }
+
+  // QUIT dialog: the game's "RETURN TO ONLINE MENU" YES / NO message with other texts
+  if (g_quit_dialog && (ctx.r4.u32 == quit::kMessageBody || ctx.r4.u32 == quit::kMessageTitle))
+  {
+    SetupGuest(base);
+    std::lock_guard lock(g_mutex);
+
+    if (auto it = g_guest.texts.find(ctx.r4.u32 == quit::kMessageBody ? kTextQuitQuestion : quit::kTextLabel); it != g_guest.texts.end())
+    {
+      ctx.r3.u32 = it->second;
+      return;
+    }
+  }
+
+  // Settings: CONTROLLER -> CONTROLS
+  if (std::find(std::begin(kTextController), std::end(kTextController), ctx.r4.u32) != std::end(kTextController) && REXCVAR_GET(sst_controls_name))
+  {
+    SetupGuest(base);
+    std::lock_guard lock(g_mutex);
+
+    if (const uint32_t id = TextId(base, "CONTROLS"))
+    {
+      ctx.r3.u32 = g_guest.texts[id];
+      return;
+    }
+  }
+
+  // Main menu: Xbox LIVE -> ONLINE PLAY (the item and the header above the menu)
+  if ((ctx.r4.u32 == 0xA1B21EABu || ctx.r4.u32 == 0x2815E3A5u) && REXCVAR_GET(sst_online_play_name))
+  {
+    SetupGuest(base);
+    std::lock_guard lock(g_mutex);
+
+    if (const uint32_t id = TextId(base, "ONLINE PLAY"))
     {
       ctx.r3.u32 = g_guest.texts[id];
       return;
@@ -1335,7 +1695,7 @@ int SceneFileKind(uint8_t *base, uint32_t path, std::string &name)
     const bool dat = name.ends_with(".dat"), rel = name.ends_with(".rel");
     const std::string as_dat = rel ? name.substr(0, name.size() - 4) + ".dat" : name;
 
-    if ((dat || rel) && WideLayoutFor(as_dat) && widen::WantsWideLayout(as_dat))
+    if ((dat || rel) && ((WideLayoutFor(as_dat) && widen::WantsWideLayout(as_dat)) || (as_dat == "sstmainmenu.dat" && REXCVAR_GET(sst_quit_item))))
       kind = dat ? 3 : 4;
   }
 
@@ -1367,8 +1727,8 @@ extern "C" REX_FUNC(sub_825946B0)
 // SumoTool: set up a scene from its DAT and REL, r4 = {DAT pointer, size}, r5 = {REL pointer, size} (pointer in the high word). The PauseMenu scene is patched here, both files together, or not at all
 extern "C" REX_FUNC(sub_82595158)
 {
-  const uint32_t dat = uint32_t(ctx.r4.u64 >> 32), dat_size = uint32_t(ctx.r4.u64);
-  const uint32_t rel = uint32_t(ctx.r5.u64 >> 32), rel_size = uint32_t(ctx.r5.u64);
+  const uint32_t dat = uint32_t(ctx.r4.u64 >> 32), rel = uint32_t(ctx.r5.u64 >> 32);
+  uint32_t dat_size = uint32_t(ctx.r4.u64), rel_size = uint32_t(ctx.r5.u64);
   uint32_t dat_room = 0, rel_room = 0, dat_size_at = 0, rel_size_at = 0;
   std::string hud_name, dat_name;
   {
@@ -1414,6 +1774,40 @@ extern "C" REX_FUNC(sub_82595158)
   }
 
   const bool rooms = dat_room && rel_room && dat_size <= dat_room && rel_size <= rel_room;
+  // Main menu: the QUIT row (before the wide layout, which then covers it too)
+  if (rooms && dat_name == "sstmainmenu.dat" && REXCVAR_GET(sst_quit_item))
+  {
+    widen::MainMenuRow row{quit::kParent, quit::kRow, quit::kHighlight, quit::kFirstChild, quit::kTextLabel, quit::kBarLabel, quit::kOptionsFrom, quit::kOptionsTo, 0.0f};
+    widen::Bytes new_dat, new_rel;
+    std::string error;
+
+    if (widen::AddMainMenuRow(GuestPtr(base, dat), dat_size, GuestPtr(base, rel), rel_size, row, new_dat, new_rel, error) && new_dat.size() <= dat_room && new_rel.size() <= rel_room)
+    {
+      std::memcpy(GuestPtr(base, dat), new_dat.data(), new_dat.size());
+      std::memcpy(GuestPtr(base, rel), new_rel.data(), new_rel.size());
+
+      if (Load32(base, dat_size_at) == dat_size)
+        Store32(base, dat_size_at, uint32_t(new_dat.size()));
+
+      if (Load32(base, rel_size_at) == rel_size)
+        Store32(base, rel_size_at, uint32_t(new_rel.size()));
+
+      dat_size = uint32_t(new_dat.size());
+      rel_size = uint32_t(new_rel.size());
+      ctx.r4.u64 = (uint64_t(dat) << 32) | dat_size;
+      ctx.r5.u64 = (uint64_t(rel) << 32) | rel_size;
+      std::lock_guard lock(g_pause_mutex);
+      g_quit_scene_failed = false;
+      REXLOG_INFO("[sst-menu] sstmainmenu.dat: QUIT row added");
+    }
+    else
+    {
+      std::lock_guard lock(g_pause_mutex);
+      g_quit_scene_failed = true;
+      REXLOG_ERROR("[sst-menu] sstmainmenu.dat: QUIT row not added ({})", error.empty() ? std::string("too large") : error);
+    }
+  }
+
   // Ultrawide: the scene's wide layout
   if (rooms && dat_name != "pausemenu.dat" && WideLayoutFor(dat_name) && widen::WantsWideLayout(dat_name))
   {

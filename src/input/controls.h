@@ -28,6 +28,15 @@ namespace sst::input
   // Kind of device last used (any button, trigger or stick past the dead zone); before any input, the first pad connected (keyboard when there is none). --sst_prompts forces a style
   PromptStyle CurrentPromptStyle();
 
+  // Count of Start / A presses on any device (keyboard: Enter, K, Esc), for skipping the intro
+  uint32_t ConfirmPresses();
+
+  // Esc on the keyboard: pause (START) in a match, back (B) in menus, QUIT on the main menu's category list
+  void SetInMatch(bool in_match);       // from the front-end's script starts (HUD scripts: match; menu scripts: not)
+  void MainMenuFrame(bool category_list); // every main menu frame: on its category list or not
+  void SetDialogUp(bool up);            // the port's YES / NO box (Esc = B = NO)
+  uint32_t EscapePresses();              // Esc presses counted on the main menu's category list
+
   // Bumped whenever CurrentPromptStyle() changes
   uint32_t PromptStyleGeneration();
 
