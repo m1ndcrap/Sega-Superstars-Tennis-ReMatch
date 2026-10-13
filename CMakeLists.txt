@@ -19,6 +19,7 @@ set(SSTREMATCH_SOURCES
     src/menu/restart.cpp
     src/menu/hud_anchor.cpp
     src/menu/scene_widen.cpp
+    src/movie/movie_debug.cpp
 )
 if(WIN32)
     # Native D3D12 renderer (active with --gpu_plugin=sst)

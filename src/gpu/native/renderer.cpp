@@ -8,6 +8,7 @@
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
@@ -115,6 +116,10 @@ REXCVAR_DEFINE_INT32(sst_native_capture_frame, 0, "SST",
 REXCVAR_DEFINE_BOOL(sst_native_ui_fit, true, "SST",
                     "Native renderer: keep 2D UI in a 16:9 box at other aspect ratios (debug: "
                     "false stretches it, to tell UI fitting apart from game-side issues)");
+
+REXCVAR_DEFINE_BOOL(sst_native_wide_targets, true, "SST",
+                    "Native renderer: render targets take the display's shape (2520x1080 at "
+                    "21:9 and 1080p) instead of a 16:9 image stretched to it");
 
 REXCVAR_DEFINE_BOOL(sst_native_scissor, true, "SST",
                     "Native renderer: apply the game's scissor rectangle (menus clip panels "
@@ -235,6 +240,70 @@ namespace sst::native
     D3D12_RECT Scaled(const D3D12_RECT &r, float s)
     {
       return {Px(r.left, s), Px(r.top, s), Px(r.right, s), Px(r.bottom, s)};
+    }
+
+    D3D12_RECT Scaled(const D3D12_RECT &r, Scale2 s)
+    {
+      return {Px(r.left, s.x), Px(r.top, s.y), Px(r.right, s.x), Px(r.bottom, s.y)};
+    }
+
+    // Vertex declaration bound at dev+0x2E2C (CreateVertexDeclaration sub_82300CA8 / its init sub_82300BB8): +0x18 element count, elements from +0x34, 12 bytes each {u16 stream, u16 offset, u32 D3DDECLTYPE (bits 0-5: the vertex format), u8 method, u8 usage, u8 usage index}. Vertex declaration bound at dev+0x2E2C (CreateVertexDeclaration sub_82300CA8, filled by sub_82300BB8): +0x18 element count, elements from +0x34, 12 bytes each {u16 stream, u16 offset, u32 D3DDECLTYPE (bits 0-5: the vertex format), u8 method, u8 usage, u8 usage index}; the list ends at stream 0xFF
+    struct DeclInput
+    {
+      uint32_t stream = 0, offset = 0, format = 0, components = 0, stride = 0;
+    };
+
+    bool FindDeclInput(const uint8_t *base, uint32_t dev, uint32_t usage, uint32_t usage_index, DeclInput &out)
+    {
+      const uint32_t decl = be32(base, dev + 0x2E2C);
+
+      if (!PlausibleAddress(decl))
+        return false;
+
+      const uint32_t count = be32(base, decl + 0x18);
+
+      if (count == 0 || count > 32)
+        return false;
+
+      bool found = false;
+      struct E
+      {
+        uint32_t stream, offset, format;
+      };
+
+      E all[32];
+
+      for (uint32_t i = 0; i < count; ++i)
+      {
+        const uint32_t e = decl + 0x34 + 12 * i;
+        const uint32_t w0 = be32(base, e), type = be32(base, e + 4), w2 = be32(base, e + 8);
+        all[i] = {w0 >> 16, w0 & 0xFFFF, type & 0x3F};
+
+        if (all[i].stream == 0xFF)
+          return false;
+
+        const uint32_t u = (w2 >> 16) & 0xFF, ui = (w2 >> 8) & 0xFF;
+
+        if (!found && u == usage && ui == usage_index && DeclFormatSize(all[i].format))
+        {
+          out.stream = all[i].stream;
+          out.offset = all[i].offset;
+          out.format = all[i].format;
+          out.components = uint32_t(rex::graphics::xenos::GetVertexFormatComponentCount(rex::graphics::xenos::VertexFormat(all[i].format)));
+          found = true;
+        }
+      }
+
+      if (!found)
+        return false;
+      // The vertex size: the end of the stream's furthest element
+      out.stride = 0;
+
+      for (uint32_t i = 0; i < count; ++i)
+        if (all[i].stream == out.stream)
+          out.stride = std::max(out.stride, all[i].offset + DeclFormatSize(all[i].format));
+
+      return out.stride > 0 && out.stride < 256;
     }
 
     // Device register mirror (see native-renderer-d3d-layer.md): packed blocks
@@ -694,7 +763,7 @@ namespace sst::native
         return false;
 
       device_->CreateRenderTargetView(outputs_[i].Get(), nullptr, Rtv(i));
-      output_scale_[i] = 1.0f;
+      output_scale_[i] = Scale2{};
     }
 
     for (uint32_t i = 0; i < kSlots; ++i)
@@ -1234,7 +1303,7 @@ namespace sst::native
     rt.state = state;
   }
 
-  Renderer::HostRT *Renderer::GetHostRT(const uint8_t *base, uint32_t surface, bool depth, float scale, uint32_t samples, uint32_t min_width, uint32_t min_height)
+  Renderer::HostRT *Renderer::GetHostRT(const uint8_t *base, uint32_t surface, bool depth, Scale2 scale, uint32_t samples, uint32_t min_width, uint32_t min_height)
   {
     if (!PlausibleAddress(surface))
       return nullptr;
@@ -1272,8 +1341,8 @@ namespace sst::native
     rt.format = depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : ColorTargetFormat(guest_format);
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = PxU(rt.width, scale);
-    desc.Height = PxU(rt.height, scale);
+    desc.Width = PxU(rt.width, scale.x);
+    desc.Height = PxU(rt.height, scale.y);
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = depth ? DXGI_FORMAT_R32G8X24_TYPELESS : rt.format;
@@ -1331,7 +1400,7 @@ namespace sst::native
     srv_handle.ptr += size_t(rt.srv) * srv_size_;
     device_->CreateShaderResourceView(rt.resource.Get(), &sd, srv_handle);
     ++stats_.host_rts;
-    REXLOG_INFO("[sst-native] render target {:08X}: {}x{} {}{} (surface {}x{}, guest format {}){}", surface, rt.width, rt.height, depth ? "depth D32S8" : "colour", samples > 1 ? fmt::format(" {}x MSAA", samples) : std::string(), sw, sh, guest_format, scale != 1.0f ? fmt::format(", host {}x{}", PxU(rt.width, scale), PxU(rt.height, scale)) : std::string());
+    REXLOG_INFO("[sst-native] render target {:08X}: {}x{} {}{} (surface {}x{}, guest format {}){}", surface, rt.width, rt.height, depth ? "depth D32S8" : "colour", samples > 1 ? fmt::format(" {}x MSAA", samples) : std::string(), sw, sh, guest_format, scale != Scale2{} ? fmt::format(", host {}x{}", PxU(rt.width, scale.x), PxU(rt.height, scale.y)) : std::string());
     bound_targets_ = 0;
     HostRT &stored = map[surface] = std::move(rt);
 
@@ -1351,7 +1420,7 @@ namespace sst::native
     return &stored;
   }
 
-  Renderer::ResolvedTexture *Renderer::GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, float scale)
+  Renderer::ResolvedTexture *Renderer::GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, Scale2 scale)
   {
     const DXGI_FORMAT format = ResolveTextureFormat(guest_format);
     auto it = resolved_.find(page);
@@ -1377,8 +1446,8 @@ namespace sst::native
     t->scale = scale;
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = PxU(width, scale);
-    desc.Height = PxU(height, scale);
+    desc.Width = PxU(width, scale.x);
+    desc.Height = PxU(height, scale.y);
     desc.DepthOrArraySize = UINT16(slices);
     desc.MipLevels = 1;
     desc.Format = format;
@@ -2113,11 +2182,11 @@ namespace sst::native
     const bool swap_rb = !depth && (dst_swizzle & 7) == 2 && ((dst_swizzle >> 6) & 7) == 0;
     dst->rb_swapped = swap_rb;
     {
-      const float k = src.scale;
+      const Scale2 k = src.scale;
       const D3D12_RECT host = Scaled(dr, k);
       // FXAA (VIDEO > ANTI-ALIASING): applied to the 3D scene's colour copies, before the UI is drawn over the final image
       const bool fxaa = fxaa_ && !depth && !stacked && src.samples == 1 && scene_surfaces_.count(surface);
-      Blit(src.srv, Px(sx0 + (dr.left - px), k), Px(sy0 + (dr.top - py), k), RtRtv(dst->rtvs[slice]), dst->format, host, swap_rb, 0.0f, src.samples | (depth ? 0x100u : 0u), fxaa);
+      Blit(src.srv, Px(sx0 + (dr.left - px), k.x), Px(sy0 + (dr.top - py), k.y), RtRtv(dst->rtvs[slice]), dst->format, host, swap_rb, 0.0f, src.samples | (depth ? 0x100u : 0u), fxaa);
     }
     {
       auto b = Transition(dst->resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
@@ -2461,8 +2530,27 @@ namespace sst::native
     return std::abs(aspect) <= int64_t(width_) * 2;
   }
 
+  // VIDEO > ASPECT RATIO: 0 4:3, 1 16:9, 2 16:10, 3 21:9, 4 32:9. 4:3 is the game's own 4:3 mode (a 1280x1024 frame, from startup); 4:3 picked later waits for a restart (16:9 until then)
+  int Renderer::DisplayAspect() const
+  {
+    int aspect = std::clamp(REXCVAR_GET(sst_aspect), 0, 4);
+
+    if (height_ > 720)
+      aspect = 0;
+    else if (aspect == 0)
+      aspect = 1;
+
+    return aspect;
+  }
+  // How much wider than the game's frame the display is (1 in its 4:3 mode)
+  float Renderer::DisplayStretch() const
+  {
+    static constexpr float kAspects[5] = {4.0f / 3.0f, 16.0f / 9.0f, 1.6f, 21.0f / 9.0f, 32.0f / 9.0f};
+    return height_ > 720 ? 1.0f : kAspects[DisplayAspect()] / (16.0f / 9.0f);
+  }
+
   // Which scale a guest surface (and the depth buffer drawn with it) renders at: the shadow map's, the 3D scene's (surfaces drawn with MSAA, RB_SURFACE_INFO bits 16-17), or the UI / final image's. Remembered per surface so a target keeps its size between passes
-  float Renderer::SurfaceScale(const uint8_t *base, uint32_t dev, uint32_t color, uint32_t depth)
+  Scale2 Renderer::SurfaceScale(const uint8_t *base, uint32_t dev, uint32_t color, uint32_t depth)
   {
     if ((color && shadow_surfaces_.count(color)) || (depth && shadow_surfaces_.count(depth)))
       return shadow_scale_;
@@ -2489,8 +2577,8 @@ namespace sst::native
   {
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = PxU(width_, scale_);
-    desc.Height = PxU(height_, scale_);
+    desc.Width = PxU(width_, scale_.x);
+    desc.Height = PxU(height_, scale_.y);
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
@@ -2539,15 +2627,20 @@ namespace sst::native
   {
     {
       // VIDEO page settings. Targets / resolve textures are re-made at a new size on their next use. Internal resolution in lines of the game's frame (720, or 1024 in its 4:3 mode)
-      const float scale = float(std::clamp(REXCVAR_GET(sst_resolution), 240, 4320)) / float(height_);
-      const float scene = scale * float(std::clamp(REXCVAR_GET(sst_render_scale), 25, 100)) / 100.0f;
+      const float lines = float(std::clamp(REXCVAR_GET(sst_resolution), 240, 4320)) / float(height_);
+      const float scene_lines = lines * float(std::clamp(REXCVAR_GET(sst_render_scale), 25, 100)) / 100.0f;
+      // Width follows the display's shape (RESOLUTION is the number of lines): at 21:9, 1080p renders 2520x1080 rather than a 1920x1080 image stretched. (Narrower displays - 16:10 - keep the full 16:9 width.)
+      const float wide = REXCVAR_GET(sst_native_wide_targets) ? std::max(DisplayStretch(), 1.0f) : 1.0f;
+      const Scale2 scale{lines * wide, lines}, scene{scene_lines * wide, scene_lines};
       // The stacked shadow map is a 3D texture: D3D12 caps those at 2048 texels
       const int shadow = std::clamp(REXCVAR_GET(sst_shadow_size), 0, 2048);
-      const float shadow_scale = shadow ? float(shadow) / 1024.0f : 0.125f;
+      const float shadow_k = shadow ? float(shadow) / 1024.0f : 0.125f;
+      const Scale2 shadow_scale{shadow_k, shadow_k};
+      wide_x_ = wide;
 
       if (scale != scale_ || scene != scene_scale_ || shadow_scale != shadow_scale_ || shadows_off_ != (shadow == 0))
       {
-        REXLOG_INFO("[sst-native] internal resolution {}x{}, 3D {}x{}, shadow map {}", PxU(width_, scale), PxU(height_, scale), PxU(width_, scene), PxU(height_, scene), shadow ? fmt::format("{0}x{0}", shadow) : "off");
+        REXLOG_INFO("[sst-native] internal resolution {}x{}, 3D {}x{}, shadow map {}", PxU(width_, scale.x), PxU(height_, scale.y), PxU(width_, scene.x), PxU(height_, scene.y), shadow ? fmt::format("{0}x{0}", shadow) : "off");
         scale_ = scale;
         scene_scale_ = scene;
         shadow_scale_ = shadow_scale;
@@ -2568,17 +2661,8 @@ namespace sst::native
       msaa_ = msaa;
       fxaa_ = aa_type == 1;
       bloom_off_ = !REXCVAR_GET(sst_bloom);
-      // Aspect ratio: 4:3, 16:9, 16:10, 21:9, 32:9
-      static constexpr float kAspects[5] = {4.0f / 3.0f, 16.0f / 9.0f, 1.6f, 21.0f / 9.0f, 32.0f / 9.0f};
-      // 4:3: the game's own 4:3 mode (a 1280x1024 frame, from startup) needs no fit; 4:3 picked later waits for a restart (16:9 until then)
-      int aspect = std::clamp(REXCVAR_GET(sst_aspect), 0, 4);
-
-      if (height_ > 720)
-        aspect = 0;
-      else if (aspect == 0)
-        aspect = 1;
-
-      const float s = height_ > 720 ? 1.0f : kAspects[aspect] / (16.0f / 9.0f); // display stretch
+      const int aspect = DisplayAspect();
+      const float s = DisplayStretch();
       ui_fit_x_ = s > 1.0f ? 1.0f / s : 1.0f;
       // Narrower than 16:9 (16:10): the 2D layer is stretched to the full height (11 % taller) instead of fitted into a 16:9 box. The rules that decide what to fit are built around the screen's width (full-width layers stay full), so a vertical fit split bars from their texts and left uncovered bands above and below the menus; stretched, everything stays together
       ui_fit_y_ = 1.0f;
@@ -2856,8 +2940,8 @@ namespace sst::native
         ++acquire_repeats_;
         pinned_ = acquired_slot_;
         *slot = uint32_t(acquired_slot_);
-        *width = PxU(width_, output_scale_[acquired_slot_]);
-        *height = PxU(height_, output_scale_[acquired_slot_]);
+        *width = PxU(width_, output_scale_[acquired_slot_].x);
+        *height = PxU(height_, output_scale_[acquired_slot_].y);
         return outputs_[acquired_slot_].Get();
       }
     }
@@ -2911,8 +2995,8 @@ namespace sst::native
 
     pinned_ = pick;
     *slot = uint32_t(pick);
-    *width = PxU(width_, output_scale_[pick]);
-    *height = PxU(height_, output_scale_[pick]);
+    *width = PxU(width_, output_scale_[pick].x);
+    *height = PxU(height_, output_scale_[pick].y);
     return outputs_[pick].Get();
   }
 
@@ -2967,7 +3051,7 @@ namespace sst::native
       }
 
       const uint32_t clear_ds = be32(base, device + kDevDepth);
-      const float rs = SurfaceScale(base, device, rt0, clear_ds);
+      const Scale2 rs = SurfaceScale(base, device, rt0, clear_ds);
       const uint32_t samples = (scene_surfaces_.count(rt0) || scene_surfaces_.count(clear_ds)) ? msaa_ : 1;
       auto area = [&](const HostRT &rt)
       {
@@ -4432,6 +4516,8 @@ namespace sst::native
       }
 
       const uint32_t l0 = match->l0, l1 = match->l1, l2 = match->l2;
+      // Left unpatched by D3D (format 0, stride 0): laid out from the declaration below
+      const bool unpatched = (l0 & 0x1F) == 0 && ((l1 >> 16) & 0x3F) == 0 && (l2 & 0xFF) == 0;
       // Its full fetch (a mini fetch uses the last full fetch before it)
       const LiveFetch *full = nullptr;
 
@@ -4446,7 +4532,7 @@ namespace sst::native
             full = &lf;
       }
 
-      if (full)
+      if (full && !unpatched)
       {
         const uint32_t slot = ((full->l0 >> 20) & 0x1F) * 3 + ((full->l0 >> 25) & 3);
         full_stream = stream_index(slot, (full->l2 & 0xFF) * 4);
@@ -4463,8 +4549,37 @@ namespace sst::native
       HostElement h;
       h.stream = -1;
       h.fetch_addr = 0;
+      // A vertex fetch D3D left unpatched (format 0, stride 0 - as compiled): seen on the movie quad (CriMovieControl, DrawVerticesUP). Its layout comes from the bound vertex declaration instead
+      bool from_decl = false;
 
-      if ((l0 & 0x1F) == 0)
+      if (unpatched)
+      {
+        DeclInput di;
+
+        if (FindDeclInput(base, dev, in.usage, in.usage_index, di))
+        {
+          FetchElement &f = h.fetch;
+          f.format = di.format;
+          f.offset = di.offset;
+          f.out = !UsageIsUint(in.usage) ? FetchElement::Out::kFloat : in.usage == 2 ? FetchElement::Out::kUint
+                                                                                     : FetchElement::Out::kFloatBits;
+          // Input component c reads element component c; missing ones read 0 (w: 1), as D3D's own patch fills them
+          for (int c = 0; c < 4; ++c)
+            f.sel[c] = uint8_t(c < int(di.components) ? c : c == 3 ? 5
+                                                                   : 4);
+
+          h.stream = stream_index(95 - di.stream, di.stride);
+          h.fetch_addr = in.address;
+          from_decl = h.stream >= 0;
+
+          if (from_decl && LogOnce(0xCD00000000000000ull ^ vs_entry->hash ^ in.address))
+            REXLOG_INFO("[sst-native] VS {:016X} {}{}: unpatched vertex fetch, layout from the "
+                        "vertex declaration (format {}, offset {}, stride {}, stream {})",
+                        vs_entry->hash, d.SemanticName, d.SemanticIndex, di.format, di.offset, di.stride, di.stream);
+        }
+      }
+
+      if (!from_decl && (l0 & 0x1F) == 0)
       {                                               // vertex fetch opcode
         const int32_t offset = int32_t(l2 << 1) >> 9; // bits 8-30, signed, in dwords
         FetchElement &f = h.fetch;
@@ -4584,7 +4699,7 @@ namespace sst::native
       }
 
       const uint32_t ds_surface = be32(base, dev + kDevDepth);
-      const float rs = SurfaceScale(base, dev, rt0, ds_surface);
+      const Scale2 rs = SurfaceScale(base, dev, rt0, ds_surface);
 
       if (shadows_off_ && rs == shadow_scale_ && (shadow_surfaces_.count(rt0) || shadow_surfaces_.count(ds_surface)))
       {
@@ -4628,7 +4743,7 @@ namespace sst::native
     }
 
     const bool has_depth = rt_mode ? depth_rt != nullptr : be32(base, dev + kDevDepth) != 0;
-    const float draw_scale = color_rt ? color_rt->scale : output_scale_[target_];
+    const Scale2 draw_scale = color_rt ? color_rt->scale : output_scale_[target_];
 
     uint32_t ps_spec = 0;
     const bool alpha_test = (colorcontrol >> 3) & 1;
@@ -5562,10 +5677,9 @@ namespace sst::native
       std::memcpy(&sc[66], &half_x, 4);
       std::memcpy(&sc[67], &half_y, 4);
       // Internal resolution: host pixels = guest pixels x the target's scale. Pixel shaders that read their screen position get it in guest pixels
-      const float inv_scale = 1.0f / draw_scale;
-      std::memcpy(&sc[70], &inv_scale, 4);
-
-      // g_ClipTransform (c18): clip-space scale + offset, applied in the vertex shader so UI moved outside the 16:9 box (ultrawide HUD) is not clipped. UI draws: positions scaled by ui_fit_ about the frame's centre.
+      const float inv_scale[2] = {1.0f / draw_scale.x, 1.0f / draw_scale.y};
+      std::memcpy(&sc[70], inv_scale, 8); // g_InvRenderScale (c17.zw)
+      // g_ClipTransform (c18): clip-space scale + offset, applied in the vertex shader so UI moved outside the 16:9 box (ultrawide HUD) is not clipped. UI draws: positions scaled by ui_fit_ about the frame's centre
       {
         float ct[4] = {1.0f, 1.0f, 0.0f, 0.0f};
 
@@ -5585,10 +5699,10 @@ namespace sst::native
         std::memcpy(&sc[72], ct, sizeof(ct));
       }
 
-      vp.TopLeftX *= draw_scale;
-      vp.TopLeftY *= draw_scale;
-      vp.Width *= draw_scale;
-      vp.Height *= draw_scale;
+      vp.TopLeftX *= draw_scale.x;
+      vp.TopLeftY *= draw_scale.y;
+      vp.Width *= draw_scale.x;
+      vp.Height *= draw_scale.y;
       cap_half_x = half_x;
       cap_half_y = half_y;
       std::memcpy(shared.cpu, sc, sizeof(sc));

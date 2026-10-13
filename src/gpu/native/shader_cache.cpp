@@ -24,7 +24,7 @@ namespace sst::native
   namespace
   {
     // Bump when the translator, the prelude or the compile options change so stale cache files are rebuilt
-    constexpr uint32_t kCacheVersion = 6;       // 2: D3D9 multiply rule; 3: vertex index in r0.x; 4: 3D fetch offsets; 5: screen position / render scale; 6: clip transform (c18)
+    constexpr uint32_t kCacheVersion = 7;       // 2: D3D9 multiply rule; 3: vertex index in r0.x; 4: 3D fetch offsets; 5: screen position / render scale; 6: clip transform (c18); 7: render scale per axis (c17.zw)
     constexpr uint32_t kFileMagic = 0x53535453; // "SSTS"
 
     struct FileHeader
@@ -54,7 +54,6 @@ namespace sst::native
 
       return false;
     }
-
   }
 
   struct Worker
@@ -118,7 +117,6 @@ namespace sst::native
   ShaderEntry *ShaderCache::Register(const uint8_t *container, uint32_t size)
   {
     const uint64_t hash = XXH3_64bits(container, size);
-
     {
       std::shared_lock lock(entries_mutex_);
       auto it = entries_.find(hash);
@@ -144,7 +142,6 @@ namespace sst::native
     }
 
     ShaderEntry *raw;
-
     {
       std::unique_lock lock(entries_mutex_);
       auto [it, fresh] = entries_.try_emplace(hash, std::move(entry));
@@ -199,7 +196,6 @@ namespace sst::native
 
     ShaderVariant *variant;
     bool queue = false;
-
     {
       std::lock_guard lock(entry->variants_mutex);
       auto &slot = entry->variants[spec];
@@ -216,7 +212,6 @@ namespace sst::native
     if (queue)
     {
       pending_.fetch_add(1);
-
       {
         std::lock_guard lock(queue_mutex_);
         queue_.push_back({entry, spec, variant});
@@ -249,7 +244,6 @@ namespace sst::native
     for (;;)
     {
       Job job;
-
       {
         std::unique_lock lock(queue_mutex_);
         queue_cv_.wait(lock, [this]
@@ -309,7 +303,6 @@ namespace sst::native
     // Translate
     const auto start = std::chrono::steady_clock::now();
     auto tr = sst::xenos::Translate(entry.container.data());
-
     auto fail = [&](const std::string &why, const std::string &source)
     {
       stats_.failed.fetch_add(1);
@@ -344,6 +337,7 @@ namespace sst::native
         L"-Qstrip_reflect",
         L"-Qstrip_debug",
     };
+
     DxcBuffer buffer = {source.data(), source.size(), DXC_CP_UTF8};
     ComPtr<IDxcResult> result;
     HRESULT status = E_FAIL;
@@ -380,7 +374,6 @@ namespace sst::native
       const FileHeader header = {kFileMagic, kCacheVersion, tr.spec_constants_mask, uint32_t(variant.dxil.size())};
       auto tmp = path;
       tmp += ".tmp";
-
       {
         std::ofstream out(tmp, std::ios::binary);
         out.write(reinterpret_cast<const char *>(&header), sizeof(header));
