@@ -1338,6 +1338,146 @@ namespace sst::menu::widen
     return true;
   }
 
+  bool AddSubTexture(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, uint32_t from, uint32_t to, float u0, float u1, float v0, float v1, Bytes &out_dat, Bytes &out_rel, std::string &error)
+  {
+    Scene s;
+
+    if (!Parse(dat, dat_size, s, error))
+      return false;
+
+    if (!s.ptex.count(from))
+      return error = fmt::format("texture {:08X} missing", from), false;
+
+    if (s.ptex.count(to) || s.used.count(to))
+      return error = "already added", false;
+
+    const Ptex &t = s.ptex.at(from);
+    const float tu0 = t.uv[0], tu1 = t.uv[2], tv0 = t.uv[1], tv1 = t.uv[5]; // top left, top right, bottom right
+    auto u = [&](float f)
+    {
+      return tu0 + (tu1 - tu0) * f;
+    };
+    auto v = [&](float f)
+    {
+      return tv0 + (tv1 - tv0) * f;
+    };
+    Ptex n = t;
+    n.uv[0] = n.uv[6] = u(u0);
+    n.uv[2] = n.uv[4] = u(u1);
+    n.uv[1] = n.uv[3] = v(v0);
+    n.uv[5] = n.uv[7] = v(v1);
+    s.ptex[to] = n;
+    s.used.insert(to);
+    std::vector<std::pair<uint32_t, std::vector<uint32_t>>> relocs;
+    Write(s, relocs);
+    Bytes new_rel;
+
+    if (!PatchRel(rel, rel_size, relocs, new_rel, error))
+      return false;
+
+    out_dat = WriteChunks(s.chunks);
+    out_rel = std::move(new_rel);
+    return true;
+  }
+
+  bool AddListCarets(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, const ListCarets &carets, Bytes &out_dat, Bytes &out_rel, std::string &error)
+  {
+    // GENERAL page (scene 6A94D0C1): row 0's group and its value arrows (left 01F961FE, right 91A8461D, mirrored), row 3's group and left arrow; a top-level row group of the page to list the carets with
+    constexpr uint32_t kRow0 = 0xE2906172, kLeft0 = 0x01F961FE, kRight0 = 0x91A8461D;
+    constexpr uint32_t kRow3 = 0x171A6630, kLeft3 = 0x7FD5AEAE;
+    constexpr uint32_t kPageRow = 0xDA2F6C3D;
+    Scene s;
+
+    if (!Parse(dat, dat_size, s, error))
+      return false;
+
+    for (uint32_t h : {kRow0, kLeft0, kRight0, kRow3, kLeft3, kPageRow})
+      if (!s.objects.count(h) || !s.tracks.count(h))
+        return error = fmt::format("object {:08X} missing", h), false;
+
+    if (s.used.count(carets.up) || s.used.count(carets.down))
+      return error = "already added", false;
+
+    Track &left0 = s.tracks[kLeft0];
+
+    if (left0.kind != 0 || !left0.count || s.tracks[kLeft3].kind != 0 || s.tracks[kRight0].kind != 0)
+      return error = "arrow keys", false;
+
+    // The arrows' resting place: their last key; positions are relative to the row groups (one key each)
+    auto last = [&](uint32_t h) -> uint8_t *
+    {
+      Track &t = s.tracks[h];
+      return t.Key(t.count - 1);
+    };
+    auto group_y = [&](uint32_t h)
+    {
+      return RdF(s.tracks[h].Key(0) + 0x10);
+    };
+    const float sx = RdF(last(kLeft0) + 0x14), sy = RdF(last(kLeft0) + 0x18);
+    const float bw = left0.w * sx, bh = left0.h * sy; // the arrow's box
+    // A sprite is scaled and turned about its pivot (blob +0x2C / +0x30: offset from the key's position); its centre is pivot + scale * (half size - pivot)
+    const float px = RdF(s.objects[kLeft0].blob.data() + 0x2C), py = RdF(s.objects[kLeft0].blob.data() + 0x30);
+    auto centre = [&](float key, float pivot, float size, float scale)
+    {
+      return key + pivot + scale * (size / 2 - pivot);
+    };
+    const float sx_right = RdF(last(kRight0) + 0x14);
+    const float x_left = centre(RdF(last(kLeft0) + 0xC), px, left0.w, sx), x_right = centre(RdF(last(kRight0) + 0xC), px, left0.w, sx_right);
+    const float y0 = centre(group_y(kRow0) + RdF(last(kLeft0) + 0x10), py, left0.h, sy), y3 = centre(group_y(kRow3) + RdF(last(kLeft3) + 0x10), py, left0.h, sy);
+    const float spacing = (y3 - y0) / 3;
+
+    if (!(bw > 0.005f && bw < 0.05f && bh > 0.005f && bh < 0.08f && spacing > 0.04f && spacing < 0.15f && x_right > x_left))
+      return error = fmt::format("layout (box {:.3f} x {:.3f}, spacing {:.3f})", bw, bh, spacing), false;
+
+    // Centred between the value arrows, half a row spacing above row 0 / below row 3 (left arrow + 90 degrees = up)
+    const float cx = (x_left + x_right) / 2;
+    const struct
+    {
+      uint32_t h;
+      float cy, rot;
+    } kCarets[] = {{carets.up, y0 - spacing * 0.55f, 1.5707964f}, {carets.down, y3 + spacing * 0.55f, -1.5707964f}};
+
+    for (const auto &c : kCarets)
+    {
+      Object o = s.objects[kLeft0];
+      o.order = s.next_order++;
+      Wr32(o.blob.data() + 8, c.h);
+      s.objects[c.h] = std::move(o);
+      s.used.insert(c.h);
+      Track t = left0;
+      t.order = s.next_order++;
+      Bytes key(last(kLeft0), last(kLeft0) + t.KeySize());
+      t.keys.clear();
+      t.count = 0;
+
+      for (auto [label, frame, alpha] : {std::tuple{carets.hide, 0u, 0x00u}, std::tuple{carets.show, 10u, 0xFFu}})
+      {
+        Wr32(key.data(), label);
+        Wr32(key.data() + 4, frame);
+        Wr32(key.data() + 8, carets.colour | alpha);
+        WrF(key.data() + 0xC, cx - px - sx * (left0.w / 2 - px));
+        WrF(key.data() + 0x10, c.cy - py - sy * (left0.h / 2 - py));
+        WrF(key.data() + 0x20, c.rot);
+        t.keys.insert(t.keys.end(), key.begin(), key.end());
+        ++t.count;
+      }
+
+      s.tracks[c.h] = std::move(t);
+      InsertAfter(s, kPageRow, c.h);
+    }
+
+    std::vector<std::pair<uint32_t, std::vector<uint32_t>>> relocs;
+    Write(s, relocs);
+    Bytes new_rel;
+
+    if (!PatchRel(rel, rel_size, relocs, new_rel, error))
+      return false;
+
+    out_dat = WriteChunks(s.chunks);
+    out_rel = std::move(new_rel);
+    return true;
+  }
+
   bool RoundTrip(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, Bytes &out_dat, Bytes &out_rel, std::string &error)
   {
     Scene s;

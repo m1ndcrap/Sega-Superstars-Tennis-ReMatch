@@ -115,6 +115,8 @@ namespace sst::menu
       kPageReturnScript = 21, // -> script to start on leaving
     };
     constexpr uint32_t kSettingsScript = 0x10701090;   // lookup2("options_settings")
+    // Settings page arrows (SSTMainMenu scene, widen::AddListCarets): objects and their keys
+    constexpr uint32_t kCaretUp = 0x53564301, kCaretDown = 0x53564302, kCaretHide = 0x53564310, kCaretShow = 0x53564311;
     constexpr uint32_t kControllerScript = 0x5ABCAE69; // lookup2("controller")
     constexpr uint32_t kTextVideoGame = 0x5458AA85;    // the game's own "VIDEO"
     constexpr uint32_t kSplashScript = 0x0ED21739; // lookup2("splash")
@@ -458,6 +460,62 @@ namespace sst::menu
       bool redraw = false, leave = false;
       int sound = kNoSound;
     } g_list;
+
+    // Scene animations (4:10 object, key, key) the dispatcher plays after a native returns (outside g_mutex)
+    struct Anim
+    {
+      uint32_t object, key; // key 0: show (4:4), 1: hide (4:5); else 4:10 to that key
+    };
+    constexpr uint32_t kAnimShow = 0, kAnimHide = 1;
+    std::atomic<bool> g_scroll_bar_on{false}; // the pause page's scroll bar is up (else it is kept hidden while the pause menu runs)
+    std::vector<Anim> g_anims;
+
+    // What the markers show (-1: not set on this page yet)
+    struct Markers
+    {
+      int up = -1, down = -1;  // Settings page: arrows above / below the four rows
+      int shown = -1, pos = -1; // pause page: scroll bar shown, thumb position
+    } g_markers;
+
+    static_assert(pause::kScrollCount == kRows - 1 && pause::kScrollVisible == kPauseVisible, "the pause page's scroll bar is built for its list");
+
+    // With g_mutex held, after the list moved
+    void UpdateListMarkers()
+    {
+      const ListState &l = g_list;
+      Markers &m = g_markers;
+
+      if (l.pause)
+      {
+        const int pos = std::clamp(l.top, 0, pause::kScrollCount - pause::kScrollVisible);
+
+        if (m.shown != 1)
+          g_anims.push_back({pause::kScrollGroup, kAnimShow}), m.shown = 1, g_scroll_bar_on = true;
+
+        if (pos != m.pos)
+          g_anims.push_back({pause::kScrollThumb, pause::kScrollPos + uint32_t(pos)}), m.pos = pos;
+
+        return;
+      }
+
+      const int up = l.top > 0, down = l.top + l.visible < l.Count();
+
+      if (up != m.up)
+        g_anims.push_back({kCaretUp, up ? kCaretShow : kCaretHide}), m.up = up;
+
+      if (down != m.down)
+        g_anims.push_back({kCaretDown, down ? kCaretShow : kCaretHide}), m.down = down;
+    }
+
+    void HideListMarkers()
+    {
+      if (g_list.pause)
+        g_anims.push_back({pause::kScrollGroup, kAnimHide}), g_scroll_bar_on = false;
+      else
+        g_anims.push_back({kCaretUp, kCaretHide}), g_anims.push_back({kCaretDown, kCaretHide});
+
+      g_markers = {};
+    }
 
     std::filesystem::path SettingsPath()
     {
@@ -1042,6 +1100,27 @@ namespace sst::menu
       default:
         REXLOG_WARN("[sst-menu] unknown native {:04X}", id);
         SetResult(base, out, 0, 0);
+        break;
+      }
+
+      // "More rows" markers: the Settings page's up / down arrows, the pause page's scroll bar
+      switch (id & 0xFF)
+      {
+      case kBegin:
+      case kPauseBegin:
+        g_markers = {};
+        break;
+
+      case kLabel:
+      case kPauseLabel:
+        UpdateListMarkers();
+        break;
+
+      case kEvent:
+      case kPauseEvent:
+        if (g_list.leave)
+          HideListMarkers();
+
         break;
       }
 
@@ -1664,6 +1743,25 @@ extern "C" REX_FUNC(sub_821DFBC0)
   if ((id >> 8) == kNativeGroup)
   {
     HandleNative(ctx, base, id);
+    // Scene animations the native asked for
+    std::vector<Anim> anims;
+    {
+      std::lock_guard lock(g_mutex);
+      anims.swap(g_anims);
+    }
+
+    for (const Anim &a : anims)
+    {
+      if (a.key == kAnimShow || a.key == kAnimHide)
+      {
+        SceneShow(ctx, base, a.object, a.key == kAnimShow);
+        continue;
+      }
+
+      const uint32_t v[4] = {a.object, a.key, a.key, 0};
+      const uint8_t t[4] = {3, 3, 3, 2};
+      SceneCall(ctx, base, sub_82282AA0, v, t, 4);
+    }
     return;
   }
 
@@ -1731,6 +1829,11 @@ extern "C" REX_FUNC(sub_821DFBC0)
           if (module && (module == orig || module == patched))
           {
             sst::input::PauseMenuFrame();
+
+            // The VIDEO page's scroll bar stays hidden on the rest of the pause menu
+            if (!g_scroll_bar_on.load())
+              SceneShow(ctx, base, pause::kScrollGroup, false);
+
             break;
           }
       }
@@ -1989,7 +2092,7 @@ int SceneFileKind(uint8_t *base, uint32_t path, std::string &name)
     const bool dat = name.ends_with(".dat"), rel = name.ends_with(".rel");
     const std::string as_dat = rel ? name.substr(0, name.size() - 4) + ".dat" : name;
 
-    if ((dat || rel) && ((WideLayoutFor(as_dat) && widen::WantsWideLayout(as_dat)) || (as_dat == "sstmainmenu.dat" && REXCVAR_GET(sst_quit_item))))
+    if ((dat || rel) && ((WideLayoutFor(as_dat) && widen::WantsWideLayout(as_dat)) || (as_dat == "sstmainmenu.dat" && (REXCVAR_GET(sst_quit_item) || REXCVAR_GET(sst_graphics_menu)))))
       kind = dat ? 3 : 4;
   }
 
@@ -2102,6 +2205,35 @@ extern "C" REX_FUNC(sub_82595158)
     }
   }
 
+  // Settings page: up / down arrows for the VIDEO / KEY BINDINGS lists (before the wide layout)
+  if (rooms && dat_name == "sstmainmenu.dat" && REXCVAR_GET(sst_graphics_menu))
+  {
+    widen::Bytes new_dat, new_rel;
+    std::string error;
+
+    if (widen::AddListCarets(GuestPtr(base, dat), dat_size, GuestPtr(base, rel), rel_size, {kCaretUp, kCaretDown, kCaretHide, kCaretShow, 0x183E8C00u}, new_dat, new_rel, error) && new_dat.size() <= dat_room && new_rel.size() <= rel_room)
+    {
+      std::memcpy(GuestPtr(base, dat), new_dat.data(), new_dat.size());
+      std::memcpy(GuestPtr(base, rel), new_rel.data(), new_rel.size());
+
+      if (Load32(base, dat_size_at) == dat_size)
+        Store32(base, dat_size_at, uint32_t(new_dat.size()));
+
+      if (Load32(base, rel_size_at) == rel_size)
+        Store32(base, rel_size_at, uint32_t(new_rel.size()));
+
+      dat_size = uint32_t(new_dat.size());
+      rel_size = uint32_t(new_rel.size());
+      ctx.r4.u64 = (uint64_t(dat) << 32) | dat_size;
+      ctx.r5.u64 = (uint64_t(rel) << 32) | rel_size;
+      REXLOG_INFO("[sst-menu] sstmainmenu.dat: list arrows added");
+    }
+    else
+    {
+      REXLOG_WARN("[sst-menu] sstmainmenu.dat: list arrows not added ({})", error.empty() ? std::string("too large") : error);
+    }
+  }
+
   // Ultrawide: the scene's wide layout
   if (rooms && dat_name != "pausemenu.dat" && WideLayoutFor(dat_name) && widen::WantsWideLayout(dat_name))
   {
@@ -2151,8 +2283,26 @@ extern "C" REX_FUNC(sub_82595158)
     std::vector<uint8_t> d(GuestPtr(base, dat), GuestPtr(base, dat) + dat_size);
     std::vector<uint8_t> r(GuestPtr(base, rel), GuestPtr(base, rel) + rel_size);
     std::string error;
+    // The scroll thumb's texture: the middle of the yellow 3P tag
+    uint32_t thumb_tex = pause::kYellowTag;
+    {
+      widen::Bytes sd, sr;
+
+      if (widen::AddSubTexture(d.data(), d.size(), r.data(), r.size(), pause::kYellowTag, pause::kThumbTex, 0.4f, 0.6f, 0.5f, 0.85f, sd, sr, error))
+      {
+        d = std::move(sd);
+        r = std::move(sr);
+        thumb_tex = pause::kThumbTex;
+      }
+      else
+      {
+        REXLOG_WARN("[sst-menu] pause scroll thumb texture: {}", error);
+        error.clear();
+      }
+    }
+
     pause::Relocs relocs;
-    auto new_dat = pause::PatchDat(d.data(), d.size(), relocs, error);
+    auto new_dat = pause::PatchDat(d.data(), d.size(), relocs, error, thumb_tex);
     std::optional<pause::Bytes> new_rel;
 
     if (new_dat)

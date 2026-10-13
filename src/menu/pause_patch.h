@@ -24,6 +24,14 @@ namespace sst::menu::pause
   constexpr uint32_t kTextBlank = 0x5354FF00;
   constexpr uint32_t kTextVideo = 0x5354FF01;
 
+  // The VIDEO page's scroll bar (added to the scene; the port hides kScrollGroup (4:5) except on the VIDEO page; the thumb's key kScrollPos + i is scroll position i)
+  constexpr uint32_t kScrollGroup = 0x53560040, kScrollTrack = 0x53560041, kScrollThumb = 0x53560042;
+  constexpr uint32_t kScrollHide = 0x53560048, kScrollShow = 0x53560049, kScrollPos = 0x53560050;
+  constexpr uint32_t kYellowTag = 0x2A3BDF69; // the yellow (3P) tag texture
+  constexpr uint32_t kThumbTex = 0x53560060;  // its middle (a bright yellow strip: the whole tag, squeezed thin, samples a blurred mip level)
+  constexpr int kScrollCount = 12;  // settings on the pause menu's VIDEO page (no ASPECT RATIO)
+  constexpr int kScrollVisible = 7; // rows shown
+
   // Natives the trampoline calls (group 0x53).
   constexpr uint32_t kNativeResult = 4;    // (k) -> see graphics_menu.cpp
   constexpr uint32_t kNativeEventHash = 5; // (input event hash)
@@ -40,7 +48,8 @@ namespace sst::menu::pause
     std::vector<std::pair<uint32_t, std::vector<uint32_t>>> chunks;
   };
 
-  std::optional<Bytes> PatchDat(const uint8_t *data, size_t size, Relocs &relocs, std::string &error);
+  // thumb_tex: the scroll thumb's texture (kThumbTex once widen::AddSubTexture made it; else the whole yellow tag)
+  std::optional<Bytes> PatchDat(const uint8_t *data, size_t size, Relocs &relocs, std::string &error, uint32_t thumb_tex = kYellowTag);
   std::optional<Bytes> PatchRel(const uint8_t *data, size_t size, const Relocs &relocs, std::string &error);
   std::optional<Bytes> PatchScript(const uint8_t *module, size_t size, std::string &error);
 

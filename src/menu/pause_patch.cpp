@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <tuple>
 
 namespace sst::menu::pause
 {
@@ -74,6 +75,10 @@ namespace sst::menu::pause
     constexpr uint32_t kNewRowChild = 0x53560010; // + 0..3, copies of RETRY's children
     constexpr uint32_t kSpareLabel = 0x53560020;  // + row
     constexpr uint32_t kSpareValue = 0x53560030;  // + row
+    // The VIDEO page's scroll bar (pause_patch.h)
+    constexpr uint32_t kPanelGroup = 0x26F7E3DD;  // the panel (edges, body); its colour fades the menu in and out
+    constexpr uint32_t kDarkStrip = 0x0944873D;   // the confirmation dialog's body: a dark blue strip (texture 85FE4B82)
+    constexpr uint32_t kPlayerTag = 0x400E36C4;   // the "1P" tag (texture 71F80B5B); the scroll thumb uses the 3P tag's texture
 
     struct Chunk
     {
@@ -178,7 +183,7 @@ namespace sst::menu::pause
   }
 
   // scene
-  std::optional<Bytes> PatchDat(const uint8_t *data, size_t size, Relocs &relocs, std::string &error)
+  std::optional<Bytes> PatchDat(const uint8_t *data, size_t size, Relocs &relocs, std::string &error, uint32_t thumb_tex)
   {
     auto chunks_opt = ReadChunks(data, size, error);
 
@@ -424,6 +429,95 @@ namespace sst::menu::pause
 
       for (uint32_t h : kDialogLower)
         move_y(h, dy);
+    }
+
+    // The VIDEO page's scroll bar: a group in the panel (hidden until the page shows it) with a dark track along the panel's right side, over the rows, and a yellow thumb with one key per scroll position
+    {
+      if (!need(kPanelGroup, Tag("GROP")) || !need(kDarkStrip, Tag("TXTR")) || !need(kPlayerTag, Tag("TXTR")) || objects.count(kScrollGroup))
+        return error = "scroll bar parts not found", std::nullopt;
+
+      auto first_key = [&](uint32_t h)
+      {
+        return Bytes(tracks[h].keys.begin(), tracks[h].keys.begin() + tracks[h].KeySize());
+      };
+      // In the panel group's space (the panel pieces are its children). The panel texture is 300 texels tall: the title bar and its white line take rows 0-42, the bottom bar's white line starts at row 286; the right edge piece's last 10 / 21 texels are its dark rim
+      const float body_y = RdF(tracks[kPanel[1]].keys.data() + 0x10), body_h = tracks[kPanel[1]].h;
+      const float edge_x = RdF(tracks[kPanel[2]].keys.data() + 0xC), edge_w = tracks[kPanel[2]].w;
+      const float y0 = body_y + body_h * 43.0f / 300.0f + 0.003f, height = body_h * (286.0f - 43.0f) / 300.0f - 0.006f;
+      const float width = 0.0065f, x = edge_x + edge_w - width; // flush with the panel's right edge
+      const float thumb_h = height * float(kScrollVisible) / float(kScrollCount);
+
+      if (!(height > 0.15f && height < 0.6f && x > 0.5f && x < 1.0f))
+        return error = "scroll bar layout", std::nullopt;
+
+      // Group: a copy of the panel group's header, no children of its own but the two pieces
+      Object g = objects[kPanelGroup];
+      g.order = order++;
+      Wr32(g.blob.data(), kScrollGroup);
+      g.children = {kScrollTrack, kScrollThumb};
+      objects[kScrollGroup] = std::move(g);
+      objects[kPanelGroup].children.push_back(kScrollGroup);
+      {
+        Track t = tracks[kPanelGroup];
+        Bytes key = first_key(kPanelGroup);
+        t.keys.clear();
+        t.count = 0;
+
+        for (auto [label, frame, alpha] : {std::tuple{kScrollHide, 0u, 0x00u}, std::tuple{kScrollShow, 10u, 0xFFu}})
+        {
+          Wr32(key.data(), label);
+          Wr32(key.data() + 4, frame);
+          Wr32(key.data() + 8, 0xFFFFFF00u | alpha | 0xFF); // (a group's colour does not reach its children: shown / hidden with 4:4 / 4:5)
+          WrF(key.data() + 0xC, 0.0f);
+          WrF(key.data() + 0x10, 0.0f);
+          WrF(key.data() + 0x14, 1.0f);
+          WrF(key.data() + 0x18, 1.0f);
+          t.keys.insert(t.keys.end(), key.begin(), key.end());
+          ++t.count;
+        }
+
+        tracks[kScrollGroup] = std::move(t);
+      }
+
+      // A TXTR copy with texture `tex` and keys {label, frame, y} at x, scaled to width x h
+      // layer: draw order (blob +0x28, lower is in front): the panel is 60, row arrows 48, the row cursor 32
+      auto piece = [&](uint32_t from, uint32_t to, uint32_t tex, uint32_t layer, float h, uint32_t colour, const std::vector<std::pair<uint32_t, float>> &keys)
+      {
+        clone(from, to);
+        Wr32(objects[to].blob.data(), tex);
+        Wr32(objects[to].blob.data() + 0x28, layer);
+        Track &t = tracks[to];
+        Bytes key = first_key(from);
+        t.keys.clear();
+        t.count = 0;
+        uint32_t frame = 0;
+
+        for (auto [label, y] : keys)
+        {
+          Wr32(key.data(), label);
+          Wr32(key.data() + 4, frame);
+          // The sprite is scaled about its pivot (blob +0x2C / +0x30, from the key's position): put the scaled box's top left at (x, y)
+          const float sx = width / t.w, sy = h / t.h;
+          const float px = RdF(objects[to].blob.data() + 0x2C), py = RdF(objects[to].blob.data() + 0x30);
+          Wr32(key.data() + 8, colour);
+          WrF(key.data() + 0xC, x - px * (1 - sx));
+          WrF(key.data() + 0x10, y - py * (1 - sy));
+          WrF(key.data() + 0x14, sx);
+          WrF(key.data() + 0x18, sy);
+          WrF(key.data() + 0x20, 0.0f);
+          t.keys.insert(t.keys.end(), key.begin(), key.end());
+          ++t.count;
+          frame += 10;
+        }
+      };
+
+      piece(kDarkStrip, kScrollTrack, Rd32(objects[kDarkStrip].blob.data()), 47, height, 0xFFFFFFC0u, {{kScrollHide, y0}});
+      std::vector<std::pair<uint32_t, float>> positions;
+
+      for (int i = 0; i <= kScrollCount - kScrollVisible; ++i)
+        positions.push_back({kScrollPos + uint32_t(i), y0 + (height - thumb_h) * float(i) / float(kScrollCount - kScrollVisible)});
+
+      piece(kPlayerTag, kScrollThumb, thumb_tex, 46, thumb_h, 0xFFFFFFFFu, positions); // in front of the track
     }
 
     // rebuild KFRM

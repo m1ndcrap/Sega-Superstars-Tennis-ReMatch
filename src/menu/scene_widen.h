@@ -36,6 +36,19 @@ namespace sst::menu::widen
 
   bool AddMainMenuRow(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, const MainMenuRow &row, Bytes &out_dat, Bytes &out_rel, std::string &error);
 
+  // Settings > VIDEO (the GENERAL page layout, four rows): small up / down arrows above the first and below the last row, the rows' value arrow turned 90 degrees. Hidden (key `hide`, alpha 0) until the page animates them to key `show`
+  struct ListCarets
+  {
+    uint32_t up, down;   // new objects
+    uint32_t hide, show; // their key labels
+    uint32_t colour;     // RGB in the top 24 bits (the arrow texture is white)
+  };
+
+  bool AddListCarets(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, const ListCarets &carets, Bytes &out_dat, Bytes &out_rel, std::string &error);
+
+  // A new texture entry `to`: the part [u0, u1] x [v0, v1] (fractions) of texture `from`
+  bool AddSubTexture(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, uint32_t from, uint32_t to, float u0, float u1, float v0, float v1, Bytes &out_dat, Bytes &out_rel, std::string &error);
+
   // Test: parses and rewrites the scene unchanged (should give the same bytes).
   bool RoundTrip(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, Bytes &out_dat, Bytes &out_rel, std::string &error);
 
