@@ -22,6 +22,8 @@ set(SSTREMATCH_SOURCES
     src/menu/main_menu_quit.cpp
     src/movie/movie_debug.cpp
     src/input/controls.cpp
+    src/input/cursor.cpp
+    src/input/lightbar.cpp
 )
 if(WIN32)
     # Native D3D12 renderer (active with --gpu_plugin=sst)
@@ -48,6 +50,11 @@ else()
     add_executable(sst_rematch ${SSTREMATCH_SOURCES})
 endif()
 target_include_directories(sst_rematch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# src/input/lightbar.cpp writes the PlayStation pads' HID output reports
+if(WIN32)
+    target_link_libraries(sst_rematch PRIVATE hid setupapi)
+endif()
+
 # src/input/controls.cpp builds the SDK's input drivers itself; sdl_input_driver.h includes SDL3's headers (types only - the driver code lives in rexruntime)
 if(TARGET SDL3::SDL3)
     target_include_directories(sst_rematch PRIVATE $<TARGET_PROPERTY:SDL3::SDL3,INTERFACE_INCLUDE_DIRECTORIES>)

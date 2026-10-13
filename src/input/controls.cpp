@@ -1,6 +1,8 @@
 // sst_rematch - keyboard controls and input device tracking
 
 #include "input/controls.h"
+#include "input/cursor.h"
+#include "input/lightbar.h"
 
 #include <rex/cvar.h>
 #include <rex/input/input_driver.h>
@@ -13,7 +15,10 @@
 #if defined(_WIN32)
 #include <rex/input/xinput/xinput_input_driver.h>
 #endif
+#include <fmt/format.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/ui/keybinds.h>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -28,6 +33,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <cctype>
 #include <mutex>
 #include <string>
@@ -37,6 +45,8 @@
 
 REXCVAR_DEFINE_STRING(sst_prompts, "auto", "SST",
                       "Button prompts: auto (the device used last), xbox, playstation or keyboard");
+REXCVAR_DEFINE_STRING(sst_keyboard_player, "shared", "SST",
+                      "Keyboard's player: shared (1P, together with the first pad), separate (1P on its own, pads 2P-4P; also set in CONTROLS > KEY BINDINGS) or 1-4");
 
 namespace sst::input
 {
@@ -96,10 +106,14 @@ namespace sst::input
     std::atomic<uint32_t> g_last_used{uint32_t(Kind::kNone)};
     std::atomic<uint32_t> g_generation{0};
     std::atomic<uint32_t> g_confirm_presses{0};
+    std::atomic<uint32_t> g_y_presses{0};
+    std::atomic<uint64_t> g_last_confirm_device{0}; // the device of the last Start / A press
+    std::atomic<int> g_primary_user{-1};            // the game's 1P: the player slot that pressed Start on the title screen (-1: not known yet, slot 0)
     std::atomic<uint32_t> g_style{uint32_t(PromptStyle::kKeyboard)};
 
     // Esc
     std::atomic<bool> g_in_match{false};
+    std::atomic<uint32_t> g_keyboard_player{0};
     std::atomic<int64_t> g_main_menu_beat{0}; // steady clock ms of the main menu's last frame on its category list (0: none)
     std::atomic<bool> g_dialog_up{false};
     std::atomic<uint32_t> g_escape_presses{0};
@@ -327,7 +341,13 @@ namespace sst::input
           uint16_t &held = buttons_[uint64_t(id)];
 
           if (buttons & ~held & (rex::input::X_INPUT_GAMEPAD_START | rex::input::X_INPUT_GAMEPAD_A))
+          {
             g_confirm_presses.fetch_add(1);
+            g_last_confirm_device = uint64_t(id);
+          }
+
+          if (buttons & ~held & rex::input::X_INPUT_GAMEPAD_Y)
+            g_y_presses.fetch_add(1);
 
           held = buttons;
 
@@ -355,10 +375,132 @@ namespace sst::input
 
     private:
       std::unique_ptr<rex::input::InputDriver> inner_;
-      std::unordered_map<uint64_t, Kind> kinds_;  // this driver's devices (guarded by g_mutex)
-      std::unordered_map<uint64_t, bool> active_; // last state per device: pressed (guarded by g_mutex)
+      std::unordered_map<uint64_t, Kind> kinds_;       // this driver's devices (guarded by g_mutex)
+      std::unordered_map<uint64_t, bool> active_;      // last state per device: pressed (guarded by g_mutex)
       std::unordered_map<uint64_t, uint16_t> buttons_; // last buttons per device (guarded by g_mutex)
     };
+
+    // Players. SHARED (default): the keyboard plays as 1P together with the first pad (one player, either device), pad N is player N. SEPARATE (CONTROLS > KEY BINDINGS, for keyboard + pad multiplayer): the keyboard is 1P on its own, the pads are 2P-4P. --sst_keyboard_player=1-4 puts the keyboard on a fixed player (pads keep theirs)
+    class PlayerAssignment final : public rex::input::DeviceAssignment
+    {
+    public:
+      void OnDevicesChanged(const std::vector<DeviceInfo> &devices) override
+      {
+        std::lock_guard lock(mutex_);
+        devices_ = devices;
+        Assign();
+      }
+
+      void DevicesForUser(uint32_t user_index, std::vector<DeviceId> &out) const override
+      {
+        std::lock_guard lock(mutex_);
+        out.clear();
+
+        if (user_index < rex::input::kMaxGuestUsers)
+          out = users_[user_index];
+      }
+
+      // The keyboard setting changed
+      void Reassign()
+      {
+        std::lock_guard lock(mutex_);
+        Assign();
+      }
+
+    private:
+      void Assign()
+      {
+        for (auto &u : users_)
+          u.clear();
+
+        const std::string mode = Lower(REXCVAR_GET(sst_keyboard_player));
+        const bool separate = mode == "separate";
+        const int fixed = mode.size() == 1 && mode[0] >= '1' && mode[0] <= '4' ? mode[0] - '1' : -1;
+        std::vector<LightbarPad> pads;
+
+        for (const DeviceInfo &d : devices_)
+        {
+          if (!d.synthetic)
+          {
+            const uint32_t user = std::min<uint32_t>(d.ordinal + (separate ? 1 : 0), rex::input::kMaxGuestUsers - 1);
+            users_[user].push_back(d.id);
+            pads.push_back({d.guid, user, user});
+            continue;
+          }
+
+          if (d.name != "Keyboard and Mouse")
+          {
+            users_[0].push_back(d.id); // the NOP stand-in
+            continue;
+          }
+
+          const uint32_t user = fixed >= 0 ? uint32_t(fixed) : 0;
+          users_[user].push_back(d.id);
+          g_keyboard_player = user;
+        }
+
+        std::string desc;
+
+        for (uint32_t u = 0; u < rex::input::kMaxGuestUsers; ++u)
+          for (const DeviceInfo &d : devices_)
+            if (std::find(users_[u].begin(), users_[u].end(), d.id) != users_[u].end() && d.name != "None")
+              desc += fmt::format("{}{}P {}", desc.empty() ? "" : ", ", u + 1, d.name);
+
+        if (desc != last_)
+        {
+          last_ = desc;
+          REXLOG_INFO("[sst-input] players: {}", desc.empty() ? "none" : desc);
+        }
+
+        // Lightbars show the game's player numbers: the slot that started the game (title screen) is 1P, the other slots with a device follow in order
+        std::vector<uint32_t> order;
+        const int primary = g_primary_user.load();
+
+        if (primary >= 0 && primary < int(rex::input::kMaxGuestUsers) && UsedLocked(uint32_t(primary)))
+          order.push_back(uint32_t(primary));
+
+        for (uint32_t u = 0; u < rex::input::kMaxGuestUsers; ++u)
+          if (UsedLocked(u) && std::find(order.begin(), order.end(), u) == order.end())
+            order.push_back(u);
+
+        for (LightbarPad &p : pads)
+          p.number = uint32_t(std::find(order.begin(), order.end(), p.slot) - order.begin());
+
+        SetLightbars(pads);
+      }
+
+      bool UsedLocked(uint32_t u) const
+      {
+        for (DeviceId id : users_[u])
+          for (const DeviceInfo &d : devices_)
+            if (d.id == id && d.name != "None")
+              return true;
+
+        return false;
+      }
+
+    public:
+      // The player slot a device plays on (-1: none)
+      int UserOf(uint64_t id) const
+      {
+        std::lock_guard lock(mutex_);
+
+        for (uint32_t u = 0; u < rex::input::kMaxGuestUsers; ++u)
+          for (DeviceId d : users_[u])
+            if (uint64_t(d) == id)
+              return int(u);
+
+        return -1;
+      }
+
+    private:
+      mutable std::mutex mutex_;
+      std::vector<DeviceInfo> devices_;
+      std::vector<DeviceId> users_[rex::input::kMaxGuestUsers];
+      std::string last_;
+    };
+
+    PlayerAssignment *g_assignment = nullptr;
 
     void Add(rex::input::InputSystem &system, std::unique_ptr<rex::input::InputDriver> driver)
     {
@@ -367,11 +509,490 @@ namespace sst::input
     }
   }
 
+  // ---- key bindings (CONTROLS > KEY BINDINGS) ----
+  namespace
+  {
+    struct KeyAction
+    {
+      const char *cvar;
+      const char *label; // the page's label font: A-Z, 0-4, '-', ':', '/'
+    };
+
+    constexpr KeyAction kKeyActions[] = {
+        {"keybind_lstick_up", "MOVE UP"},
+        {"keybind_lstick_down", "MOVE DOWN"},
+        {"keybind_lstick_left", "MOVE LEFT"},
+        {"keybind_lstick_right", "MOVE RIGHT"},
+        {"keybind_a", "A BUTTON"},
+        {"keybind_b", "B BUTTON"},
+        {"keybind_x", "X BUTTON"},
+        {"keybind_y", "Y BUTTON"},
+        {"keybind_left_shoulder", "LEFT BUMPER"},
+        {"keybind_right_shoulder", "RIGHT BUMPER"},
+        {"keybind_left_trigger", "LEFT TRIGGER"},
+        {"keybind_right_trigger", "RIGHT TRIGGER"},
+        {"keybind_back", "BACK BUTTON"},
+        {"keybind_start", "START BUTTON"},
+        {"keybind_dpad_up", "D-PAD UP"},
+        {"keybind_dpad_down", "D-PAD DOWN"},
+        {"keybind_dpad_left", "D-PAD LEFT"},
+        {"keybind_dpad_right", "D-PAD RIGHT"},
+    };
+    constexpr int kKeyActionCount = int(std::size(kKeyActions));
+
+    // Keys that can be bound (names as the SDK's key parser knows them; Esc cancels, bare modifiers never fire in the SDK's keyboard driver)
+    constexpr const char *kBindableKeys[] = {
+        "A",
+        "B",
+        "C",
+        "D",
+        "E",
+        "F",
+        "G",
+        "H",
+        "I",
+        "J",
+        "K",
+        "L",
+        "M",
+        "N",
+        "O",
+        "P",
+        "Q",
+        "R",
+        "S",
+        "T",
+        "U",
+        "V",
+        "W",
+        "X",
+        "Y",
+        "Z",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "Return",
+        "Space",
+        "Tab",
+        "Backspace",
+        "Delete",
+        "Insert",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "Left",
+        "Right",
+        "Up",
+        "Down",
+        "Backtick",
+        "Minus",
+        "Plus",
+        "Comma",
+        "Period",
+        "Semicolon",
+        "Slash",
+        "Backslash",
+        "LBracket",
+        "RBracket",
+        "Quote",
+        "Numpad0",
+        "Numpad1",
+        "Numpad2",
+        "Numpad3",
+        "Numpad4",
+        "Numpad5",
+        "Numpad6",
+        "Numpad7",
+        "Numpad8",
+        "Numpad9",
+        "NumpadPlus",
+        "NumpadMinus",
+        "NumpadStar",
+        "NumpadSlash",
+        "CapsLock",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+    };
+
+    std::filesystem::path KeysPath()
+    {
+      return rex::filesystem::GetExecutableFolder() / "sst_keys.ini";
+    }
+
+    const char *DefaultFor(const std::string &name)
+    {
+      for (const auto &[n, v] : kDefaults)
+        if (name == n)
+          return v;
+
+      return "";
+    }
+
+    std::map<std::string, std::string> LoadKeys()
+    {
+      std::map<std::string, std::string> out;
+      std::ifstream f(KeysPath());
+      std::string line;
+
+      while (std::getline(f, line))
+      {
+        const size_t eq = line.find('=');
+
+        if (eq == std::string::npos || (line.compare(0, 8, "keybind_") != 0 && line.compare(0, 15, "keyboard_player") != 0))
+          continue;
+
+        auto trim = [](std::string v)
+        {
+          while (!v.empty() && std::isspace((unsigned char)v.back()))
+            v.pop_back();
+
+          size_t i = 0;
+
+          while (i < v.size() && std::isspace((unsigned char)v[i]))
+            ++i;
+
+          return v.substr(i);
+        };
+        out[trim(line.substr(0, eq))] = trim(line.substr(eq + 1));
+      }
+
+      return out;
+    }
+
+    void SaveKeys()
+    {
+      std::ofstream f(KeysPath(), std::ios::trunc);
+      f << "# SST ReMatch keyboard bindings (CONTROLS > KEY BINDINGS). Delete this file to go back to the defaults.\n";
+
+      f << "keyboard_player=" << REXCVAR_GET(sst_keyboard_player) << "\n";
+
+      for (const KeyAction &a : kKeyActions)
+        f << a.cvar << "=" << rex::cvar::Query<std::string>(a.cvar) << "\n";
+    }
+
+    std::vector<std::string> SplitKeys(const std::string &v)
+    {
+      std::vector<std::string> out;
+      std::stringstream ss(v);
+      std::string k;
+
+      while (std::getline(ss, k, ','))
+        if (!k.empty())
+          out.push_back(k);
+
+      return out;
+    }
+
+    std::string JoinKeys(const std::vector<std::string> &keys)
+    {
+      std::string out;
+
+      for (const std::string &k : keys)
+        out += (out.empty() ? "" : ",") + k;
+
+      return out;
+    }
+
+    // "PageUp" -> "PAGE UP", "Numpad0" -> "NUMPAD 0", "Return" -> "ENTER"
+    std::string KeyDisplay(const std::string &key)
+    {
+      static const std::pair<const char *, const char *> kNames[] = {{"Return", "ENTER"}, {"LBracket", "LEFT BRACKET"}, {"RBracket", "RIGHT BRACKET"}, {"NumpadStar", "NUMPAD STAR"}, {"Backspace", "BACKSPACE"}, {"CapsLock", "CAPS LOCK"}};
+
+      for (auto [n, d] : kNames)
+        if (key == n)
+          return d;
+
+      std::string out;
+
+      for (size_t i = 0; i < key.size(); ++i)
+      {
+        const char c = key[i];
+
+        if (i && ((std::isupper((unsigned char)c) && std::islower((unsigned char)key[i - 1])) || (std::isdigit((unsigned char)c) && std::isalpha((unsigned char)key[i - 1]))) && key != "+")
+          out += ' ';
+
+        out += char(std::toupper((unsigned char)c));
+      }
+
+      return out;
+    }
+
+    enum class Capture : uint8_t
+    {
+      kIdle,
+      kWaitRelease, // the key that chose the row is still down
+      kWaitPress,
+      kHoldRelease, // the new key is still down (the menu ignores it)
+    };
+
+    std::mutex g_keys_mutex;
+    Capture g_capture = Capture::kIdle;
+    int g_capture_action = -1;
+
+    bool Focused()
+    {
+#if defined(_WIN32)
+      HWND fg = GetForegroundWindow();
+      DWORD pid = 0;
+      return fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+#else
+      return false;
+#endif
+    }
+
+    bool KeyDown(uint32_t vk)
+    {
+#if defined(_WIN32)
+      return (GetAsyncKeyState(int(vk)) & 0x8000) != 0;
+#else
+      (void)vk;
+      return false;
+#endif
+    }
+
+    bool AnyKeyDown()
+    {
+      if (!Focused())
+        return false;
+
+      for (uint32_t vk = 0x08; vk <= 0xFE; ++vk)
+        if (KeyDown(vk))
+          return true;
+
+      return false;
+    }
+
+    void Bind(int action, const std::string &key)
+    {
+      const KeyAction &a = kKeyActions[action];
+      const std::vector<std::string> old = SplitKeys(rex::cvar::Query<std::string>(a.cvar));
+      // The key leaves any other action; one left without keys takes this action's old key
+      for (int j = 0; j < kKeyActionCount; ++j)
+      {
+        if (j == action)
+          continue;
+
+        std::vector<std::string> keys = SplitKeys(rex::cvar::Query<std::string>(kKeyActions[j].cvar));
+        const size_t before = keys.size();
+        std::erase(keys, key);
+
+        if (keys.size() == before)
+          continue;
+
+        if (keys.empty() && !old.empty() && old[0] != key)
+          keys.push_back(old[0]);
+
+        rex::cvar::SetFlagByName(kKeyActions[j].cvar, JoinKeys(keys));
+        REXLOG_INFO("[sst-input] {} -> {}", kKeyActions[j].cvar, JoinKeys(keys));
+      }
+
+      rex::cvar::SetFlagByName(a.cvar, key);
+      REXLOG_INFO("[sst-input] {} -> {}", a.cvar, key);
+      SaveKeys();
+    }
+  }
+
+  // Rows: KEYBOARD PLAYER, the actions (Y resets them)
+  int KeyBindingCount()
+  {
+    return kKeyActionCount + 1;
+  }
+
+  const char *KeyBindingLabel(int row)
+  {
+    const int i = row - 1;
+    return row == 0 ? "KEYBOARD PLAYER" : i >= 0 && i < kKeyActionCount ? kKeyActions[i].label
+                                                                        : " ";
+  }
+
+  bool KeyBindingToggle(int row)
+  {
+    if (row != 0)
+      return false;
+
+    const bool separate = Lower(REXCVAR_GET(sst_keyboard_player)) != "separate";
+    rex::cvar::SetFlagByName("sst_keyboard_player", separate ? "separate" : "shared");
+    REXLOG_INFO("[sst-input] keyboard player: {}", separate ? "separate (keyboard 1P, pads 2P-4P)" : "shared with 1P");
+
+    if (g_assignment)
+      g_assignment->Reassign();
+
+    SaveKeys();
+    return true;
+  }
+
+  std::string KeyBindingValue(int row)
+  {
+    if (row == 0)
+    {
+      const std::string mode = Lower(REXCVAR_GET(sst_keyboard_player));
+      return mode == "separate" ? "SEPARATE" : mode.size() == 1 && mode[0] >= '1' && mode[0] <= '4' ? mode + "P"
+                                                                                                    : "SHARED WITH 1P";
+    }
+
+    const int i = row - 1;
+
+    if (i < 0 || i >= kKeyActionCount)
+      return " ";
+
+    {
+      std::lock_guard lock(g_keys_mutex);
+
+      if (g_capture_action == i && (g_capture == Capture::kWaitRelease || g_capture == Capture::kWaitPress))
+        return "PRESS A KEY";
+    }
+
+    const std::vector<std::string> keys = SplitKeys(rex::cvar::Query<std::string>(kKeyActions[i].cvar));
+
+    if (keys.empty())
+      return "-";
+
+    std::string out;
+
+    for (size_t k = 0; k < keys.size() && k < 2; ++k)
+      out += (k ? " / " : "") + KeyDisplay(keys[k]);
+
+    return out;
+  }
+
+  void BeginKeyCapture(int row)
+  {
+    std::lock_guard lock(g_keys_mutex);
+    const int i = row - 1;
+
+    if (i < 0 || i >= kKeyActionCount)
+      return;
+
+    g_capture = Capture::kWaitRelease;
+    g_capture_action = i;
+  }
+
+  bool KeyCaptureActive()
+  {
+    std::lock_guard lock(g_keys_mutex);
+    return g_capture != Capture::kIdle;
+  }
+
+  int PollKeyCapture()
+  {
+    std::lock_guard lock(g_keys_mutex);
+
+    switch (g_capture)
+    {
+    case Capture::kIdle:
+      return 0;
+
+    case Capture::kWaitRelease:
+      if (!AnyKeyDown())
+        g_capture = Capture::kWaitPress;
+
+      return 0;
+
+    case Capture::kWaitPress:
+    {
+      if (!Focused())
+        return 0;
+
+      if (KeyDown(0x1B)) // Esc: keep the binding
+      {
+        g_capture = Capture::kHoldRelease;
+        REXLOG_INFO("[sst-input] key binding cancelled");
+        return 2;
+      }
+
+      for (const char *name : kBindableKeys)
+      {
+        const uint32_t vk = uint32_t(rex::ui::ParseVirtualKey(name));
+
+        if (vk && KeyDown(vk))
+        {
+          Bind(g_capture_action, name);
+          g_capture = Capture::kHoldRelease;
+          return 1;
+        }
+      }
+
+      return 0;
+    }
+
+    case Capture::kHoldRelease:
+      if (!AnyKeyDown())
+        g_capture = Capture::kIdle, g_capture_action = -1;
+
+      return 0;
+    }
+
+    return 0;
+  }
+
+  void ResetKeyBindings()
+  {
+    for (const KeyAction &a : kKeyActions)
+      rex::cvar::SetFlagByName(a.cvar, DefaultFor(a.cvar));
+
+    SaveKeys();
+    REXLOG_INFO("[sst-input] key bindings reset to the defaults");
+  }
+
+  bool InMatch()
+  {
+    return g_in_match.load();
+  }
+
+  void MarkGameStarted()
+  {
+    const int user = g_assignment ? g_assignment->UserOf(g_last_confirm_device.load()) : -1;
+
+    if (user >= 0 && g_primary_user.exchange(user) != user)
+    {
+      REXLOG_INFO("[sst-input] the game was started from player slot {}: it is 1P", user + 1);
+
+      if (g_assignment)
+        g_assignment->Reassign();
+    }
+  }
+
+  uint32_t YPresses()
+  {
+    return g_y_presses.load(std::memory_order_relaxed);
+  }
+
   void ApplyDefaults()
   {
+    const auto saved = LoadKeys();
+
+    if (auto it = saved.find("keyboard_player"); it != saved.end() && !rex::cvar::HasNonDefaultValue("sst_keyboard_player"))
+      rex::cvar::SetFlagByName("sst_keyboard_player", it->second);
+
     for (const auto &[name, value] : kDefaults)
       if (!rex::cvar::HasNonDefaultValue(name))
-        rex::cvar::SetFlagByName(name, value);
+      {
+        const auto it = saved.find(name);
+        rex::cvar::SetFlagByName(name, it != saved.end() ? it->second.c_str() : value);
+      }
+
+    if (!saved.empty())
+      REXLOG_INFO("[sst-input] key bindings from {} ({} keys)", KeysPath().filename().string(), saved.size());
+
+    StartCursorHider();
 
     REXLOG_INFO("[sst-input] keyboard {}: move W A S D, shots J K L O (X A B Y), superstar I / Space, "
                 "partner Q / E, back U, start Enter, Esc pause / back / quit, D-pad arrows",
@@ -398,7 +1019,9 @@ namespace sst::input
     }
 
     system->AddDriver(std::make_unique<rex::input::nop::NopInputDriver>(nullptr, tool_mode ? 0 : 1));
-    system->SetDeviceAssignment(std::make_unique<rex::input::SlotAssignment>());
+    auto assignment = std::make_unique<PlayerAssignment>();
+    g_assignment = assignment.get();
+    system->SetDeviceAssignment(std::move(assignment));
     {
       std::lock_guard lock(g_mutex);
       Update();

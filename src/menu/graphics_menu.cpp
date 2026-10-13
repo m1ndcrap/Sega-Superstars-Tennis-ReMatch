@@ -108,7 +108,15 @@ namespace sst::menu
       kQuitDialogEnd = quit::kNativeDialogEnd,
       kQuit = quit::kNativeQuit,
       kQuitEscape = quit::kNativeEscape,
+      // The page script's list-agnostic hooks (tools/gen_graphics_script.py): VIDEO or KEY BINDINGS
+      kPageTitle = 18,        // -> title text id
+      kPageFrame = 19,        // every frame -> 1: redraw
+      kPageReturnCursor = 20, // -> Settings list cursor + 1 to leave behind
+      kPageReturnScript = 21, // -> script to start on leaving
     };
+    constexpr uint32_t kSettingsScript = 0x10701090;   // lookup2("options_settings")
+    constexpr uint32_t kControllerScript = 0x5ABCAE69; // lookup2("controller")
+    constexpr uint32_t kTextVideoGame = 0x5458AA85;    // the game's own "VIDEO"
     constexpr uint32_t kSplashScript = 0x0ED21739; // lookup2("splash")
 
     static_assert(pause::kNativeResult == kResult);
@@ -419,6 +427,10 @@ namespace sst::menu
     // QUIT: its dialog is up (texts swapped); the row is pushed down by OPTIONS' sub-items
     bool g_quit_dialog = false;
     bool g_quit_row_pushed = false;
+    // CONTROLS > KEY BINDINGS: the next VIDEO page start is the key list (set when Y leaves the CONTROLS page)
+    bool g_keys_page_next = false;
+    uint32_t g_keys_y_seen = 0; // sst::input::YPresses() handled on the KEY BINDINGS page
+    bool g_open_keys = false; // Y was pressed on the CONTROLS page: its exit (to the Settings list) opens KEY BINDINGS instead
     uint32_t g_escape_seen = 0; // sst::input::EscapePresses() at the main menu's last frame
     bool g_quit_scene_failed = false;
     std::unordered_map<uint32_t, uint32_t> g_quit_modules; // original mainmenu module -> patched copy (0: failed)
@@ -438,8 +450,9 @@ namespace sst::menu
       int visible = kVisible; // rows on screen
       bool pause = false;     // in-match page: no ASPECT RATIO (cameras are set up per match)
       bool dialog = false;    // this event: show the restart dialog (4:3 switched)
-      int Count() const { return pause ? kRows - 1 : kRows; }
-      int Row(int i) const { return pause && i >= kAspect ? i + 1 : i; } // list index -> Row
+      bool keys = false;      // CONTROLS > KEY BINDINGS instead of VIDEO
+      int Count() const { return keys ? sst::input::KeyBindingCount() : pause ? kRows - 1 : kRows; }
+      int Row(int i) const { return !keys && pause && i >= kAspect ? i + 1 : i; } // list index -> Row
       int cursor = 0, top = 0;
       int old_visible = 0, new_visible = 0;
       bool redraw = false, leave = false;
@@ -645,6 +658,49 @@ namespace sst::menu
       l.sound = kNoSound;
       l.dialog = false;
 
+      // KEY BINDINGS: select waits for a key (or resets them all), back leaves; nothing while a key is being taken
+      if (l.keys)
+      {
+        if (sst::input::KeyCaptureActive())
+        {
+          l.new_visible = l.old_visible;
+          return;
+        }
+
+        if ((event == kSelect || event == kLeft || event == kRight) && sst::input::KeyBindingToggle(l.cursor))
+        {
+          l.redraw = true;
+          l.sound = kMove;
+          l.new_visible = l.old_visible;
+          return;
+        }
+
+        if (event == kSelect)
+        {
+          sst::input::BeginKeyCapture(l.cursor);
+
+          l.redraw = true;
+          l.sound = kSelectSound;
+          l.new_visible = l.old_visible;
+          return;
+        }
+
+        if (event == kBack)
+        {
+          REXLOG_INFO("[sst-menu] KEY BINDINGS closed");
+          l.leave = true;
+          l.sound = kBackSound;
+          l.new_visible = l.old_visible;
+          return;
+        }
+
+        if (event == kLeft || event == kRight)
+        {
+          l.new_visible = l.old_visible;
+          return;
+        }
+      }
+
       switch (event)
       {
       case kLeft:
@@ -758,8 +814,56 @@ namespace sst::menu
         g_list = {};
         g_list.visible = (id & 0xFF) == kPauseBegin ? kPauseVisible : kVisible;
         g_list.pause = (id & 0xFF) == kPauseBegin;
-        REXLOG_INFO("[sst-menu] VIDEO page opened{}: {}", (id & 0xFF) == kPauseBegin ? " (pause menu)" : "", Describe(g_current));
+        g_list.keys = (id & 0xFF) == kBegin && g_keys_page_next;
+        g_keys_page_next = false;
+        g_keys_y_seen = sst::input::YPresses();
+
+        if (g_list.keys)
+          REXLOG_INFO("[sst-menu] KEY BINDINGS page opened");
+        else
+          REXLOG_INFO("[sst-menu] VIDEO page opened{}: {}", (id & 0xFF) == kPauseBegin ? " (pause menu)" : "", Describe(g_current));
+
         SetResult(base, out, 0, 2);
+        break;
+
+      case kPageTitle:
+        SetResult(base, out, g_list.keys ? TextId(base, "KEY BINDINGS") : kTextVideoGame, 3);
+        break;
+
+      case kPageFrame:
+      {
+        bool redraw = false;
+
+        if (g_list.keys)
+        {
+          // A key was taken (or the wait cancelled); Y (not while a key is being taken) resets the bindings
+          const int captured = sst::input::PollKeyCapture();
+          const uint32_t y = sst::input::YPresses();
+          redraw = captured != 0;
+
+          if (captured || sst::input::KeyCaptureActive())
+          {
+            g_keys_y_seen = y;
+          }
+          else if (y != g_keys_y_seen)
+          {
+            g_keys_y_seen = y;
+            sst::input::ResetKeyBindings();
+            redraw = true;
+          }
+        }
+
+        SetResult(base, out, redraw ? 1 : 0, 2);
+        break;
+      }
+
+      case kPageReturnCursor:
+        SetResult(base, out, g_list.keys ? 3 : 5, 2); // CONTROLS / VIDEO item of the Settings list, + 1
+        break;
+
+      case kPageReturnScript:
+        SetResult(base, out, g_list.keys ? kControllerScript : kSettingsScript, 3);
+        g_list.keys = false; // (the page is closing)
         break;
 
       case kPauseEvent:
@@ -928,7 +1032,9 @@ namespace sst::menu
       case kValue:
       {
         const int row = g_list.top + std::clamp(ArgInt(base, values, types, count, 0), 0, 3);
-        std::string text = (id & 0xFF) == kLabel ? std::string(kList[row].label) : ValueText(g_current, row);
+        std::string text = g_list.keys ? ((id & 0xFF) == kLabel ? std::string(sst::input::KeyBindingLabel(row)) : sst::input::KeyBindingValue(row))
+                                       : (id & 0xFF) == kLabel ? std::string(kList[row].label)
+                                                               : ValueText(g_current, row);
         SetResult(base, out, TextId(base, text), 3);
         break;
       }
@@ -1302,6 +1408,8 @@ extern "C" void sub_82594820(PPCContext &__restrict, uint8_t *); // file size (p
 extern "C" void sub_82282BB8(PPCContext &__restrict, uint8_t *); // scene native 4:4 show
 extern "C" void sub_82282C28(PPCContext &__restrict, uint8_t *); // scene native 4:5 hide
 extern "C" void sub_82282AA0(PPCContext &__restrict, uint8_t *); // scene native 4:10 animate (object, from label, to label, flags)
+extern "C" void sub_82283318(PPCContext &__restrict, uint8_t *); // scene native 4:18 alpha (object, 0-255)
+extern "C" void sub_82582110(PPCContext &__restrict, uint8_t *); // scenes 0x82DB4370, object hash -> object (+0xB: alpha)
 extern "C" void sub_82122480(PPCContext &__restrict, uint8_t *); // allocate (size, align)
 extern "C" void sub_821289D8(PPCContext &__restrict, uint8_t *); // read file (fs, path, buffer)
 
@@ -1311,6 +1419,34 @@ extern "C" REX_FUNC(sub_821CCA28)
   {
     std::lock_guard lock(g_mutex);
     ApplyAspect(base);
+  }
+
+  // The KEY BINDINGS page is over once the page it leaves for starts
+  if (ctx.r4.u32 == kControllerScript || ctx.r4.u32 == kSettingsScript)
+  {
+    std::lock_guard lock(g_mutex);
+    g_list.keys = false;
+  }
+
+  // CONTROLS page left with Y: KEY BINDINGS (the VIDEO page's script with the key list) instead of the Settings list
+  if (ctx.r4.u32 == kSettingsScript && g_open_keys)
+  {
+    g_open_keys = false;
+    g_keys_page_next = true;
+    ctx.r4.u64 = kVideoScript;
+  }
+
+  // Title screen -> main menu: whoever pressed Start is the game's 1P
+  {
+    static bool title = false;
+
+    if (ctx.r4.u32 == 0x1187AE2B) // startscreen
+      title = true;
+    else if (ctx.r4.u32 == quit::kScriptHash && title) // mainmenu
+    {
+      title = false;
+      sst::input::MarkGameStarted();
+    }
   }
 
   // Esc on the keyboard: pause once a match's HUD starts, back once a menu starts
@@ -1374,6 +1510,11 @@ namespace
   constexpr uint32_t kControllerLayer = 0xABB4502D; // lookup2("SETTINGS_CONTROLLER"): the page's layer, closed (4:3) by the script's Exit
   bool g_controller_ps = false;   // the DualShock 3 diagram is shown (the two groups are swapped in the page's natives)
   bool g_controller_open = false; // the page is up: the diagram follows the device in use
+  bool g_keys_hint = false;       // the page offers KEY BINDINGS (Y): the keyboard was in use when it opened
+  uint32_t g_y_seen = 0;          // sst::input::YPresses() handled
+  uint32_t g_navbar = 0;          // guest array for the page's navbar: Select, Confirm, Back + Key Bindings
+  constexpr uint32_t kNavbarButtons = 0x69F54F57, kInputEvents = 0x7074624C;
+  constexpr uint32_t kEventSelect = 0x2FAB294A;
   uint32_t g_scratch = 0;         // guest buffer for the direct native calls: +0 result (8), +8 values (8 x 4), +40 types (8)
   // The page's last animation (4:10: object, from, to, flags) on the shown diagram, played on the other one when it takes over
   struct PadAnim
@@ -1447,6 +1588,72 @@ namespace
     }
     REXLOG_INFO("[sst-menu] controls page: {} diagram", ps ? "DualShock 3" : "Xbox 360 / keyboard");
   }
+
+  // VIBRATION greyed out (half alpha, as the game greys the main menu's Xbox LIVE item) while the keyboard is in use: the texts of the controls page's row and of the pause menu's row
+  struct Dim
+  {
+    uint32_t hash;
+    bool active = false;
+    uint8_t written = 0, original = 0xFF;
+  };
+
+  Dim g_dim_controls[] = {{0x7D139BC8}, {0x9FFE01DC}, {0xC9C4FF84}}; // VIBRATION, OFF, ON (SETTINGS_CONTROLLER\OPTION_2)
+  Dim g_dim_pause[] = {{0x2408EA3F}, {0xAF864C0C}};                  // VIBRATION, its value (pause menu row F8A9F905)
+
+  uint32_t FindObject(PPCContext &ctx, uint8_t *base, uint32_t hash)
+  {
+    PPCContext c = ctx;
+    c.r3.u64 = 0x82DB4370;
+    c.r4.u64 = hash;
+    sub_82582110(c, base);
+    return c.r3.u32;
+  }
+
+  void SetAlpha(PPCContext &ctx, uint8_t *base, uint32_t hash, uint32_t alpha)
+  {
+    const uint32_t values[2] = {hash, alpha};
+    const uint8_t types[2] = {3, 2};
+    SceneCall(ctx, base, sub_82283318, values, types, 2);
+  }
+
+  // Each frame: halves the texts' alpha (the game's own alpha changes - fades, highlights - are followed), or puts it back
+  template <size_t N>
+  void DimTexts(PPCContext &ctx, uint8_t *base, Dim (&dims)[N], bool dim)
+  {
+    for (Dim &d : dims)
+    {
+      if (!dim && !d.active)
+        continue;
+
+      const uint32_t obj = FindObject(ctx, base, d.hash);
+
+      if (!obj)
+      {
+        d.active = false;
+        continue;
+      }
+
+      const uint8_t a = *GuestPtr(base, obj + 0xB);
+
+      if (dim)
+      {
+        if (!d.active || a != d.written)
+        {
+          d.original = a;
+          d.written = uint8_t(a / 2);
+          d.active = true;
+          SetAlpha(ctx, base, d.hash, d.written);
+        }
+      }
+      else
+      {
+        if (a == d.written)
+          SetAlpha(ctx, base, d.hash, d.original);
+
+        d.active = false;
+      }
+    }
+  }
 }
 
 // Script VM: call native r5 (group << 8 | index)
@@ -1464,6 +1671,75 @@ extern "C" REX_FUNC(sub_821DFBC0)
   if (g_controller_open)
     UpdateControllerDiagram(ctx, base, false);
 
+  // A fourth navbar button on Y: Key Bindings on the CONTROLS page (keyboard in use), Reset to Defaults on KEY BINDINGS
+  const bool keys_page = g_list.keys && !g_controller_open;
+
+  if (((g_controller_open && g_keys_hint) || keys_page) && id == 0x205 && ctx.r10.u32 == 3 && ctx.r8.u32 && Load32(base, ctx.r8.u32) == kNavbarButtons && *GuestPtr(base, ctx.r9.u32 + 2) == 6)
+  {
+    if (!g_navbar)
+    {
+      auto *memory = rex::system::kernel_memory();
+      g_navbar = memory ? memory->SystemHeapAlloc(0x80) : 0;
+    }
+
+    uint32_t label = 0;
+    {
+      std::lock_guard lock(g_mutex);
+      SetupGuest(base);
+      label = TextId(base, keys_page ? "Reset to Defaults" : "Key Bindings");
+    }
+
+    if (g_navbar && label)
+    {
+      // A static array object (as a module's): {0, 0xFFFF8800 (no reference count), count, elements (relative), 0x80000000 | capacity}, elements {value, type}
+      const std::pair<uint32_t, uint32_t> elems[] = {{0, 2}, {0xF1141A0A, 3}, {6, 2}, {0xFBD92248, 3}, {2, 2}, {0x3A648438, 3}, {8, 2}, {label, 3}};
+      // (+0: the class pointer of the VM's arrays, as the page's own array has it)
+      Store32(base, g_navbar, Load32(base, Load32(base, ctx.r8.u32 + 8)));
+      Store32(base, g_navbar + 4, 0xFFFF8800);
+      Store32(base, g_navbar + 8, uint32_t(std::size(elems)));
+      Store32(base, g_navbar + 12, 0x14);
+      Store32(base, g_navbar + 16, 0x80000000u | uint32_t(std::size(elems)));
+
+      for (size_t i = 0; i < std::size(elems); ++i)
+      {
+        Store32(base, g_navbar + 0x14 + 8 * uint32_t(i), elems[i].first);
+        Store32(base, g_navbar + 0x18 + 8 * uint32_t(i), elems[i].second);
+      }
+
+      Store32(base, ctx.r8.u32 + 8, g_navbar);
+    }
+  }
+
+  // VIBRATION greyed while the keyboard is in use: the controls page (its frame's input read) and the pause menu (3:18 input reads in a match)
+  {
+    const bool keyboard = sst::input::CurrentPromptStyle() == sst::input::PromptStyle::kKeyboard;
+
+    if (g_controller_open && id == 0x306 && ctx.r10.u32 == 1 && ctx.r8.u32 && Load32(base, ctx.r8.u32) == kInputEvents)
+      DimTexts(ctx, base, g_dim_controls, keyboard);
+
+    if (id == 0x312 && sst::input::InMatch())
+      DimTexts(ctx, base, g_dim_pause, keyboard);
+  }
+
+  // Controls page: Y leaves it (as Confirm, keeping the layout type) for KEY BINDINGS
+  if (g_controller_open && g_keys_hint && id == 0x306 && ctx.r10.u32 == 1 && ctx.r8.u32 && Load32(base, ctx.r8.u32) == kInputEvents && sst::input::YPresses() != g_y_seen)
+  {
+    g_y_seen = sst::input::YPresses();
+    const uint32_t out = ctx.r3.u32;
+    __imp__sub_821DFBC0(ctx, base);
+    const uint32_t type = Load32(base, out + 4);
+
+    if (type <= 3)
+    {
+      Store32(base, out, kEventSelect);
+      Store32(base, out + 4, 3);
+      g_open_keys = true;
+      REXLOG_INFO("[sst-menu] controls page: Y -> KEY BINDINGS");
+    }
+
+    return;
+  }
+
   if ((id >> 8) == 4 && ctx.r10.u32 >= 1 && ctx.r10.u32 <= 8 && ctx.r8.u32)
   {
     const uint32_t values = ctx.r8.u32;
@@ -1474,6 +1750,8 @@ extern "C" REX_FUNC(sub_821DFBC0)
       // The page opens (its script hides the DualShock 3 diagram): show the one for the device in use (it may still be hidden from an earlier visit), hide the other. The script's own call stays (on the hidden one) for its result
       g_controller_open = true;
       g_pad_anim = {};
+      g_keys_hint = sst::input::CurrentPromptStyle() == sst::input::PromptStyle::kKeyboard;
+      g_y_seen = sst::input::YPresses();
       UpdateControllerDiagram(ctx, base, true);
       Store32(base, values, g_controller_ps ? kXboxPadGroup : kPs3PadGroup);
       __imp__sub_821DFBC0(ctx, base);
