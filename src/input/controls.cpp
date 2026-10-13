@@ -116,6 +116,7 @@ namespace sst::input
     std::atomic<uint32_t> g_keyboard_player{0};
     std::atomic<int64_t> g_main_menu_beat{0}; // steady clock ms of the main menu's last frame on its category list (0: none)
     std::atomic<bool> g_dialog_up{false};
+    std::atomic<int64_t> g_pause_beat{0}; // steady clock ms of the pause menu's last frame
     std::atomic<uint32_t> g_escape_presses{0};
 
     int64_t NowMs()
@@ -138,7 +139,14 @@ namespace sst::input
       if (const int64_t beat = g_main_menu_beat.load(); beat && NowMs() - beat < 250)
         return EscapeMode::kMainMenu;
 
-      return g_in_match.load() ? EscapeMode::kPause : EscapeMode::kBack;
+      if (!g_in_match.load())
+        return EscapeMode::kBack;
+
+      // In a match: Start pauses; in the pause menu, Esc is B (back to the match)
+      if (const int64_t beat = g_pause_beat.load(); beat && NowMs() - beat < 250)
+        return EscapeMode::kBack;
+
+      return EscapeMode::kPause;
     }
 
     // Esc state, shared by every keyboard poll (guarded by g_mutex)
@@ -456,11 +464,12 @@ namespace sst::input
         std::vector<uint32_t> order;
         const int primary = g_primary_user.load();
 
+        // (Before the title screen is left nobody has started the game: pads count from 1P among themselves)
         if (primary >= 0 && primary < int(rex::input::kMaxGuestUsers) && UsedLocked(uint32_t(primary)))
           order.push_back(uint32_t(primary));
 
         for (uint32_t u = 0; u < rex::input::kMaxGuestUsers; ++u)
-          if (UsedLocked(u) && std::find(order.begin(), order.end(), u) == order.end())
+          if (UsedLocked(u, primary < 0) && std::find(order.begin(), order.end(), u) == order.end())
             order.push_back(u);
 
         for (LightbarPad &p : pads)
@@ -469,11 +478,11 @@ namespace sst::input
         SetLightbars(pads);
       }
 
-      bool UsedLocked(uint32_t u) const
+      bool UsedLocked(uint32_t u, bool pads_only = false) const
       {
         for (DeviceId id : users_[u])
           for (const DeviceInfo &d : devices_)
-            if (d.id == id && d.name != "None")
+            if (d.id == id && d.name != "None" && !(pads_only && d.synthetic))
               return true;
 
         return false;
@@ -1048,6 +1057,11 @@ namespace sst::input
   void MainMenuFrame(bool category_list)
   {
     g_main_menu_beat = category_list ? NowMs() : 0;
+  }
+
+  void PauseMenuFrame()
+  {
+    g_pause_beat = NowMs();
   }
 
   void SetDialogUp(bool up)

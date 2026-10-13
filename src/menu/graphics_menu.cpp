@@ -1718,7 +1718,23 @@ extern "C" REX_FUNC(sub_821DFBC0)
       DimTexts(ctx, base, g_dim_controls, keyboard);
 
     if (id == 0x312 && sst::input::InMatch())
+    {
       DimTexts(ctx, base, g_dim_pause, keyboard);
+
+      // The pause menu's script reads input (3:18) only while the menu is up: Esc is "back" there, not Start (r4 = the calling VM, +8 its module)
+      if (ctx.r4.u32)
+      {
+        const uint32_t module = Load32(base, ctx.r4.u32 + 8);
+        std::lock_guard lock(g_pause_mutex);
+
+        for (auto &[orig, patched] : g_pause_modules)
+          if (module && (module == orig || module == patched))
+          {
+            sst::input::PauseMenuFrame();
+            break;
+          }
+      }
+    }
   }
 
   // Controls page: Y leaves it (as Confirm, keeping the layout type) for KEY BINDINGS

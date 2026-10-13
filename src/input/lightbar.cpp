@@ -98,6 +98,8 @@ namespace sst::input
     std::condition_variable g_wake;
     std::vector<Pad> g_pads;
     uint32_t g_change = 0;
+    std::map<std::wstring, bool> setup_done; // DualSense paths whose lightbar was released (cleared when pads come or go; worker thread)
+    bool g_redo_setup = false;
     bool g_thread_started = false;
 
     uint16_t Hex16Le(const std::string &guid, size_t at)
@@ -202,7 +204,8 @@ namespace sst::input
       return out;
     }
 
-    bool WriteLightbar(const HidPad &pad, Rgb c)
+    // setup (DualSense): instead of a colour, release the lightbar from the pad's own connection animation ("light out", as the Linux driver does once per connection); until then a Bluetooth pad that SDL has not set up yet keeps its own blue
+    bool WriteLightbar(const HidPad &pad, Rgb c, bool setup = false)
     {
       HANDLE h = CreateFileW(pad.path.c_str(), GENERIC_WRITE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
 
@@ -227,20 +230,27 @@ namespace sst::input
       if (ds5 && !pad.bluetooth)
       {
         buf.assign(std::max<size_t>(48, size), 0);
-        buf[0] = 0x02;     // USB effects report
-        buf[1 + 1] = 0x04; // enable: lightbar only
-        buf[1 + 44] = c.r, buf[1 + 45] = c.g, buf[1 + 46] = c.b;
+        buf[0] = 0x02; // USB effects report
+        uint8_t *e = buf.data() + 1;
+
+        if (setup)
+          e[38] = 0x02, e[41] = 0x02; // lightbar setup control; light out
+        else
+          e[1] = 0x04, e[44] = c.r, e[45] = c.g, e[46] = c.b; // enable: lightbar only
       }
       else if (ds5)
       {
         buf.assign(std::max<size_t>(78, size), 0);
-        // Bluetooth effects report. Byte 1: sequence number (high nibble, must change from report to report or the pad keeps its last state) | 2
-        static uint8_t seq = 0;
-        seq = uint8_t((seq + 1) & 0xF);
+        // Bluetooth effects report (as SDL sends it): byte 1 tag and sequence (0), byte 2 0x10, the effects from byte 3
         buf[0] = 0x31;
-        buf[1] = uint8_t(seq << 4 | 0x02);
-        buf[2 + 1] = 0x04;
-        buf[2 + 44] = c.r, buf[2 + 45] = c.g, buf[2 + 46] = c.b;
+        buf[1] = 0x00;
+        buf[2] = 0x10;
+        uint8_t *e = buf.data() + 3;
+
+        if (setup)
+          e[38] = 0x02, e[41] = 0x02; // lightbar setup control; light out
+        else
+          e[1] = 0x04, e[44] = c.r, e[45] = c.g, e[46] = c.b; // enable: lightbar only
       }
       else if (!pad.bluetooth)
       {
@@ -309,6 +319,13 @@ namespace sst::input
             break;
           }
 
+      {
+        std::lock_guard lock(g_mutex);
+
+        if (g_redo_setup)
+          setup_done.clear(), g_redo_setup = false;
+      }
+
       const std::vector<HidPad> hid = EnumerateSonyPads();
       // Pair each SDK pad with a HID device of the same model and bus, both in connection order
       std::vector<bool> used(hid.size(), false);
@@ -321,6 +338,13 @@ namespace sst::input
           {
             used[i] = true;
             const Rgb c = kPlayerColours[p.player & 3];
+            // DualSense: release the lightbar once per connection first
+            if (IsDualSense(p.product) && !setup_done[hid[i].path])
+            {
+              setup_done[hid[i].path] = WriteLightbar(hid[i], c, true);
+              std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
             const bool ok = WriteLightbar(hid[i], c);
             static std::map<std::wstring, uint32_t> logged;
 
@@ -393,6 +417,9 @@ namespace sst::input
 
     if (list.empty() && g_pads.empty())
       return;
+
+    if (list.size() != g_pads.size())
+      g_redo_setup = true; // a pad came or went
 
     g_pads = std::move(list);
     ++g_change;
