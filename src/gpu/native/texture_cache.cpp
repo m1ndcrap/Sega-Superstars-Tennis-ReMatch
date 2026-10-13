@@ -2,6 +2,8 @@
 
 #include "gpu/native/texture_cache.h"
 
+#include "gpu/native/prompts.h"
+
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -589,6 +591,17 @@ namespace sst::native
     const auto start = std::chrono::steady_clock::now();
     std::vector<UINT> loaded;
     uint8_t block[16];
+    // Button-icon atlas pages: the icons follow the input device in use (prompts.h)
+    int prompt_page = -1;
+
+    if (format == xenos::TextureFormat::k_DXT2_3 && k.tiled && k.mip_max == 0 && k.base_page && dim == xenos::DataDimension::k2DOrStacked && t.base_size >= 4096 && (uint64_t(k.base_page) << 12) + 4096 <= kGuestPhysicalSize)
+      prompt_page = prompts::MatchPage(membase_ + (size_t(k.base_page) << 12), k.width, k.height);
+
+    t.prompt_page = prompt_page;
+    t.prompt_generation = prompt_page >= 0 ? prompts::Generation() : 0;
+
+    if (prompt_page >= 0)
+      prompts::BeginPage(prompt_page);
 
     for (uint32_t level = k.mip_min; level <= k.mip_max; ++level)
     {
@@ -654,6 +667,9 @@ namespace sst::native
               std::memcpy(block, membase_ + addr, bpb);
               SwapEndian(block, bpb, k.endian);
               Convert(hf.load, block, bpb, dst);
+
+              if (prompt_page >= 0 && is_base && slice == 0 && z == 0)
+                prompts::Block(prompt_page, x, y, dst);
             }
           }
         }
@@ -661,6 +677,9 @@ namespace sst::native
         loaded.push_back(sub);
       }
     }
+
+    if (prompt_page >= 0)
+      prompts::EndPage(prompt_page);
 
     stats_.upload_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 
@@ -863,8 +882,10 @@ namespace sst::native
       return kNone;
     }
 
+    // Button-icon pages are uploaded again when the icons to show change (another input device)
+    const bool prompt_stale = t->resident && t->prompt_page >= 0 && t->prompt_generation != prompts::Generation();
     // Textures whose data hasn't changed for a while are re-checked every 8th frame only (staggered), which keeps hashing cheap in matches
-    const bool throttled = t->resident && t->stable_checks >= 60 && ((frame_ + (hash >> 61)) & 7) != 0;
+    const bool throttled = !prompt_stale && t->resident && t->stable_checks >= 60 && ((frame_ + (hash >> 61)) & 7) != 0;
 
     if (t->checked_frame != frame_ && throttled)
     {
@@ -880,7 +901,7 @@ namespace sst::native
       stats_.hashed_bytes += uint64_t(t->base_size) + t->mip_size;
       stats_.hash_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 
-      if (t->resident && h == t->content_hash)
+      if (t->resident && h == t->content_hash && !prompt_stale)
       {
         ++t->stable_checks;
       }

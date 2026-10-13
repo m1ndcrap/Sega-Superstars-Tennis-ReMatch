@@ -19,7 +19,11 @@ set(SSTREMATCH_SOURCES
     src/menu/restart.cpp
     src/menu/hud_anchor.cpp
     src/menu/scene_widen.cpp
+    src/menu/main_menu_quit.cpp
     src/movie/movie_debug.cpp
+    src/input/controls.cpp
+    src/input/cursor.cpp
+    src/input/lightbar.cpp
 )
 if(WIN32)
     # Native D3D12 renderer (active with --gpu_plugin=sst)
@@ -33,6 +37,7 @@ if(WIN32)
         src/gpu/native/texture_cache.cpp
         src/gpu/native/hitch_profiler.cpp
         src/gpu/native/present_hook.cpp
+        src/gpu/native/prompts.cpp
     )
 else()
     list(APPEND SSTREMATCH_SOURCES src/gpu/native/native_stub.cpp)
@@ -45,6 +50,17 @@ else()
     add_executable(sst_rematch ${SSTREMATCH_SOURCES})
 endif()
 target_include_directories(sst_rematch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# src/input/lightbar.cpp writes the PlayStation pads' HID output reports
+if(WIN32)
+    target_link_libraries(sst_rematch PRIVATE hid setupapi)
+endif()
+
+# src/input/controls.cpp builds the SDK's input drivers itself; sdl_input_driver.h includes SDL3's headers (types only - the driver code lives in rexruntime)
+if(TARGET SDL3::SDL3)
+    target_include_directories(sst_rematch PRIVATE $<TARGET_PROPERTY:SDL3::SDL3,INTERFACE_INCLUDE_DIRECTORIES>)
+elseif(REXSDK_DIR)
+    target_include_directories(sst_rematch PRIVATE ${REXSDK_DIR}/thirdparty/sdl3/include)
+endif()
 
 # --- "sst" GPU plugin: native rendering backend (Windows / D3D12) -------------
 # Built like the SDK's rexgpu-xenos plugin: the SDK's generic GPU sources (PM4,
