@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -37,6 +38,13 @@ namespace sst::native
   struct ShaderEntry;
 
   constexpr uint32_t kMaxStreams = 16;
+
+  // Host pixels per guest pixel, per axis. The targets that make up the picture get the display's shape (wider at 21:9 / 32:9, so ultrawide stays sharp instead of stretching a 16:9 image); the shadow map stays square
+  struct Scale2
+  {
+    float x = 1, y = 1;
+    bool operator==(const Scale2 &) const = default;
+  };
 
   struct DrawCall
   {
@@ -138,6 +146,7 @@ namespace sst::native
       kPhVertices,
       kPhConstants,
       kPhTextures,
+      kPhUiFit,
       kPhRecord,
       kPhClear,
       kPhSubmit,
@@ -254,10 +263,18 @@ namespace sst::native
     void CaptureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, const ShaderVariant *vs, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, uint64_t layout_hash, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, float half_x, float half_y);
     void FinishCapture();
     void CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0);
+    // Screen extent (NDC) of a small draw, from running its vertex shader on the CPU (aspect ratio: tells 2D UI from 3D, and full-screen layers from elements). flat: every vertex has w = 1 (2D)
+    struct DrawExtent
+    {
+      bool ok = false, flat = false;
+      float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+    };
+
+    DrawExtent MeasureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count);
     void CheckVsPositions(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, const float *host, uint32_t host_inputs);
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t slot) const;
 
-    // render targets (milestone 4) Every guest render-target surface (colour or depth) is a host texture at its logical size (max of the surface size and the viewports drawn with; the main scene's 640x736 tile surface is drawn as one 1280x736 image). Resolves copy them into host textures registered with the texture cache under the destination's guest address; the frame shown is the last full-size resolve (the game's front buffer copy)
+    // Every guest render-target surface (colour or depth) is a host texture at its logical size (max of the surface size and the viewports drawn with; the main scene's 640x736 tile surface is drawn as one 1280x736 image). Resolves copy them into host textures registered with the texture cache under the destination's guest address; the frame shown is the last full-size resolve (the game's front buffer copy)
     struct HostRT
     {
       Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -268,6 +285,8 @@ namespace sst::native
       uint32_t srv = 0;  // shader-visible SRV slot (resolve source)
       D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
       uint32_t guest_format = 0;
+      Scale2 scale;         // host size = width / height (guest pixels) x scale
+      uint32_t samples = 1; // MSAA (3D scene targets, VIDEO > ANTI-ALIASING)
     };
 
     struct ResolvedTexture
@@ -281,20 +300,22 @@ namespace sst::native
       uint32_t srv = 0;           // identity view (presenting)
       bool rb_swapped = false;    // stored red/blue swapped (ARGB-style destination)
       D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+      Scale2 scale; // host size = width / height x scale
     };
 
     bool RenderTargetsEnabled() const;
-    HostRT *GetHostRT(const uint8_t *base, uint32_t surface, bool depth, uint32_t min_width, uint32_t min_height);
+    HostRT *GetHostRT(const uint8_t *base, uint32_t surface, bool depth, Scale2 scale, uint32_t samples, uint32_t min_width, uint32_t min_height);
     void SetRTState(HostRT &rt, D3D12_RESOURCE_STATES state);
     D3D12_CPU_DESCRIPTOR_HANDLE RtRtv(uint32_t index) const;
     D3D12_CPU_DESCRIPTOR_HANDLE RtDsv(uint32_t index) const;
     uint32_t AllocateRtSrv();
     D3D12_GPU_DESCRIPTOR_HANDLE SrvGpu(uint32_t slot) const;
-    ResolvedTexture *GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume);
+    ResolvedTexture *GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, Scale2 scale);
     bool CreateBlitResources();
-    ID3D12PipelineState *GetBlitPipeline(DXGI_FORMAT format);
+    // kind: 0 copy, 1 copy from MSAA (average / sample 0 for depth), 2 FXAA, 3 FPS counter text (alpha blended)
+    ID3D12PipelineState *GetBlitPipeline(DXGI_FORMAT format, uint32_t kind);
     // Copies src_srv texels (src_x, src_y)+ into `rtv` at dst rect (draws a triangle; the caller handles states). Restores the draw root signature
-    void Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb = false);
+    void Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb = false, float gamma = 0, uint32_t src_samples = 1, bool fxaa = false);
     void RestoreDrawState();
     void PresentRenderTargets();
     std::unordered_map<uint32_t, HostRT> color_rts_, depth_rts_;
@@ -302,7 +323,12 @@ namespace sst::native
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rt_rtv_heap_, rt_dsv_heap_;
     uint32_t rt_rtv_next_ = 0, rt_dsv_next_ = 0, rt_srv_next_ = 0, dsv_size_ = 0, srv_size_ = 0;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> blit_root_;
-    std::vector<uint8_t> blit_vs_, blit_ps_;
+    std::vector<uint8_t> blit_vs_, blit_ps_, blit_ps_ms_, blit_ps_fxaa_, blit_ps_text_;
+    // VIDEO > FPS COUNTER: frames shown per second (new frames handed to the display), drawn in the output's top-left corner
+    std::atomic<uint64_t> shown_frames_{0};
+    uint64_t fps_last_frames_ = 0, fps_last_tick_ = 0;
+    uint32_t fps_tenths_ = 0;
+    void DrawFpsCounter(const D3D12_RECT &output);
     std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> blit_pipelines_;
     uint32_t present_page_ = 0; // page of this frame's front-buffer resolve (0: none)
     HostRT *last_color_rt_ = nullptr;
@@ -349,16 +375,42 @@ namespace sst::native
     ID3D12Device *device_ = nullptr;
     ShaderCache *shaders_ = nullptr;
     const uint8_t *physical_membase_ = nullptr;
-    uint32_t width_ = 0, height_ = 0;
+    uint32_t width_ = 0, height_ = 0; // guest output size (1280x720)
+    // Internal resolution (latched per frame from the VIDEO page cvars): host render targets, resolve textures and outputs are their guest size x a scale - scale_ (sst_resolution / 720) for the UI / final image and the output, scene_scale_ (x sst_render_scale %) for the 3D scene's targets (the surfaces drawn with MSAA), shadow_scale_ (sst_shadow_size / 1024) for the shadow map's (resolved into stacked textures). (x: also x the display's stretch - wide_x_ - except for the shadow map.)
+    Scale2 scale_, scene_scale_, shadow_scale_;
+    float wide_x_ = 1; // display aspect / 16:9 (2.333 / 1.778 at 21:9): host targets' extra width
+    bool shadows_off_ = false;
+    bool bloom_off_ = false;                              // VIDEO > BLOOM OFF: the quarter-size glow / bloom targets stay black
+    bool fxaa_ = false;                                   // VIDEO > ANTI-ALIASING FXAA: on the 3D scene's colour resolves
+    uint32_t msaa_ = 1;                                   // VIDEO > ANTI-ALIASING MSAA: samples of the 3D scene's targets
+    std::unordered_map<uint32_t, uint32_t> msaa_support_; // format << 8 | samples -> usable
+    uint32_t UsableSamples(DXGI_FORMAT format, uint32_t samples);
+    bool BloomSurface(const HostRT &rt, uint32_t surface) const;
+    float gamma_ = 1;                // present: output = colour ^ gamma_ (sst_brightness)
+    std::atomic<bool> fps30_{false}; // read by Acquire (plugin thread)
+    std::unordered_set<uint32_t> scene_surfaces_, shadow_surfaces_;
+    // VIDEO > ASPECT RATIO. The game's camera uses the chosen aspect (see graphics_menu.cpp) and the presenter stretches the 16:9 frame to it; the UI is drawn squeezed by ui_fit_ about the frame's centre so it keeps its proportions in a 16:9 box. Draws that sample full-screen copies (the 3D scene, the glow) are composites and stay stretched
+    float ui_fit_x_ = 1.0f, ui_fit_y_ = 1.0f;
+    int aspect_ = 1;
+    std::unordered_set<uint32_t> composite_pages_; // resolve textures holding full-screen images
+    bool draw_composite_ = false;                  // this draw samples one of them
+    std::string draw_textures_;                    // F9 capture: textures this draw samples
+    std::array<Scale2, kOutputs> output_scale_{};
+    Scale2 depth_scale_;
+    uint64_t fps30_acquires_ = 0;
+    bool ApplyScale(); // (re)creates the current output / depth at scale_
+    Scale2 SurfaceScale(const uint8_t *base, uint32_t dev, uint32_t color, uint32_t depth);
+    int DisplayAspect() const;    // VIDEO > ASPECT RATIO in effect (0-4)
+    float DisplayStretch() const; // display aspect / the frame's (16:9)
 
-    // Output ring + depth
+    // Output ring (handed to the plugin) + depth
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kOutputs> outputs_;
     std::array<uint64_t, kOutputs> output_seq_{}; // frame sequence held (0 = none)
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtv_heap_, dsv_heap_;
     uint32_t rtv_size_ = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> depth_;
 
-    // Bindless heaps + placeholders
+    // Bindless heaps (XenosRecomp layout) + placeholders
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srv_heap_, sampler_heap_;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> placeholder_textures_;
@@ -521,6 +573,7 @@ namespace sst::native
       uint64_t memexport_bad_outputs = 0, memexport_bad_logged = 0;
       uint64_t morph_consumers = 0, morph_consumer_overrun = 0, morph_consumer_stale = 0, morph_consumer_bad = 0, morph_consumer_bad_logged = 0;
       uint64_t check_draws = 0, check_flagged = 0, check_logged = 0;
+      uint64_t measured_draws = 0, measured_3d_early = 0, measured_sampled = 0; // UI fit (MeasureDraw)
       uint64_t morph_jump_checks = 0, morph_jump_draws = 0, morph_jump_logged = 0;
       uint64_t morph_modified = 0, morph_modified_logged = 0;
       uint64_t check_jump_checks = 0, check_jump_draws = 0, check_jump_logged = 0;

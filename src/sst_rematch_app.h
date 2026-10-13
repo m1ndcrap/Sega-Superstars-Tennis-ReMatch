@@ -5,9 +5,12 @@
 #pragma once
 
 #include "gpu/native/native.h"
+#include "menu/graphics_menu.h"
+#include "menu/restart.h"
 
 #include <rex/filesystem.h>
 #include <rex/rex_app.h>
+#include <rex/ui/window.h>
 
 class SstRematchApp : public rex::ReXApp
 {
@@ -17,6 +20,8 @@ public:
   static std::unique_ptr<rex::ui::WindowedApp> Create(
       rex::ui::WindowedAppContext &ctx)
   {
+    // Started by the VIDEO page's restart: let the previous run exit first.
+    sst::menu::WaitForRestartParent();
     return std::unique_ptr<SstRematchApp>(new SstRematchApp(ctx, "sst_rematch",
                                                             PPCImageConfig));
   }
@@ -38,7 +43,23 @@ public:
     }
   }
 
-  // Native renderer
-  void OnPostSetup() override { sst::native::Initialize(runtime()); }
+  // Video settings (sst_settings.ini, VIDEO page), then the native
+  // renderer: attaches to the "sst" GPU plugin when it is the one loaded
+  // (--gpu_plugin=sst), otherwise does nothing.
+  void OnPostSetup() override
+  {
+    sst::menu::Initialize([this](bool fullscreen)
+                          { app_context().CallInUIThread([this, fullscreen]
+                                                         {
+        if (auto* w = window(); w && w->IsFullscreen() != fullscreen) w->SetFullscreen(fullscreen); }); }, [this]
+                          { app_context().RequestDeferredQuit(); });
+    sst::native::Initialize(runtime());
+  }
   void OnShutdown() override { sst::native::Shutdown(); }
+
+  // Other hooks available:
+  // void OnPostInitLogging() override {}
+  // void OnLoadXexImage(std::string& xex_image) override {}
+  // void OnPostLoadXexImage() override {}
+  // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}
 };

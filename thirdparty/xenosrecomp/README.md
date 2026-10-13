@@ -11,6 +11,7 @@ Local changes (built with `SST_RECOMP`, same as `xenosrecomp-sst.patch` in the r
 - `shader_recompiler.cpp`: vertex-shader exports with no matching interpolator are written to a scratch variable instead of asserting.
 - `shader_common.h`: `getTexture3DDimensions` / `getWeights3D` for 3D-texture fetches.
 - `shader_recompiler.cpp` / `shader_common.h`: 3D fetches keep their texel offsets (`tfetch3D(..., float3 offset)`, `getWeights3D(..., float3 offset)`). Upstream only passed offsets for 2D fetches; the game's shadow lookups take four taps at ±0.5 texel on a stacked 3D shadow map (soft edges), which all landed on the same texel without them.
+- `shader_recompiler.cpp` / `shader_common.h`: the pixel shader screen position (`vPos` parameter) is divided by the internal resolution scale (`g_InvRenderScale`, shared constants c17.z), so screen-space shaders see guest pixels at any resolution.
 - `sst_prefix.h`: replaces upstream `pch.h` (standard library + fmt + `byteSwap` / `be<T>` only).
 
 `shader_common.h` is also the HLSL prelude for every translated shader; CMake embeds it into the exe.

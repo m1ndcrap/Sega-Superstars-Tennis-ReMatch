@@ -14,6 +14,12 @@ include(generated/rexglue.cmake)
 set(SSTREMATCH_SOURCES
     src/main.cpp
     src/gpu/d3d_trace.cpp
+    src/menu/graphics_menu.cpp
+    src/menu/pause_patch.cpp
+    src/menu/restart.cpp
+    src/menu/hud_anchor.cpp
+    src/menu/scene_widen.cpp
+    src/movie/movie_debug.cpp
 )
 if(WIN32)
     # Native D3D12 renderer (active with --gpu_plugin=sst)
@@ -26,6 +32,7 @@ if(WIN32)
         src/gpu/native/xenos_ucode_tables.cpp
         src/gpu/native/texture_cache.cpp
         src/gpu/native/hitch_profiler.cpp
+        src/gpu/native/present_hook.cpp
     )
 else()
     list(APPEND SSTREMATCH_SOURCES src/gpu/native/native_stub.cpp)

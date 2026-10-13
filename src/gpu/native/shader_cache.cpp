@@ -24,7 +24,7 @@ namespace sst::native
   namespace
   {
     // Bump when the translator, the prelude or the compile options change so stale cache files are rebuilt
-    constexpr uint32_t kCacheVersion = 4;       // 2: D3D9 multiply rule; 3: vertex index in r0.x; 4: 3D fetch offsets
+    constexpr uint32_t kCacheVersion = 7;       // 2: D3D9 multiply rule; 3: vertex index in r0.x; 4: 3D fetch offsets; 5: screen position / render scale; 6: clip transform (c18); 7: render scale per axis (c17.zw)
     constexpr uint32_t kFileMagic = 0x53535453; // "SSTS"
 
     struct FileHeader

@@ -17,6 +17,10 @@
 #include "gpu/frame_source.h"
 
 #include <algorithm>
+#include <algorithm>
+#include <cstddef>
+#include <string>
+#include <cstring>
 #include <cmath>
 #include <mutex>
 
@@ -26,6 +30,11 @@ REXCVAR_DEFINE_INT32(sst_vblank, 2, "SST",
                      "Guest vblank pacing: 0 = the SDK's timer (1 ms sleep loop), 1 = precise "
                      "60 Hz timer, 2 = locked to the display's refresh when it is ~60 Hz "
                      "(else precise timer)");
+REXCVAR_DEFINE_INT32(sst_vblank_lead_ms, 8, "SST",
+                     "sst_vblank 2: guest vblanks come this many ms before the display's vblank, so each "
+                     "new frame reaches the presenter well before the window is repainted at the display "
+                     "vblank (0 = on the vblank: frames then race the repaint and some are shown early, "
+                     "then repeated)");
 
 namespace sst::gpu
 {
@@ -137,7 +146,9 @@ namespace sst::gpu
           if (std::fabs(display_hz - guest_hz) < 0.6)
           {
             period = int64_t(ti.qpcRefreshPeriod);
-            const int64_t vblank = int64_t(ti.qpcVBlank);
+            // The presenter repaints the window right after each display vblank (UI ticks); the game's swap (and the copy of its frame to the presenter) follows a guest vblank by ~1.2 ms. Ticking at the display vblank put those two within a millisecond of each other, so which frame a repaint showed jittered (one shown a refresh early, then repeated). Ticking ahead of it moves the swap mid-refresh
+            const int64_t lead = std::clamp<int64_t>(int64_t(double(std::clamp(REXCVAR_GET(sst_vblank_lead_ms), 0, 14)) * qpf / 1000.0), 0, period * 7 / 8);
+            const int64_t vblank = int64_t(ti.qpcVBlank) - lead;
             // The display vblank nearest the planned tick, but never two ticks within half a period
             const int64_t k = int64_t(std::llround(double(next - vblank) / double(period)));
             target = vblank + k * period;
@@ -153,7 +164,7 @@ namespace sst::gpu
       if (!logged_mode)
       {
         logged_mode = true;
-        REXLOG_INFO("[sst-gpu] guest vblank: {} ({:.2f} Hz guest, display {:.2f} Hz, {} timer)", synced ? "locked to the display refresh" : "precise timer", guest_hz, display_hz, high_resolution ? "high-resolution" : "standard");
+        REXLOG_INFO("[sst-gpu] guest vblank: {} ({:.2f} Hz guest, display {:.2f} Hz, {} timer{})", synced ? "locked to the display refresh" : "precise timer", guest_hz, display_hz, high_resolution ? "high-resolution" : "standard", synced ? fmt::format(", {} ms ahead of the display vblank", std::clamp(REXCVAR_GET(sst_vblank_lead_ms), 0, 14)) : std::string());
       }
 
       wait_until(target);
@@ -442,7 +453,13 @@ namespace sst::gpu
     if (frame_ == 1 || frame_ % 600 == 0)
       REXLOG_INFO("[sst-gpu] presented frame {} ({})", frame_, native_frame ? "native renderer" : "placeholder");
 
-    presenter->RefreshGuestOutput(width, height, width, height,
+    // VIDEO > ASPECT RATIO: the 16:9 frame is shown at the chosen aspect (the game's camera and the native renderer's UI fit match it)
+    uint32_t aspect_xy[2] = {16, 9};
+
+    if (g_has_source && g_source.struct_size >= sizeof(SstFrameSource) && g_source.display_aspect)
+      g_source.display_aspect(g_source.user, &aspect_xy[0], &aspect_xy[1]);
+
+    presenter->RefreshGuestOutput(width, height, aspect_xy[0], aspect_xy[1],
                                   [&](rex::ui::Presenter::GuestOutputRefreshContext &context) -> bool
                                   {
                                     auto &d3d12_context = static_cast<D3D12Presenter::D3D12GuestOutputRefreshContext &>(context);
@@ -515,9 +532,11 @@ extern "C" REX_GPU_PLUGIN_EXPORT void sst_gpu_set_frame_source(const SstFrameSou
 {
   std::lock_guard lock(sst::gpu::g_source_mutex);
 
-  if (source && source->struct_size >= sizeof(SstFrameSource) && source->acquire && source->release)
+  if (source && source->struct_size >= offsetof(SstFrameSource, display_aspect) && source->acquire && source->release)
   {
-    sst::gpu::g_source = *source;
+    sst::gpu::g_source = {};
+    std::memcpy(&sst::gpu::g_source, source, std::min<size_t>(source->struct_size, sizeof(SstFrameSource)));
+    sst::gpu::g_source.struct_size = sizeof(SstFrameSource);
     sst::gpu::g_has_source = true;
     REXLOG_INFO("[sst-gpu] native renderer attached");
   }
