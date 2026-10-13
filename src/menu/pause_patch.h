@@ -16,6 +16,9 @@ namespace sst::menu::pause
 
   constexpr int kRows = 7;     // rows after the patch
   constexpr int kVideoRow = 6; // index of the new row (the game hard-codes 0-5)
+  // Rows top to bottom: VIDEO sits above RETURN TO CHARACTER SELECT / MAIN MENU
+  // (its index stays 6; the cursor and the VIDEO page follow this order).
+  constexpr std::array<int, kRows> kVisualOrder = {0, 1, 2, 3, 6, 4, 5};
 
   // Text ids used by the patched scene; the port's text hook resolves them.
   constexpr uint32_t kTextBlank = 0x5354FF00;
@@ -27,6 +30,7 @@ namespace sst::menu::pause
   constexpr uint32_t kNativeBegin = 6;     // ()
   constexpr uint32_t kNativeLabel = 7;     // (visible row 0-6) -> text id
   constexpr uint32_t kNativeValue = 8;     // (visible row 0-6) -> text id
+  constexpr uint32_t kNativeStep = 10;     // (row, -1 / +1, first, count) -> next row
 
   constexpr uint32_t kScriptHash = 0xEF8CD98C; // lookup2("pausemenu_match")
 

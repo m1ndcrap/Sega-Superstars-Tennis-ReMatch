@@ -63,8 +63,11 @@ namespace sst::menu::pause
     constexpr uint32_t kRetryRow = 0x8A139936;                                       // template for the new row
     constexpr uint32_t kValueText = 0xA18E2471;                                      // CONTROLLER's value ("TYPE A")
     constexpr std::array<uint32_t, 3> kPanel = {0x30EF67A8, 0xC9A9E37B, 0xCE5A4A4D}; // edges, body
-    constexpr uint32_t kValueFont = 0x2207B8BE;                                      // has 0-9 (the row font only has 1-4)
-    constexpr float kValueScale = 1.15f;                                             // its glyphs are smaller than the row font's
+    // The confirmation dialog for the full panel (F73595A0): body, then the YES / NO bar group, cursor group and YES / NO texts
+    constexpr uint32_t kDialogBody = 0x0944873D;
+    constexpr std::array<uint32_t, 4> kDialogLower = {0xE8F65357, 0x20A4C7FB, 0x97B856AC, 0x778A36F5};
+    constexpr uint32_t kValueFont = 0x2207B8BE; // has 0-9 (the row font only has 1-4)
+    constexpr float kValueScale = 1.15f;        // its glyphs are smaller than the row font's
 
     // New objects (hashes chosen outside the scene's)
     constexpr uint32_t kNewRow = 0x53560006;
@@ -298,6 +301,13 @@ namespace sst::menu::pause
       if (!need(h, Tag("TXTR")))
         return error = "panel not found", std::nullopt;
 
+    if (!need(kDialogBody, Tag("TXTR")) || !(tracks[kDialogBody].h > 0.1f))
+      return error = "dialog not found", std::nullopt;
+
+    for (uint32_t h : kDialogLower)
+      if (!objects.count(h) || !tracks.count(h))
+        return error = "dialog parts not found", std::nullopt;
+
     for (uint32_t h : objects[kRetryRow].children)
       if (!objects.count(h) || !tracks.count(h))
         return error = "RETRY row", std::nullopt;
@@ -314,8 +324,18 @@ namespace sst::menu::pause
 
     if (!(dy > 0.03f && dy < 0.08f))
       return error = "row spacing", std::nullopt;
+    // VIDEO goes where RETURN TO CHARACTER SELECT was; that row and RETURN TO MAIN MENU move down one spacing (kVisualOrder)
+    const float new_y = key_y(kRowGroups[4]);
+    auto move_y = [&](uint32_t h, float by)
+    {
+      Track &t = tracks[h];
 
-    const float new_y = key_y(kRowGroups[5]) + dy;
+      for (uint16_t k = 0; k < t.count; ++k)
+      {
+        uint8_t *key = t.keys.data() + k * t.KeySize();
+        WrF(key + 0x10, RdF(key + 0x10) + by);
+      }
+    };
 
     uint32_t order = 0x7FFF0000;
     auto clone = [&](uint32_t from, uint32_t to)
@@ -385,9 +405,26 @@ namespace sst::menu::pause
       objects[row].children.push_back(sv);
     }
 
+    move_y(kRowGroups[4], dy);
+    move_y(kRowGroups[5], dy);
+
     // The panel grows by one row
     for (uint32_t h : kPanel)
       tracks[h].h += dy;
+
+    // So does the confirmation dialog over it (RETRY / RETURN TO ...): its body gets one row taller, the YES / NO bar, buttons and cursor move down
+    {
+      Track &body = tracks[kDialogBody];
+
+      for (uint16_t k = 0; k < body.count; ++k)
+      {
+        uint8_t *key = body.keys.data() + k * body.KeySize();
+        WrF(key + 0x18, RdF(key + 0x18) + dy / body.h);
+      }
+
+      for (uint32_t h : kDialogLower)
+        move_y(h, dy);
+    }
 
     // rebuild KFRM
     {
@@ -727,6 +764,44 @@ namespace sst::menu::pause
     const uint32_t next = jf_next + uint32_t(int16_t(Rd16(m + at + 12)));
     const uint32_t patch_at = jf_next; // pushabs 9; pushabs 4; index (7 bytes)
 
+    // Up / down: the cursor (abs 4) steps through the rows in kVisualOrder. The game's code: pushabs 4; pushi 1; op sub|add; stabs 4; then the wrap to [abs 10, abs 10 + abs 11). Replaced by abs4 = native step(abs4, -1|+1, abs10, abs11), padded with nops
+    struct Nav
+    {
+      std::vector<int> sig; // -1 = any byte
+      int dir;
+    };
+
+    const Nav kNav[2] = {{{0x29, 0, 4, 0x01, 0, 0, 0, 1, 0x0D, 13, 0x27, 0, 4, // abs4 - 1
+                           0x29, 0, 4, 0x29, 0, 10, 0x0D, 16, 0x14, -1, -1,    // < abs10 ?
+                           0x29, 0, 4, 0x29, 0, 11, 0x0D, 12, 0x27, 0, 4},     // += abs11
+                          -1},
+                         {{0x29, 0, 4, 0x01, 0, 0, 0, 1, 0x0D, 12, 0x27, 0, 4,                     // abs4 + 1
+                           0x29, 0, 4, 0x29, 0, 10, 0x29, 0, 11, 0x0D, 12, 0x0D, 19, 0x14, -1, -1, // >= end ?
+                           0x29, 0, 4, 0x29, 0, 11, 0x0D, 13, 0x27, 0, 4},                         // -= abs11
+                          1}};
+    std::vector<std::pair<uint32_t, const Nav *>> nav_sites;
+
+    for (const Nav &n : kNav)
+    {
+      size_t hits = 0, hit = 0;
+
+      for (size_t p = 0x20; p + n.sig.size() <= functab; ++p)
+      {
+        bool ok = true;
+
+        for (size_t i = 0; i < n.sig.size() && ok; ++i)
+          ok = n.sig[i] < 0 || m[p + i] == n.sig[i];
+
+        if (ok)
+          ++hits, hit = p;
+      }
+
+      if (hits != 1)
+        return error = "cursor step not found", std::nullopt;
+
+      nav_sites.push_back({uint32_t(hit), &n});
+    }
+
     // the trampoline, appended to the code
     Asm a(functab);
     const uint32_t tramp = a.pc();
@@ -799,14 +874,25 @@ namespace sst::menu::pause
       call(4, 15, 2);
     };
 
+    // Row r's spare texts show the page's line at r's place, top to bottom
+    auto line_of = [](int r)
+    {
+      for (int v = 0; v < kRows; ++v)
+        if (kVisualOrder[v] == r)
+          return v;
+
+      return r;
+    };
+
     auto redraw = [&]
     {
       for (int r = 0; r < kRows; ++r)
       {
+        const int v = line_of(r);
         set_text(kSpareLabel + r, [&]
-                 { a.pushi(r), call(0x53, kNativeLabel, 1, true); });
+                 { a.pushi(v), call(0x53, kNativeLabel, 1, true); });
         set_text(kSpareValue + r, [&]
-                 { a.pushi(r), call(0x53, kNativeValue, 1, true); });
+                 { a.pushi(v), call(0x53, kNativeValue, 1, true); });
       }
     };
 
@@ -943,6 +1029,24 @@ namespace sst::menu::pause
 
       for (int i = 3; i < 7; ++i)
         out[patch_at + i] = 0x11;
+    }
+
+    for (auto [at_nav, n] : nav_sites)
+    {
+      Asm step(at_nav);
+      step.pushabs(kSlotCursor);
+      step.pushi(n->dir);
+      step.pushabs(10);
+      step.pushabs(11);
+      step.native(0x53, kNativeStep, 4);
+      step.u8(0x27), step.u16(uint16_t(kSlotCursor)); // stabs
+      Bytes code;
+
+      if (!step.finish(code) || code.size() > n->sig.size())
+        return error = "cursor step", std::nullopt;
+
+      code.resize(n->sig.size(), 0x11); // nop
+      std::copy(code.begin(), code.end(), out.begin() + at_nav);
     }
     // Header and the rows global
     Wr32(out.data() + 4, functab + d1);

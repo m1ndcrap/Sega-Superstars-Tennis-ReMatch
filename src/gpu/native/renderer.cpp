@@ -166,10 +166,8 @@ namespace sst::native
 
     // Placeholder descriptor indices (heap slots)
     constexpr uint32_t kPlaceholder2D = 0, kPlaceholder3D = 1, kPlaceholderCube = 2;
-
     // Black 3D: stands in for the stacked shadow map (sampled as 3D) until render targets are emulated - depth 0 reads as "lit" in the game's shadow test
     constexpr uint32_t kPlaceholder3DBlack = 3;
-
     // Heap slots below these are placeholders / default samplers; the rest belong to the texture cache
     constexpr uint32_t kSrvHeapSize = 65536, kSamplerHeapSize = 2048;
     constexpr uint32_t kSrvReserved = 512, kSamplerReserved = 16;
@@ -186,7 +184,6 @@ namespace sst::native
     // On the render thread, the guest memory a command needs as it was when the game issued it (device state, patched microcode, vertex data from the caller) is read from snapshots taken by the hook (see native.cpp)
     thread_local const GuestOverlay *t_overlays = nullptr;
     thread_local uint32_t t_overlay_count = 0;
-
     const uint8_t *GuestPtr(const uint8_t *base, uint32_t addr)
     {
       for (uint32_t i = 0; i < t_overlay_count; ++i)
@@ -213,14 +210,27 @@ namespace sst::native
       std::memcpy(&v, p, 4);
       return __builtin_bswap32(v);
     }
-
     // D3D object addresses are virtual; tolerate physical ones (map through the 0xA0000000 physical view)
-    uint32_t ToVirtual(uint32_t addr) { return addr < 0x20000000u ? (addr | 0xA0000000u) : addr; }
-    bool PlausibleAddress(uint32_t addr) { return addr >= 0x40000000u; }
+    uint32_t ToVirtual(uint32_t addr)
+    {
+      return addr < 0x20000000u ? (addr | 0xA0000000u) : addr;
+    }
 
-    // Guest pixels -> host pixels at an internal resolution scale (rounded, so adjacent rectangles stay adjacent).
-    LONG Px(LONG v, float s) { return LONG(std::lround(double(v) * s)); }
-    uint32_t PxU(uint32_t v, float s) { return std::max<uint32_t>(1, uint32_t(Px(LONG(v), s))); }
+    bool PlausibleAddress(uint32_t addr)
+    {
+      return addr >= 0x40000000u;
+    }
+
+    // Guest pixels -> host pixels at an internal resolution scale (rounded, so adjacent rectangles stay adjacent)
+    LONG Px(LONG v, float s)
+    {
+      return LONG(std::lround(double(v) * s));
+    }
+
+    uint32_t PxU(uint32_t v, float s)
+    {
+      return std::max<uint32_t>(1, uint32_t(Px(LONG(v), s)));
+    }
 
     D3D12_RECT Scaled(const D3D12_RECT &r, float s)
     {
@@ -270,7 +280,6 @@ namespace sst::native
     constexpr uint32_t kDevIndices = 0x3094, kDevRT0 = 0x3098, kDevDepth = 0x30A8;
     constexpr uint32_t kDevPS = 0x3194, kDevVS = 0x3198;
     constexpr uint32_t kDevScissorTL = 0x28C4, kDevScissorBR = 0x28C8; // PA_SC_WINDOW_SCISSOR_*
-
     // Fetch constants: slot j (2 dwords) at +0x480 + 8j. Textures use 3 slots each (sampler i = slots 3i..3i+2); vertex stream s is slot 95 - s
     constexpr uint32_t kDevFetchConstants = 0x480;
 
@@ -374,7 +383,6 @@ namespace sst::native
       const std::string size = std::to_string((size_word >> 18) + 1) + "x" + std::to_string(((size_word >> 3) & 0x7FFF) + 1);
       return filter == size;
     }
-
   }
 
   void SetGuestOverlays(const GuestOverlay *overlays, uint32_t count)
@@ -455,7 +463,6 @@ namespace sst::native
         return;
 
       path = rex::filesystem::GetExecutableFolder() / "cache" / "pipelines.bin";
-
       {
         std::ifstream in(path, std::ios::binary);
 
@@ -509,7 +516,6 @@ namespace sst::native
 
       const auto t0 = std::chrono::steady_clock::now();
       job.desc.InputLayout = {job.layout.data(), UINT(job.layout.size())};
-
       {
         std::lock_guard lock(library_mutex);
 
@@ -557,7 +563,6 @@ namespace sst::native
     void Save()
     {
       std::vector<uint8_t> data;
-
       {
         std::lock_guard lock(library_mutex);
 
@@ -574,7 +579,6 @@ namespace sst::native
       std::error_code ec;
       std::filesystem::create_directories(path.parent_path(), ec);
       const auto tmp = std::filesystem::path(path).concat(".tmp");
-
       {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
 
@@ -598,22 +602,21 @@ namespace sst::native
       if (!library || !dirty || saving.exchange(true))
         return;
 
-      std::thread([this]
-                  {
-                    Save();
-                    saving = false;
-                  })
+      std::thread(
+          [this]
+          {
+            Save();
+            saving = false;
+          })
           .detach();
     }
 
     void Main()
     {
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); // background
-
       for (;;)
       {
         std::shared_ptr<Job> job;
-
         {
           std::unique_lock lock(mutex);
           wake.wait(lock, [&]
@@ -644,11 +647,11 @@ namespace sst::native
   };
 
   // setup
+
   bool Renderer::Initialize(const D3D12Provider &provider, ShaderCache *shaders, const uint8_t *physical_membase, uint32_t width, uint32_t height)
   {
     provider_ = &provider;
     physical_membase_ = physical_membase;
-
     // Guest physical memory is writable host memory; memexport writes into it
     {
       int32_t threads = REXCVAR_GET(sst_native_memexport_threads);
@@ -804,15 +807,13 @@ namespace sst::native
   void Renderer::CreateDebugPixelShader()
   {
     // Colour by view distance (SV_Position.w) in bands, slightly darker on steep depth slopes so shapes read without lighting or textures
-    static const char kSource[] =
-        "float4 main(float4 p : SV_Position) : SV_Target0 {\n"
-        "  float d = p.w;\n"
-        "  float band = frac(d * 0.1);\n"
-        "  float edge = saturate(1.0 - 40.0 * (abs(ddx(p.z)) + abs(ddy(p.z))));\n"
-        "  float3 c = float3(0.35 + 0.65 * band, 0.5 + 0.5 * sin(d * 0.37), 1.0 - 0.6 * band);\n"
-        "  return float4(c * (0.4 + 0.6 * edge), 1.0);\n"
-        "}\n";
-
+    static const char kSource[] = "float4 main(float4 p : SV_Position) : SV_Target0 {\n"
+                                  "  float d = p.w;\n"
+                                  "  float band = frac(d * 0.1);\n"
+                                  "  float edge = saturate(1.0 - 40.0 * (abs(ddx(p.z)) + abs(ddy(p.z))));\n"
+                                  "  float3 c = float3(0.35 + 0.65 * band, 0.5 + 0.5 * sin(d * 0.37), 1.0 - 0.6 * band);\n"
+                                  "  return float4(c * (0.4 + 0.6 * edge), 1.0);\n"
+                                  "}\n";
     Microsoft::WRL::ComPtr<IDxcCompiler3> compiler;
 
     if (FAILED(provider_->DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
@@ -958,7 +959,6 @@ namespace sst::native
       device_->CreateShaderResourceView(tex.Get(), &sd, h);
       placeholder_textures_.push_back(tex);
     }
-
     // Fill the rest of the heap with the 2D placeholder so any index is valid
     {
       D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -974,7 +974,6 @@ namespace sst::native
         device_->CreateShaderResourceView(placeholder_textures_[0].Get(), &sd, h);
       }
     }
-
     // Samplers: linear wrap everywhere
     D3D12_SAMPLER_DESC smp = {};
     smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1009,9 +1008,7 @@ namespace sst::native
       CloseHandle(event_);
 
     event_ = nullptr;
-
-    // finishes compiles, saves the pipeline cache
-    pipeline_workers_.reset();
+    pipeline_workers_.reset(); // finishes compiles, saves the pipeline cache
     pending_pipelines_.clear();
     pipelines_.clear();
 
@@ -1113,6 +1110,7 @@ namespace sst::native
   }
 
   // render targets: host textures, resolve copies, presenting
+
   namespace
   {
     constexpr uint32_t kRtRtvCount = 256, kRtDsvCount = 64;
@@ -1124,20 +1122,26 @@ namespace sst::native
       switch (format)
       {
       case 0: // k_8_8_8_8
+
       case 1: // k_8_8_8_8_GAMMA
         return DXGI_FORMAT_R8G8B8A8_UNORM;
 
-      case 2:  // k_2_10_10_10
+      case 2: // k_2_10_10_10
+
       case 10: // k_2_10_10_10_AS_10_10_10_10
         return DXGI_FORMAT_R10G10B10A2_UNORM;
 
-      case 3:  // k_2_10_10_10_FLOAT
+      case 3: // k_2_10_10_10_FLOAT
+
       case 12: // k_2_10_10_10_FLOAT_AS_16_16_16_16
-      case 5:  // k_16_16_16_16 (-32..32 fixed point)
-      case 7:  // k_16_16_16_16_FLOAT
+
+      case 5: // k_16_16_16_16 (-32..32 fixed point)
+
+      case 7: // k_16_16_16_16_FLOAT
         return DXGI_FORMAT_R16G16B16A16_FLOAT;
 
       case 4: // k_16_16
+
       case 6: // k_16_16_FLOAT
         return DXGI_FORMAT_R16G16_FLOAT;
 
@@ -1158,15 +1162,19 @@ namespace sst::native
       switch (format)
       {
       case 22: // k_24_8
+
       case 23: // k_24_8_FLOAT
+
       case 36: // k_32_FLOAT
         return DXGI_FORMAT_R32_FLOAT;
 
-      case 7:  // k_2_10_10_10
+      case 7: // k_2_10_10_10
+
       case 54: // k_2_10_10_10_AS_16_16_16_16
         return DXGI_FORMAT_R10G10B10A2_UNORM;
 
       case 32: // k_16_16_16_16_FLOAT
+
       case 26:
         return DXGI_FORMAT_R16G16B16A16_FLOAT;
 
@@ -1180,7 +1188,6 @@ namespace sst::native
     }
 
     const D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
   }
 
   bool Renderer::RenderTargetsEnabled() const
@@ -1324,10 +1331,7 @@ namespace sst::native
     srv_handle.ptr += size_t(rt.srv) * srv_size_;
     device_->CreateShaderResourceView(rt.resource.Get(), &sd, srv_handle);
     ++stats_.host_rts;
-    REXLOG_INFO("[sst-native] render target {:08X}: {}x{} {}{} (surface {}x{}, guest format {}){}",
-                surface, rt.width, rt.height, depth ? "depth D32S8" : "colour",
-                samples > 1 ? fmt::format(" {}x MSAA", samples) : std::string(), sw, sh,
-                guest_format, scale != 1.0f ? fmt::format(", host {}x{}", PxU(rt.width, scale), PxU(rt.height, scale)) : std::string());
+    REXLOG_INFO("[sst-native] render target {:08X}: {}x{} {}{} (surface {}x{}, guest format {}){}", surface, rt.width, rt.height, depth ? "depth D32S8" : "colour", samples > 1 ? fmt::format(" {}x MSAA", samples) : std::string(), sw, sh, guest_format, scale != 1.0f ? fmt::format(", host {}x{}", PxU(rt.width, scale), PxU(rt.height, scale)) : std::string());
     bound_targets_ = 0;
     HostRT &stored = map[surface] = std::move(rt);
 
@@ -1396,7 +1400,6 @@ namespace sst::native
       t->rtvs = it->second->rtvs;
       t->srv = it->second->srv;
     }
-
     while (t->rtvs.size() < slices)
     {
       if (rt_rtv_next_ >= kRtRtvCount)
@@ -1489,77 +1492,69 @@ namespace sst::native
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) || FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&blit_root_))))
       return false;
 
-    static const char kVS[] =
-        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
-        "  float2 uv = float2((id << 1) & 2, id & 2);\n"
-        "  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
-        "}\n";
-
-    static const char kPS[] =
-        "cbuffer C : register(b0) { int4 offset; };\n"
-        "Texture2D<float4> src : register(t0);\n"
-        "float4 main(float4 p : SV_Position) : SV_Target {\n"
-        "  float4 c = src.Load(int3(int2(p.xy) + offset.xy, 0));\n"
-        "  if (offset.z & 1) c = c.bgra;\n"
-        "  if (offset.w != 0) c.rgb = pow(saturate(c.rgb), asfloat(offset.w));\n"
-        "  return c;\n"
-        "}\n";
-
-    // offset.z: bit 0 swap red / blue, bits 8-15 source samples, bit 16 depth.
-    static const char kPSMS[] =
-        "cbuffer C : register(b0) { int4 offset; };\n"
-        "Texture2DMS<float4> src : register(t0);\n"
-        "float4 main(float4 p : SV_Position) : SV_Target {\n"
-        "  int2 at = int2(p.xy) + offset.xy;\n"
-        "  uint n = max((uint(offset.z) >> 8) & 0xFF, 1u);\n"
-        "  float4 c = src.Load(at, 0);\n"
-        "  if (((uint(offset.z) >> 16) & 1) == 0) {\n"
-        "    for (uint i = 1; i < n; ++i) c += src.Load(at, i);\n"
-        "    c /= float(n);\n"
-        "  }\n"
-        "  if (offset.z & 1) c = c.bgra;\n"
-        "  if (offset.w != 0) c.rgb = pow(saturate(c.rgb), asfloat(offset.w));\n"
-        "  return c;\n"
-        "}\n";
-
-    // FXAA (the compact 'console' variant: 4 diagonal luma taps, one blur direction, two / four taps along it).
-    static const char kPSFxaa[] =
-        "cbuffer C : register(b0) { int4 offset; int4 rect; };\n"
-        "Texture2D<float4> src : register(t0);\n"
-        "SamplerState lin : register(s0);\n"
-        "static float2 lo_uv, hi_uv;\n"
-        "float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
-        // Taps stay inside the copied rectangle: with tiled rendering the rest of the source holds another tile's (older) pixels.
-        "float3 S(float2 uv) { return src.SampleLevel(lin, clamp(uv, lo_uv, hi_uv), 0).rgb; }\n"
-        "float4 main(float4 p : SV_Position) : SV_Target {\n"
-        "  uint w, h; src.GetDimensions(w, h);\n"
-        "  float2 rcp = 1.0 / float2(w, h);\n"
-        "  lo_uv = (float2(rect.xy) + 0.5) * rcp;\n"
-        "  hi_uv = (float2(rect.zw) - 0.5) * rcp;\n"
-        "  float2 uv = (floor(p.xy) + float2(offset.xy) + 0.5) * rcp;\n"
-        "  float4 m = src.SampleLevel(lin, uv, 0);\n"
-        "  float nw = Luma(S(uv + float2(-0.5, -0.5) * rcp));\n"
-        "  float ne = Luma(S(uv + float2(0.5, -0.5) * rcp));\n"
-        "  float sw = Luma(S(uv + float2(-0.5, 0.5) * rcp));\n"
-        "  float se = Luma(S(uv + float2(0.5, 0.5) * rcp));\n"
-        "  float lm = Luma(m.rgb);\n"
-        "  float lo = min(lm, min(min(nw, ne), min(sw, se)));\n"
-        "  float hi = max(lm, max(max(nw, ne), max(sw, se)));\n"
-        "  float4 c = m;\n"
-        "  if (hi - lo >= max(0.0312, hi * 0.125)) {\n"
-        "    float2 dir = float2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));\n"
-        "    float reduce = max((nw + ne + sw + se) * (0.25 * 0.125), 1.0 / 128.0);\n"
-        "    float k = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);\n"
-        "    dir = clamp(dir * k, -8.0, 8.0) * rcp;\n"
-        "    float3 a = 0.5 * (S(uv + dir * (1.0 / 3.0 - 0.5)) + S(uv + dir * (2.0 / 3.0 - 0.5)));\n"
-        "    float3 b = a * 0.5 + 0.25 * (S(uv - dir * 0.5) + S(uv + dir * 0.5));\n"
-        "    float lb = Luma(b);\n"
-        "    c.rgb = (lb < lo || lb > hi) ? a : b;\n"
-        "  }\n"
-        "  if (offset.z & 1) c = c.bgra;\n"
-        "  return c;\n"
-        "}\n";
-
+    static const char kVS[] = "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+                              "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+                              "  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+                              "}\n";
+    static const char kPS[] = "cbuffer C : register(b0) { int4 offset; };\n"
+                              "Texture2D<float4> src : register(t0);\n"
+                              "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                              "  float4 c = src.Load(int3(int2(p.xy) + offset.xy, 0));\n"
+                              "  if (offset.z & 1) c = c.bgra;\n"
+                              "  if (offset.w != 0) c.rgb = pow(saturate(c.rgb), asfloat(offset.w));\n"
+                              "  return c;\n"
+                              "}\n";
+    // offset.z: bit 0 swap red / blue, bits 8-15 source samples, bit 16 depth
+    static const char kPSMS[] = "cbuffer C : register(b0) { int4 offset; };\n"
+                                "Texture2DMS<float4> src : register(t0);\n"
+                                "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                                "  int2 at = int2(p.xy) + offset.xy;\n"
+                                "  uint n = max((uint(offset.z) >> 8) & 0xFF, 1u);\n"
+                                "  float4 c = src.Load(at, 0);\n"
+                                "  if (((uint(offset.z) >> 16) & 1) == 0) {\n"
+                                "    for (uint i = 1; i < n; ++i) c += src.Load(at, i);\n"
+                                "    c /= float(n);\n"
+                                "  }\n"
+                                "  if (offset.z & 1) c = c.bgra;\n"
+                                "  if (offset.w != 0) c.rgb = pow(saturate(c.rgb), asfloat(offset.w));\n"
+                                "  return c;\n"
+                                "}\n";
+    // FXAA (the compact 'console' variant: 4 diagonal luma taps, one blur direction, two / four taps along it)
+    static const char kPSFxaa[] = "cbuffer C : register(b0) { int4 offset; int4 rect; };\n"
+                                  "Texture2D<float4> src : register(t0);\n"
+                                  "SamplerState lin : register(s0);\n"
+                                  "static float2 lo_uv, hi_uv;\n"
+                                  "float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+                                  // Taps stay inside the copied rectangle: with tiled rendering the rest of the source holds another tile's (older) pixels
+                                  "float3 S(float2 uv) { return src.SampleLevel(lin, clamp(uv, lo_uv, hi_uv), 0).rgb; }\n"
+                                  "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                                  "  uint w, h; src.GetDimensions(w, h);\n"
+                                  "  float2 rcp = 1.0 / float2(w, h);\n"
+                                  "  lo_uv = (float2(rect.xy) + 0.5) * rcp;\n"
+                                  "  hi_uv = (float2(rect.zw) - 0.5) * rcp;\n"
+                                  "  float2 uv = (floor(p.xy) + float2(offset.xy) + 0.5) * rcp;\n"
+                                  "  float4 m = src.SampleLevel(lin, uv, 0);\n"
+                                  "  float nw = Luma(S(uv + float2(-0.5, -0.5) * rcp));\n"
+                                  "  float ne = Luma(S(uv + float2(0.5, -0.5) * rcp));\n"
+                                  "  float sw = Luma(S(uv + float2(-0.5, 0.5) * rcp));\n"
+                                  "  float se = Luma(S(uv + float2(0.5, 0.5) * rcp));\n"
+                                  "  float lm = Luma(m.rgb);\n"
+                                  "  float lo = min(lm, min(min(nw, ne), min(sw, se)));\n"
+                                  "  float hi = max(lm, max(max(nw, ne), max(sw, se)));\n"
+                                  "  float4 c = m;\n"
+                                  "  if (hi - lo >= max(0.0312, hi * 0.125)) {\n"
+                                  "    float2 dir = float2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));\n"
+                                  "    float reduce = max((nw + ne + sw + se) * (0.25 * 0.125), 1.0 / 128.0);\n"
+                                  "    float k = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);\n"
+                                  "    dir = clamp(dir * k, -8.0, 8.0) * rcp;\n"
+                                  "    float3 a = 0.5 * (S(uv + dir * (1.0 / 3.0 - 0.5)) + S(uv + dir * (2.0 / 3.0 - 0.5)));\n"
+                                  "    float3 b = a * 0.5 + 0.25 * (S(uv - dir * 0.5) + S(uv + dir * 0.5));\n"
+                                  "    float lb = Luma(b);\n"
+                                  "    c.rgb = (lb < lo || lb > hi) ? a : b;\n"
+                                  "  }\n"
+                                  "  if (offset.z & 1) c = c.bgra;\n"
+                                  "  return c;\n"
+                                  "}\n";
     ComPtr<IDxcCompiler3> compiler;
 
     if (FAILED(provider_->DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
@@ -1585,26 +1580,25 @@ namespace sst::native
       return true;
     };
 
-    // FPS counter: c.xy = top-left (host pixels), c.z = font pixel size, c.w = frames per second x 10. 3x5 digits, drawn on a dark box.
-    static const char kPSText[] =
-        "cbuffer C : register(b0) { int4 c; };\n"
-        "static const uint kFont[11] = {0x7b6f, 0x2c97, 0x73e7, 0x73cf, 0x5bc9, 0x79cf, 0x79ef,\n"
-        "                               0x7249, 0x7bef, 0x7bcf, 0x2};\n"
-        "float4 main(float4 p : SV_Position) : SV_Target {\n"
-        "  int2 q = (int2(p.xy) - c.xy) / max(c.z, 1) - int2(1, 1);\n"
-        "  uint chars[5]; uint n = 0;\n"
-        "  uint v = uint(c.w) / 10, t = uint(c.w) % 10;\n"
-        "  if (v >= 100) chars[n++] = (v / 100) % 10;\n"
-        "  if (v >= 10) chars[n++] = (v / 10) % 10;\n"
-        "  chars[n++] = v % 10; chars[n++] = 10; chars[n++] = t;\n"
-        "  float4 col = float4(0, 0, 0, 0.55);\n"
-        "  if (q.x >= 0 && q.y >= 0 && q.y < 5) {\n"
-        "    uint i = uint(q.x) / 4, x = uint(q.x) % 4;\n"
-        "    if (i < n && x < 3 && ((kFont[chars[i]] >> (14 - (uint(q.y) * 3 + x))) & 1))\n"
-        "      col = float4(1, 1, 1, 1);\n"
-        "  }\n"
-        "  return col;\n"
-        "}\n";
+    // FPS counter: c.xy = top-left (host pixels), c.z = font pixel size, c.w = frames per second x 10. 3x5 digits, drawn on a dark box
+    static const char kPSText[] = "cbuffer C : register(b0) { int4 c; };\n"
+                                  "static const uint kFont[11] = {0x7b6f, 0x2c97, 0x73e7, 0x73cf, 0x5bc9, 0x79cf, 0x79ef,\n"
+                                  "                               0x7249, 0x7bef, 0x7bcf, 0x2};\n"
+                                  "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                                  "  int2 q = (int2(p.xy) - c.xy) / max(c.z, 1) - int2(1, 1);\n"
+                                  "  uint chars[5]; uint n = 0;\n"
+                                  "  uint v = uint(c.w) / 10, t = uint(c.w) % 10;\n"
+                                  "  if (v >= 100) chars[n++] = (v / 100) % 10;\n"
+                                  "  if (v >= 10) chars[n++] = (v / 10) % 10;\n"
+                                  "  chars[n++] = v % 10; chars[n++] = 10; chars[n++] = t;\n"
+                                  "  float4 col = float4(0, 0, 0, 0.55);\n"
+                                  "  if (q.x >= 0 && q.y >= 0 && q.y < 5) {\n"
+                                  "    uint i = uint(q.x) / 4, x = uint(q.x) % 4;\n"
+                                  "    if (i < n && x < 3 && ((kFont[chars[i]] >> (14 - (uint(q.y) * 3 + x))) & 1))\n"
+                                  "      col = float4(1, 1, 1, 1);\n"
+                                  "  }\n"
+                                  "  return col;\n"
+                                  "}\n";
 
     if (!compile(kVS, L"vs_6_0", blit_vs_) || !compile(kPS, L"ps_6_0", blit_ps_) || !compile(kPSText, L"ps_6_0", blit_ps_text_) || !compile(kPSMS, L"ps_6_0", blit_ps_ms_) || !compile(kPSFxaa, L"ps_6_0", blit_ps_fxaa_))
     {
@@ -1723,7 +1717,6 @@ namespace sst::native
   void Renderer::PresentRenderTargets()
   {
     const D3D12_RECT full = Scaled({0, 0, LONG(width_), LONG(height_)}, output_scale_[target_]);
-
     // (Looked up by page: the texture may have been replaced since the resolve.)
     ResolvedTexture *present_source_ = nullptr;
 
@@ -1769,7 +1762,6 @@ namespace sst::native
     LARGE_INTEGER qpc;
     QueryPerformanceCounter(&qpc);
     const uint64_t now = uint64_t(qpc.QuadPart), frames = shown_frames_.load(std::memory_order_relaxed);
-
     static const double kFreq = []
     {
       LARGE_INTEGER f;
@@ -1815,6 +1807,7 @@ namespace sst::native
   }
 
   // render targets: resolves + trace
+
   namespace
   {
     float BeFloat(const uint8_t *base, uint32_t addr)
@@ -1832,9 +1825,8 @@ namespace sst::native
     const uint32_t dim = (fetch[5] >> 9) & 3, stacked = (fetch[1] >> 10) & 1;
     uint32_t w, h, d;
 
-    // 3D
     if (dim == 2)
-    {
+    { // 3D
       w = (fetch[2] & 0x7FF) + 1, h = ((fetch[2] >> 11) & 0x7FF) + 1, d = (fetch[2] >> 22) + 1;
     }
     else
@@ -1844,10 +1836,7 @@ namespace sst::native
 
     return fmt::format("{:08X} fmt {} {}x{}{} dim {}{}{} pitch {} endian {} swz {:03X} mips {:08X} "
                        "(type {})",
-                       fetch[1] & ~0xFFFu, format, w, h, d > 1 ? fmt::format("x{}", d) : "", dim,
-                       stacked ? " stacked" : "", (fetch[0] >> 31) ? " tiled" : " linear",
-                       ((fetch[0] >> 22) & 0x1FF) * 32, (fetch[1] >> 6) & 3,
-                       (fetch[3] >> 1) & 0xFFF, fetch[5] & ~0xFFFu, type);
+                       fetch[1] & ~0xFFFu, format, w, h, d > 1 ? fmt::format("x{}", d) : "", dim, stacked ? " stacked" : "", (fetch[0] >> 31) ? " tiled" : " linear", ((fetch[0] >> 22) & 0x1FF) * 32, (fetch[1] >> 6) & 3, (fetch[3] >> 1) & 0xFFF, fetch[5] & ~0xFFFu, type);
   }
 
   std::string Renderer::DescribeSurface(const uint8_t *base, uint32_t surface)
@@ -1900,14 +1889,11 @@ namespace sst::native
     uint32_t words[20];
     uint32_t n = 0;
 
-    // RT0-3, depth
     for (uint32_t i = 0; i < 5; ++i)
-      words[n++] = be32(base, dev + kDevRT0 + 4 * i);
-
-    words[n++] = be32(base, dev + 0x2880); // RB_SURFACE_INFO
-    words[n++] = be32(base, dev + 0x2884); // RB_COLOR_INFO
-    words[n++] = be32(base, dev + 0x2888); // RB_DEPTH_INFO
-
+      words[n++] = be32(base, dev + kDevRT0 + 4 * i); // RT0-3, depth
+    words[n++] = be32(base, dev + 0x2880);            // RB_SURFACE_INFO
+    words[n++] = be32(base, dev + 0x2884);            // RB_COLOR_INFO
+    words[n++] = be32(base, dev + 0x2888);            // RB_DEPTH_INFO
     for (uint32_t r = PA_CL_VPORT_XSCALE; r <= PA_CL_VPORT_ZOFFSET; ++r)
       words[n++] = Reg(base, dev, r);
 
@@ -1929,12 +1915,9 @@ namespace sst::native
     const float xs = RegF(base, dev, PA_CL_VPORT_XSCALE), ys = RegF(base, dev, PA_CL_VPORT_YSCALE);
     const float xo = RegF(base, dev, PA_CL_VPORT_XOFFSET), yo = RegF(base, dev, PA_CL_VPORT_YOFFSET);
     const uint32_t tl = words[n - 2], br = words[n - 1];
-    t.lines.push_back(fmt::format(
-        "pass {}: RT0 {} | RT1 {:08X} | depth {} | surface info {:08X} colour info {:08X} depth info "
-        "{:08X} | viewport scale {} {} offset {} {} | scissor {}x{}-{}x{}",
-        ++t.pass_index, DescribeSurface(base, words[0]), words[1], DescribeSurface(base, words[4]),
-        words[5], words[6], words[7], xs, ys, xo, yo, tl & 0x7FFF, (tl >> 16) & 0x7FFF, br & 0x7FFF,
-        (br >> 16) & 0x7FFF));
+    t.lines.push_back(fmt::format("pass {}: RT0 {} | RT1 {:08X} | depth {} | surface info {:08X} colour info {:08X} depth info "
+                                  "{:08X} | viewport scale {} {} offset {} {} | scissor {}x{}-{}x{}",
+                                  ++t.pass_index, DescribeSurface(base, words[0]), words[1], DescribeSurface(base, words[4]), words[5], words[6], words[7], xs, ys, xo, yo, tl & 0x7FFF, (tl >> 16) & 0x7FFF, br & 0x7FFF, (br >> 16) & 0x7FFF));
   }
 
   void Renderer::TraceDraw(const uint8_t *base, uint32_t dev, const DrawCall &call, bool morph)
@@ -1955,13 +1938,9 @@ namespace sst::native
       // Vertex-data draws (DrawVerticesUP / immediate mode): the raw vertices.
       const uint32_t vs_obj = be32(base, dev + kDevVS);
       ShaderEntry *vs = vs_obj ? ResolveShader(base, vs_obj, true) : nullptr;
-      std::string line = fmt::format(
-          "  {} draw: prim {} vertices {} stride {} vs {:016X} ps {:016X} depthcontrol {:08X} "
-          "blendcontrol {:08X} colorcontrol {:08X} mode {:08X}",
-          call.immediate ? "immediate-mode" : "DrawVerticesUP", call.prim, call.count, call.up_stride,
-          vs ? vs->hash : 0, ps ? ps->hash : 0, Reg(base, dev, RB_DEPTHCONTROL),
-          Reg(base, dev, RB_BLENDCONTROL0), Reg(base, dev, RB_COLORCONTROL),
-          Reg(base, dev, PA_SU_SC_MODE_CNTL));
+      std::string line = fmt::format("  {} draw: prim {} vertices {} stride {} vs {:016X} ps {:016X} depthcontrol {:08X} "
+                                     "blendcontrol {:08X} colorcontrol {:08X} mode {:08X}",
+                                     call.immediate ? "immediate-mode" : "DrawVerticesUP", call.prim, call.count, call.up_stride, vs ? vs->hash : 0, ps ? ps->hash : 0, Reg(base, dev, RB_DEPTHCONTROL), Reg(base, dev, RB_BLENDCONTROL0), Reg(base, dev, RB_COLORCONTROL), Reg(base, dev, PA_SU_SC_MODE_CNTL));
       const uint32_t words = std::min(call.up_stride / 4, 8u);
       const uint32_t shown = std::min(call.count, 6u);
 
@@ -2047,12 +2026,9 @@ namespace sst::native
     if (PlausibleAddress(c.clear_color))
       colour = fmt::format("{} {} {} {}", BeFloat(base, c.clear_color), BeFloat(base, c.clear_color + 4), BeFloat(base, c.clear_color + 8), BeFloat(base, c.clear_color + 12));
 
-    const std::string line = fmt::format(
-        "resolve flags {:X} from {} rect {} {} {} {} -> texture {:08X} {} at {} {} level {} slice {} "
-        "clear colour {} z {}",
-        c.flags, which == 4 ? "depth" : fmt::format("RT{}", which & 3), rect[0], rect[1], rect[2],
-        rect[3], c.dst_texture, fetch[0] ? DescribeTexture(fetch) : std::string("(none)"), point[0],
-        point[1], c.level, c.slice, colour, c.clear_z);
+    const std::string line = fmt::format("resolve flags {:X} from {} rect {} {} {} {} -> texture {:08X} {} at {} {} level {} slice {} "
+                                         "clear colour {} z {}",
+                                         c.flags, which == 4 ? "depth" : fmt::format("RT{}", which & 3), rect[0], rect[1], rect[2], rect[3], c.dst_texture, fetch[0] ? DescribeTexture(fetch) : std::string("(none)"), point[0], point[1], c.level, c.slice, colour, c.clear_z);
 
     if (rt_trace_.active)
     {
@@ -2061,7 +2037,9 @@ namespace sst::native
       rt_trace_.lines.push_back("     source surface " + DescribeSurface(base, surface));
     }
 
-    if (LogOnce(0xA700000000000000ull ^ (uint64_t(c.flags) << 40) ^ (fetch[1] & ~0xFFFu) ^ (uint64_t(surface) << 8)) && stats_.resolves_logged++ < 40)
+    if (capture_active_)
+      REXLOG_INFO("[sst-native] capture (before draw {}): {} source {:08X}{}", draw_seq_ + 1, line, surface, scene_surfaces_.count(surface) ? " (scene)" : "");
+    else if (LogOnce(0xA700000000000000ull ^ (uint64_t(c.flags) << 40) ^ (fetch[1] & ~0xFFFu) ^ (uint64_t(surface) << 8)) && stats_.resolves_logged++ < 40)
       REXLOG_INFO("[sst-native] {}", line);
 
     // the copy
@@ -2081,7 +2059,7 @@ namespace sst::native
 
       if (LogOnce(0xAD00000000000000ull ^ (uint64_t(c.flags) << 32) ^ surface))
         REXLOG_INFO("[sst-native] resolve skipped ({}): {}", src_it == map.end() ? "nothing drawn to the source yet" : c.level != 0 ? "mip level"
-                                                                                                                                  : "destination",
+                                                                                                                                    : "destination",
                     line);
 
       return;
@@ -2134,7 +2112,6 @@ namespace sst::native
     const uint32_t dst_swizzle = (fetch[3] >> 1) & 0xFFF;
     const bool swap_rb = !depth && (dst_swizzle & 7) == 2 && ((dst_swizzle >> 6) & 7) == 0;
     dst->rb_swapped = swap_rb;
-
     {
       const float k = src.scale;
       const D3D12_RECT host = Scaled(dr, k);
@@ -2142,7 +2119,6 @@ namespace sst::native
       const bool fxaa = fxaa_ && !depth && !stacked && src.samples == 1 && scene_surfaces_.count(surface);
       Blit(src.srv, Px(sx0 + (dr.left - px), k), Px(sy0 + (dr.top - py), k), RtRtv(dst->rtvs[slice]), dst->format, host, swap_rb, 0.0f, src.samples | (depth ? 0x100u : 0u), fxaa);
     }
-
     {
       auto b = Transition(dst->resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
       list_->ResourceBarrier(1, &b);
@@ -2192,6 +2168,7 @@ namespace sst::native
   }
 
   // performance helpers
+
   bool Renderer::GeoCacheUsable()
   {
     if (REXCVAR_GET(sst_native_geometry_cache_mb) <= 0 || capture_active_ || REXCVAR_GET(sst_native_check_vs) || REXCVAR_GET(sst_native_check_vs_all) || REXCVAR_GET(sst_native_check_late_writes))
@@ -2222,7 +2199,6 @@ namespace sst::native
 
     if (!geo_pool_)
       return false;
-
     // Buffers decay to COMMON after each submission: make it readable as vertex / index data for this frame's draws
     const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER);
 
@@ -2248,10 +2224,8 @@ namespace sst::native
 
     const uint64_t aligned = (uint64_t(size) + 255) & ~uint64_t(255);
 
-    // not worth a quarter of the pool
     if (aligned > geo_pool_size_ / 4)
-      return;
-
+      return; // not worth a quarter of the pool
     if (geo_offset_ + aligned > geo_pool_size_)
     {
       // Full: start over. Older entries become misses (generation); copies later in this frame are ordered after the draws that read the old data
@@ -2285,7 +2259,6 @@ namespace sst::native
 
     uint32_t result = 4096;
     const std::vector<uint8_t> &ct = e->container;
-
     auto ct32 = [&](size_t at) -> uint32_t
     {
       return at + 4 <= ct.size() ? (uint32_t(ct[at]) << 24) | (uint32_t(ct[at + 1]) << 16) | (uint32_t(ct[at + 2]) << 8) | ct[at + 3] : 0;
@@ -2405,9 +2378,10 @@ namespace sst::native
       const double wall_ms = std::chrono::duration<double, std::milli>(now - p.period_start).count();
       const double ms_per_tick = wall_ms / double(std::max<uint64_t>(1, tsc - p.period_tsc));
       const double frames = double(p.frames);
-
       auto ms = [&](Phase ph)
-      { return double(p.ticks[ph]) * ms_per_tick / frames; };
+      {
+        return double(p.ticks[ph]) * ms_per_tick / frames;
+      };
 
       double renderer = 0;
 
@@ -2418,24 +2392,14 @@ namespace sst::native
       const double frame = p.frame_ms_sum / frames;
       REXLOG_INFO("[sst-native] perf: {:.1f} fps, frame {:.2f} ms avg / {:.1f} max ({:.0f}% over "
                   "1/60 s, {:.0f}% over 1/30 s); GPU {:.2f} ms avg / {:.1f} max",
-                  1000.0 / frame, frame, p.frame_ms_max, 100.0 * p.over_60 / frames,
-                  100.0 * p.over_30 / frames,
-                  p.gpu_frames ? p.gpu_ms_sum / p.gpu_frames : 0.0, p.gpu_ms_max);
+                  1000.0 / frame, frame, p.frame_ms_max, 100.0 * p.over_60 / frames, 100.0 * p.over_30 / frames, p.gpu_frames ? p.gpu_ms_sum / p.gpu_frames : 0.0, p.gpu_ms_max);
       REXLOG_INFO("[sst-native] perf: {} per frame: {:.2f} ms in the renderer, {:.2f} ms "
                   "{}; renderer: memexport {:.2f}, shaders {:.2f}, "
                   "inputs {:.2f}, indices {:.2f}, pipelines {:.2f}, vertices {:.2f}, constants "
                   "{:.2f}, textures {:.2f}, recording {:.2f}, other {:.2f}, clears {:.2f}, "
                   "submit {:.2f}; waits: GPU {:.2f}, morphs {:.2f}",
-                  threaded_ ? "render thread" : "game thread", renderer,
-                  std::max(0.0, frame - renderer),
-                  threaded_ ? "idle (waiting for the game's next frame)"
-                            : "in the game (and its own D3D)",
-                  ms(kPhMemexport), ms(kPhShaders),
-                  ms(kPhInputs), ms(kPhIndices), ms(kPhPipeline), ms(kPhVertices),
-                  ms(kPhConstants), ms(kPhTextures), ms(kPhRecord), ms(kPhOther), ms(kPhClear),
-                  ms(kPhSubmit), ms(kPhFenceWait), stats_.memexport_wait_ms / frames);
+                  threaded_ ? "render thread" : "game thread", renderer, std::max(0.0, frame - renderer), threaded_ ? "idle (waiting for the game's next frame)" : "in the game (and its own D3D)", ms(kPhMemexport), ms(kPhShaders), ms(kPhInputs), ms(kPhIndices), ms(kPhPipeline), ms(kPhVertices), ms(kPhConstants), ms(kPhTextures), ms(kPhRecord), ms(kPhOther), ms(kPhClear), ms(kPhSubmit), ms(kPhFenceWait), stats_.memexport_wait_ms / frames);
       uint64_t acquires, repeats, skips;
-
       {
         std::lock_guard lock(slot_mutex_);
         acquires = acquires_;
@@ -2458,6 +2422,7 @@ namespace sst::native
   }
 
   // frame
+
   uint32_t Renderer::UsableSamples(DXGI_FORMAT format, uint32_t samples)
   {
     while (samples > 1)
@@ -2582,9 +2547,7 @@ namespace sst::native
 
       if (scale != scale_ || scene != scene_scale_ || shadow_scale != shadow_scale_ || shadows_off_ != (shadow == 0))
       {
-        REXLOG_INFO("[sst-native] internal resolution {}x{}, 3D {}x{}, shadow map {}",
-                    PxU(width_, scale), PxU(height_, scale), PxU(width_, scene),
-                    PxU(height_, scene), shadow ? fmt::format("{0}x{0}", shadow) : "off");
+        REXLOG_INFO("[sst-native] internal resolution {}x{}, 3D {}x{}, shadow map {}", PxU(width_, scale), PxU(height_, scale), PxU(width_, scene), PxU(height_, scene), shadow ? fmt::format("{0}x{0}", shadow) : "off");
         scale_ = scale;
         scene_scale_ = scene;
         shadow_scale_ = shadow_scale;
@@ -2617,14 +2580,14 @@ namespace sst::native
 
       const float s = height_ > 720 ? 1.0f : kAspects[aspect] / (16.0f / 9.0f); // display stretch
       ui_fit_x_ = s > 1.0f ? 1.0f / s : 1.0f;
-      ui_fit_y_ = s < 1.0f ? s : 1.0f;
+      // Narrower than 16:9 (16:10): the 2D layer is stretched to the full height (11 % taller) instead of fitted into a 16:9 box. The rules that decide what to fit are built around the screen's width (full-width layers stay full), so a vertical fit split bars from their texts and left uncovered bands above and below the menus; stretched, everything stays together
+      ui_fit_y_ = 1.0f;
 
       if (aspect != aspect_)
         REXLOG_INFO("[sst-native] aspect ratio {}: UI fit {:.3f} x {:.3f}", std::array<const char *, 5>{"4:3", "16:9", "16:10", "21:9", "32:9"}[aspect], ui_fit_x_, ui_fit_y_);
 
       aspect_ = aspect;
     }
-
     {
       std::lock_guard lock(slot_mutex_);
       // A slot that holds nothing still to be shown: not the one being copied (pinned), not the last one shown (a swap may show it again), not a frame waiting its turn; else the oldest waiting frame (dropped)
@@ -2664,7 +2627,6 @@ namespace sst::native
 
     frame_res_ = uint32_t(submitted_ % kSlots);
     FrameResources &f = frames_[frame_res_];
-
     {
       const uint64_t t0 = Tick();
       WaitFence(f.fence_value);
@@ -2674,20 +2636,16 @@ namespace sst::native
     ReadGpuTime(frame_res_);
     constant_cache_.clear();
     bound_targets_ = 0;
-
     {
       const uint64_t done = fence_->GetCompletedValue();
       std::erase_if(retired_rts_, [&](const auto &r)
                     { return r.first <= done; });
     }
 
-    // decayed after the last submission
-    geo_state_ = D3D12_RESOURCE_STATE_COMMON;
-
+    geo_state_ = D3D12_RESOURCE_STATE_COMMON; // decayed after the last submission
     if (geo_entries_.size() > 400000)
     {
-      // forget old keys (data is re-stored on next use)
-      geo_entries_.clear();
+      geo_entries_.clear(); // forget old keys (data is re-stored on next use)
       ++geo_generation_;
       geo_offset_ = 0;
     }
@@ -2744,7 +2702,6 @@ namespace sst::native
 
     if (!recording_)
       BeginFrame();
-
     // --sst_native_check_late_writes: did any draw's index / vertex data change after the draw was issued (the console's GPU would have read it later)?
     for (const LateCheck &lc : late_checks_)
     {
@@ -2766,9 +2723,7 @@ namespace sst::native
           REXLOG_WARN("[sst-native] late write: {} data of draw (VS {:016X}, prim {}, count {}{}) "
                       "changed after the draw was issued, before the frame ended ({} bytes at "
                       "host {}, {} draws ago)",
-                      g.index ? std::string("index") : fmt::format("vertex stream {}", lc.ranges[0].index ? r - 1 : r),
-                      lc.vs, lc.prim, lc.count, lc.morph ? ", reads morph output" : "", g.size,
-                      fmt::ptr(g.ptr), draw_seq_ - lc.draw);
+                      g.index ? std::string("index") : fmt::format("vertex stream {}", lc.ranges[0].index ? r - 1 : r), lc.vs, lc.prim, lc.count, lc.morph ? ", reads morph output" : "", g.size, fmt::ptr(g.ptr), draw_seq_ - lc.draw);
         }
       }
     }
@@ -2785,10 +2740,7 @@ namespace sst::native
 
     if (capturing)
     {
-      D3D12_RESOURCE_BARRIER b[2] = {
-          Transition(so_buffer_.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE),
-          {}};
-
+      D3D12_RESOURCE_BARRIER b[2] = {Transition(so_buffer_.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE), {}};
       list_->ResourceBarrier(1, b);
       list_->CopyResource(so_readback_.Get(), so_buffer_.Get());
       b[0] = Transition(so_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2819,7 +2771,6 @@ namespace sst::native
       FinishCapture();
       captured_.clear();
     }
-
     // F9 (or --sst_native_capture_frame) captures the next frame
     capture_quiet_ = REXCVAR_GET(sst_native_capture_frame) == -1;
 
@@ -2974,6 +2925,7 @@ namespace sst::native
   }
 
   // clear
+
   void Renderer::Clear(const uint8_t *base, uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil)
   {
     PhaseClock clk(prof_, kPhClear);
@@ -3017,7 +2969,6 @@ namespace sst::native
       const uint32_t clear_ds = be32(base, device + kDevDepth);
       const float rs = SurfaceScale(base, device, rt0, clear_ds);
       const uint32_t samples = (scene_surfaces_.count(rt0) || scene_surfaces_.count(clear_ds)) ? msaa_ : 1;
-
       auto area = [&](const HostRT &rt)
       {
         D3D12_RECT r = {0, 0, LONG(rt.width), LONG(rt.height)};
@@ -3088,7 +3039,6 @@ namespace sst::native
       if (!selected)
         return;
     }
-
     // Xbox D3DCLEAR_TARGET0..3 = 0x10..0x80 (the D3D clear helper masks 0xF0 out before handling depth / stencil); the low bits are depth / stencil
     if ((flags & 0xF0) && rt0)
     {
@@ -3112,6 +3062,7 @@ namespace sst::native
   }
 
   // pipelines
+
   uint64_t Renderer::DxilHash(const ShaderVariant *v)
   {
     if (!v)
@@ -3192,9 +3143,8 @@ namespace sst::native
     d.pRootSignature = root_signature_.Get();
     d.VS = {vs->dxil.data(), vs->dxil.size()};
 
-    // null: depth-only
     if (ps)
-      d.PS = {ps->dxil.data(), ps->dxil.size()};
+      d.PS = {ps->dxil.data(), ps->dxil.size()}; // null: depth-only
 
     const uint32_t b = key.blend;
     D3D12_RENDER_TARGET_BLEND_DESC &rt = d.BlendState.RenderTarget[0];
@@ -3236,7 +3186,6 @@ namespace sst::native
     job->hash = hash;
     job->layout = layout;
     job->desc = d;
-
     // Library name: everything in the key, with the shaders by content (the variant pointers differ between runs)
     {
       PipelineKey stable = key;
@@ -3269,6 +3218,7 @@ namespace sst::native
   }
 
   // draw
+
   ShaderEntry *Renderer::ResolveShader(const uint8_t *base, uint32_t object, bool vertex)
   {
     if (!object)
@@ -3293,7 +3243,6 @@ namespace sst::native
   ShaderEntry *Renderer::ResolveShaderSlow(const uint8_t *base, uint32_t object, bool vertex, uint32_t vcopy, uint32_t vsize, uint32_t ucode_ptr)
   {
     const uint64_t vhash = vsize && vsize < 0x10000 ? XXH3_64bits(GuestPtr(base, vcopy), vsize) : 0;
-
     auto microcode_matches = [&](const ShaderEntry *e) -> bool
     {
       const std::vector<uint8_t> &ct = e->container;
@@ -3376,7 +3325,6 @@ namespace sst::native
           REXLOG_WARN("[sst-native] {} shader object {:08X} now holds a different shader (was "
                       "{:016X}); rebuilding it from the object",
                       vertex ? "vertex" : "pixel", object, e->hash);
-
         it->second = vhash;
         object_ucode_[object] = ucode_ptr;
         // Fall through: rebuild from the object (or find the matching container)
@@ -3387,7 +3335,6 @@ namespace sst::native
       object_vhash_[object] = vhash;
       object_ucode_[object] = ucode_ptr;
     }
-
     // Object layout (CreateVertexShader / CreatePixelShader): a copy of the container's virtual part at +0x368 (VS) / +0x28 (PS), and the microcode (physical part) pointer at +0x20 (VS) / +0x18 (PS)
     const uint32_t copy = object + (vertex ? 0x368 : 0x28);
     const uint32_t flags = be32(base, copy);
@@ -3415,7 +3362,6 @@ namespace sst::native
   const char *Renderer::LoadVsState(const uint8_t *base, uint32_t dev, uint32_t vs_obj, const ShaderEntry *vs_entry, std::vector<uint32_t> &ucode, float *constants, uint32_t bools[8], uint32_t fetch[192], uint32_t loops[32], uint32_t *literals_out)
   {
     const std::vector<uint8_t> &ct = vs_entry->container;
-
     auto ct32 = [&](size_t at) -> uint32_t
     {
       return at + 4 <= ct.size() ? (uint32_t(ct[at]) << 24) | (uint32_t(ct[at + 1]) << 16) | (uint32_t(ct[at + 2]) << 8) | ct[at + 3] : 0;
@@ -3465,7 +3411,6 @@ namespace sst::native
     if (table && table + 0x14 <= ct.size())
     {
       size_t at = size_t(table) + 0x14; // DefinitionTable::definitions
-
       for (; at + 8 <= ct.size() && ct32(at); at += 8)
       {
         const uint32_t w = ct32(at);
@@ -3488,7 +3433,6 @@ namespace sst::native
       }
 
       at += 4; // terminator
-
       for (; at + 4 <= ct.size() && ct32(at);)
       {
         const uint32_t w = ct32(at);
@@ -3516,8 +3460,8 @@ namespace sst::native
   Renderer::DrawExtent Renderer::MeasureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count)
   {
     DrawExtent e;
-
-    if (call.up_data || !vertex_count || vertex_count > 512 || !vs_entry)
+    // (Up to 4096 vertices: the star background at 32:9 batches ~1200 into one draw; unmeasured, it would not be fitted and would show stretched.)
+    if (call.up_data || !vertex_count || vertex_count > 4096 || !vs_entry)
       return e;
 
     uint32_t bools[8], fetch[192], loops[32];
@@ -3684,10 +3628,7 @@ namespace sst::native
               REXLOG_WARN("[sst-native] vertex jump (CPU-run shader): VS {:016X} buffer {:08X}{} "
                           "draw {} vertices from {}: {} vertices jumped (median move {:.4f}); "
                           "vertex {} screen ({:.3f} {:.3f}) -> ({:.3f} {:.3f}), clip ({} {} {} {});{}",
-                          vs_entry->hash, stream0, reads_morph ? " (face)" : "", vertex_count,
-                          first_vertex, jumps, median, first_vertex + first_jump,
-                          h.ndc[2 * first_jump], h.ndc[2 * first_jump + 1], ndc[2 * first_jump],
-                          ndc[2 * first_jump + 1], p[0], p[1], p[2], p[3], inputs);
+                          vs_entry->hash, stream0, reads_morph ? " (face)" : "", vertex_count, first_vertex, jumps, median, first_vertex + first_jump, h.ndc[2 * first_jump], h.ndc[2 * first_jump + 1], ndc[2 * first_jump], ndc[2 * first_jump + 1], p[0], p[1], p[2], p[3], inputs);
             }
           }
         }
@@ -3732,9 +3673,7 @@ namespace sst::native
       REXLOG_WARN("[sst-native] spike? VS {:016X} prim {} {} draw {} vertices from {} (buffer "
                   "{:08X}{}): {} of {} vertices far outside the view, first vertex {} at clip "
                   "({} {} {} {});{} [key seen {} times, {} flagged]",
-                  vs_entry->hash, call.prim, call.indexed ? "indexed" : "auto", vertex_count,
-                  first_vertex, stream0, reads_morph ? ", morph output" : "", extreme, exported,
-                  first_vertex + first, p[0], p[1], p[2], p[3], inputs, e.checked, e.flagged);
+                  vs_entry->hash, call.prim, call.indexed ? "indexed" : "auto", vertex_count, first_vertex, stream0, reads_morph ? ", morph output" : "", extreme, exported, first_vertex + first, p[0], p[1], p[2], p[3], inputs, e.checked, e.flagged);
     }
   }
 
@@ -3823,14 +3762,11 @@ namespace sst::native
 
           const float *a = &h.positions[3 * first];
           const float *b = &cur[3 * first];
-
           REXLOG_WARN("[sst-native] morph jump: VS {:016X} buffer {:08X} draw {} vertices from {}: "
                       "{} vertices moved > 25% of the mesh size {:.2f} (worst {:.2f}); vertex {} "
                       "({:.3f} {:.3f} {:.3f}) -> ({:.3f} {:.3f} {:.3f}); previous draw of this "
                       "mesh {} frames / {} draws ago; {}",
-                      vs_entry->hash, stream0, vertex_count, first_vertex, jumps, h.extent, worst,
-                      first_vertex + first, a[0], a[1], a[2], b[0], b[1], b[2],
-                      submitted_ - h.frame, draw_seq_ - h.draw, writes);
+                      vs_entry->hash, stream0, vertex_count, first_vertex, jumps, h.extent, worst, first_vertex + first, a[0], a[1], a[2], b[0], b[1], b[2], submitted_ - h.frame, draw_seq_ - h.draw, writes);
         }
       }
     }
@@ -3895,7 +3831,6 @@ namespace sst::native
   {
     ++stats_.memexport_draws;
     const uint32_t dev = call.device;
-
     auto fail = [&](const char *why)
     {
       ++stats_.memexport_failed;
@@ -4191,8 +4126,7 @@ namespace sst::native
 
             REXLOG_WARN("[sst-native] memexport VS {:016X} at {:08X}: {} implausible values of {} "
                         "(first: float {} = {}); vertices {}; c1-c4{}",
-                        p.vs_hash, p.begin[0], bad, p.size[0] / 4, first_bad, first_value,
-                        p.count, weights);
+                        p.vs_hash, p.begin[0], bad, p.size[0] / 4, first_bad, first_value, p.count, weights);
           }
         }
       }
@@ -4210,11 +4144,7 @@ namespace sst::native
     if (LogOnce(0xC500000000000000ull ^ p.vs_hash) || LogOnce(0xC600000000000000ull ^ (uint64_t(p.begin[0]) << 8)))
       REXLOG_INFO("[sst-native] memexport VS {:016X}: {} vertices ({}) -> {} elements, format {} "
                   "at {:08X} ({} streams, {} literal constants, c255 {} {} {} {}); {:.3f} ms;{}",
-                  p.vs_hash, p.count, p.indexed ? "indexed" : "auto", written,
-                  job.stats.last_format, job.stats.last_base, p.stream_count, p.literals,
-                  job.constants[1020], job.constants[1021], job.constants[1022],
-                  job.constants[1023], job.ms,
-                  DescribeMicrocode(job.ucode.data(), uint32_t(job.ucode.size())));
+                  p.vs_hash, p.count, p.indexed ? "indexed" : "auto", written, job.stats.last_format, job.stats.last_base, p.stream_count, p.literals, job.constants[1020], job.constants[1021], job.constants[1022], job.constants[1023], job.ms, DescribeMicrocode(job.ucode.data(), uint32_t(job.ucode.size())));
   }
 
   void Renderer::Draw(const uint8_t *base, const DrawCall &call)
@@ -4260,12 +4190,7 @@ namespace sst::native
     if (LogOnce(0x9000000000000000ull | rt0))
       REXLOG_INFO("[sst-native] render target {:08X}: size word {:08X} (~{}x{}), depth {:08X}, "
                   "viewport scale {} {} {} offset {} {} {}, VTE {:08X}",
-                  rt0, rt_size, (rt_size >> 18) + 1, ((rt_size >> 3) & 0x7FFF) + 1,
-                  be32(base, dev + kDevDepth), RegF(base, dev, PA_CL_VPORT_XSCALE),
-                  RegF(base, dev, PA_CL_VPORT_YSCALE), RegF(base, dev, PA_CL_VPORT_ZSCALE),
-                  RegF(base, dev, PA_CL_VPORT_XOFFSET), RegF(base, dev, PA_CL_VPORT_YOFFSET),
-                  RegF(base, dev, PA_CL_VPORT_ZOFFSET), Reg(base, dev, PA_CL_VTE_CNTL));
-
+                  rt0, rt_size, (rt_size >> 18) + 1, ((rt_size >> 3) & 0x7FFF) + 1, be32(base, dev + kDevDepth), RegF(base, dev, PA_CL_VPORT_XSCALE), RegF(base, dev, PA_CL_VPORT_YSCALE), RegF(base, dev, PA_CL_VPORT_ZSCALE), RegF(base, dev, PA_CL_VPORT_XOFFSET), RegF(base, dev, PA_CL_VPORT_YOFFSET), RegF(base, dev, PA_CL_VPORT_ZOFFSET), Reg(base, dev, PA_CL_VTE_CNTL));
     const bool rt_mode = RenderTargetsEnabled();
     const bool rt_selected = rt_mode || RenderTargetSelected(base, dev, rt_size);
 
@@ -4283,7 +4208,6 @@ namespace sst::native
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
     bool rect_list = false;
     bool convert = false; // TRIFAN / QUADLIST -> indexed triangle list
-
     switch (call.prim)
     {
     case 1:
@@ -4312,6 +4236,7 @@ namespace sst::native
       break;
 
     case 5: // TRIFAN
+
     case 0xD: // QUADLIST
       if (!REXCVAR_GET(sst_native_quads))
       {
@@ -4372,7 +4297,6 @@ namespace sst::native
     }
 
     const uint32_t virtual_size = (uint32_t(vs_entry->container[4]) << 24) | (uint32_t(vs_entry->container[5]) << 16) | (uint32_t(vs_entry->container[6]) << 8) | vs_entry->container[7];
-
     struct FetchStream
     {
       uint32_t slot;   // fetch constant slot (2-dword units)
@@ -4381,7 +4305,6 @@ namespace sst::native
 
     FetchStream fetch_streams[kMaxStreams];
     uint32_t fetch_stream_count = 0;
-
     auto stream_index = [&](uint32_t slot, uint32_t stride) -> int
     {
       for (uint32_t i = 0; i < fetch_stream_count; ++i)
@@ -4396,10 +4319,8 @@ namespace sst::native
     };
 
     std::vector<sst::xenos::VertexInput> inputs = vs_entry->vertex_inputs;
-
     std::sort(inputs.begin(), inputs.end(), [](const auto &x, const auto &y)
               { return x.address < y.address; });
-
     struct HostElement
     {
       FetchElement fetch;
@@ -4429,7 +4350,6 @@ namespace sst::native
 
     std::vector<LiveFetch> live_fetches;
     live_fetches.reserve(inputs.size());
-
     auto container_dword = [&](size_t at) -> uint32_t
     {
       if (at + 4 > vs_entry->container.size())
@@ -4479,7 +4399,6 @@ namespace sst::native
         continue;
 
       const uint32_t o1 = self->o1 ? self->o1 : self->l1; // original swizzle
-
       // Live instruction writing the original destination register
       const LiveFetch *match = self;
 
@@ -4545,9 +4464,8 @@ namespace sst::native
       h.stream = -1;
       h.fetch_addr = 0;
 
-      // vertex fetch opcode
       if ((l0 & 0x1F) == 0)
-      {
+      {                                               // vertex fetch opcode
         const int32_t offset = int32_t(l2 << 1) >> 9; // bits 8-30, signed, in dwords
         FetchElement &f = h.fetch;
         f.format = (l1 >> 16) & 0x3F;
@@ -4563,11 +4481,9 @@ namespace sst::native
         {
           const uint32_t o = (o1 >> (3 * i)) & 7, l = (l1 >> (3 * i)) & 7;
 
-          // the shader doesn't read the input for this destination
           if (o >= 4)
-            continue;
-
-          // Patched destination 6 (invalid) / 7 (keep: the register's previous value, zero for a fetch into a fresh register) read as 0.
+            continue; // the shader doesn't read the input for this destination
+          // Patched destination 6 (invalid) / 7 (keep: the register's previous value, zero for a fetch into a fresh register) read as 0
           const uint8_t hw = uint8_t(l >= 6 ? 4 : l);
 
           if ((set >> o) & 1)
@@ -4593,15 +4509,12 @@ namespace sst::native
         if (capture_active_)
           capture_detail += fmt::format(" {}{}[live {:08X} {:08X} {:08X} orig {:08X} fmt {} sel {}{}{}{} "
                                         "off {}]",
-                                        d.SemanticName, d.SemanticIndex, l0, l1, l2, o1, f.format,
-                                        f.sel[0], f.sel[1], f.sel[2], f.sel[3], offset * 4);
+                                        d.SemanticName, d.SemanticIndex, l0, l1, l2, o1, f.format, f.sel[0], f.sel[1], f.sel[2], f.sel[3], offset * 4);
 
         if (LogOnce(0xE200000000000000ull | (uint64_t(in.usage) << 40) | (uint64_t(l1 & 0x3FFFFFFF))))
           REXLOG_INFO("[sst-native] vertex input {}{}: format {} {} {} exp {} swizzle {:03X}->{:03X} "
                       "(sel {}{}{}{}) offset {} stride {}",
-                      d.SemanticName, d.SemanticIndex, f.format, f.is_signed ? "signed" : "unsigned",
-                      f.normalized ? "norm" : "int", f.exp_adjust, o1 & 0xFFF, l1 & 0xFFF,
-                      f.sel[0], f.sel[1], f.sel[2], f.sel[3], offset * 4, (l2 & 0xFF) * 4);
+                      d.SemanticName, d.SemanticIndex, f.format, f.is_signed ? "signed" : "unsigned", f.normalized ? "norm" : "int", f.exp_adjust, o1 & 0xFFF, l1 & 0xFFF, f.sel[0], f.sel[1], f.sel[2], f.sel[3], offset * 4, (l2 & 0xFF) * 4);
       }
 
       if (h.stream < 0 && LogOnce(0xE000000000000000ull | (uint64_t(vs_entry->hash & 0xFFFFFFFF) << 16) | in.address))
@@ -4675,8 +4588,7 @@ namespace sst::native
 
       if (shadows_off_ && rs == shadow_scale_ && (shadow_surfaces_.count(rt0) || shadow_surfaces_.count(ds_surface)))
       {
-        // VIDEO > SHADOWS OFF: nothing drawn into the shadow map
-        ++stats_.skip_cull;
+        ++stats_.skip_cull; // VIDEO > SHADOWS OFF: nothing drawn into the shadow map
         return;
       }
 
@@ -4691,16 +4603,14 @@ namespace sst::native
 
       if (bloom_off_ && BloomSurface(*color_rt, rt0))
       {
-        // VIDEO > BLOOM OFF: the glow / bloom targets stay black
-        ++stats_.skip_cull;
+        ++stats_.skip_cull; // VIDEO > BLOOM OFF: the glow / bloom targets stay black
         return;
       }
 
       const uint32_t ds = be32(base, dev + kDevDepth);
 
-      // stencil or depth test on
       if (ds && (depthcontrol & 3))
-      {
+      { // stencil or depth test on
         depth_rt = GetHostRT(base, ds, true, rs, samples, vw, vh);
 
         if (depth_rt && (depth_rt->width != color_rt->width || depth_rt->height != color_rt->height || depth_rt->samples != color_rt->samples))
@@ -4708,9 +4618,7 @@ namespace sst::native
           if (LogOnce(0xAC00000000000000ull ^ (uint64_t(rt0) << 24) ^ ds))
             REXLOG_INFO("[sst-native] colour target {:08X} ({}x{}) and depth {:08X} ({}x{}) differ "
                         "in size: drawing without depth",
-                        rt0, color_rt->width, color_rt->height, ds, depth_rt->width,
-                        depth_rt->height);
-
+                        rt0, color_rt->width, color_rt->height, ds, depth_rt->width, depth_rt->height);
           depth_rt = nullptr;
         }
       }
@@ -4726,9 +4634,8 @@ namespace sst::native
     const bool alpha_test = (colorcontrol >> 3) & 1;
     const uint32_t alpha_func = colorcontrol & 7;
 
-    // NEVER
     if (alpha_test && alpha_func == 0)
-    {
+    { // NEVER
       ++stats_.skip_cull;
       return;
     }
@@ -4736,9 +4643,8 @@ namespace sst::native
     if (alpha_test && alpha_func != 7)
       ps_spec |= sst::xenos::kSpecAlphaTest;
 
-    // both faces culled
     if ((mode & 3) == 3)
-    {
+    { // both faces culled
       ++stats_.skip_cull;
       return;
     }
@@ -4778,7 +4684,6 @@ namespace sst::native
       REXLOG_INFO("[sst-native] new state: colour mask {:X} blend {:08X} depth {:08X} colour "
                   "control {:08X} mode {:08X}",
                   key.color_mask, key.blend, depthcontrol, colorcontrol, mode);
-
     key.depth_enable = has_depth && ((depthcontrol >> 1) & 1);
     key.depth_write = key.depth_enable && ((depthcontrol >> 2) & 1);
     key.depth_func = key.depth_enable ? uint8_t((depthcontrol >> 4) & 7) : 7;
@@ -4856,7 +4761,6 @@ namespace sst::native
 
       if (LogOnce(0xC100000000000000ull | (index32 ? 4 : 0) | index_endian))
         REXLOG_INFO("[sst-native] index buffer: {}-bit, swap mode {} (Common {:08X})", index32 ? 32 : 16, index_endian, common);
-
       // Swap whole dwords around the referenced range, then read little-endian
       const uint32_t isz = index32 ? 4 : 2;
       const uint32_t first_byte = call.start * isz;
@@ -4939,8 +4843,7 @@ namespace sst::native
           vmin = std::min(vmin, v);
           vmax = std::max(vmax, v);
         }
-      }
-
+      } // !index_hit
       if (vmin > vmax || vmax - vmin >= kMaxDrawVertices)
       {
         ++stats_.skip_data;
@@ -4982,7 +4885,6 @@ namespace sst::native
     // Vertex data: resolve each fetch constant, then decode the referenced vertex range into one host stream (16 bytes per input)
     const uint32_t first_vertex = call.indexed ? call.base_vertex + vmin : call.start;
     const uint32_t vertex_count = vmax - vmin + 1;
-
     struct ResolvedStream
     {
       const uint8_t *src;
@@ -5027,9 +4929,7 @@ namespace sst::native
           return;
         }
 
-        // background morph output this draw reads
-        WaitMemexports(phys, phys + size);
-
+        WaitMemexports(phys, phys + size); // background morph output this draw reads
         for (const auto &[mb, me] : memexport_ranges_)
         {
           if (phys < me && phys + size > mb)
@@ -5038,7 +4938,6 @@ namespace sst::native
             return;
           }
         }
-
         // Diagnostics for draws reading morph output: is it this frame's, and does the draw stay inside what the morph wrote?
         {
           const uint64_t read_begin = uint64_t(phys) + uint64_t(first_vertex) * fs.stride;
@@ -5066,8 +4965,7 @@ namespace sst::native
               if (LogOnce(0xC700000000000000ull ^ (uint64_t(phys) << 16) ^ read_end))
                 REXLOG_WARN("[sst-native] draw reads past morph output: fetch {:08X} stride {} "
                             "vertices {}+{} (bytes {:08X}-{:08X})",
-                            phys, fs.stride, first_vertex, vertex_count, uint32_t(read_begin),
-                            uint32_t(read_end));
+                            phys, fs.stride, first_vertex, vertex_count, uint32_t(read_begin), uint32_t(read_end));
             }
           }
           else
@@ -5082,7 +4980,6 @@ namespace sst::native
                   REXLOG_WARN("[sst-native] draw reads morph output written last frame, not "
                               "this one (yet): fetch {:08X} stride {} vertices {}+{}",
                               phys, fs.stride, first_vertex, vertex_count);
-
                 break;
               }
             }
@@ -5106,7 +5003,6 @@ namespace sst::native
           REXLOG_WARN("[sst-native] draw reads past vertex buffer (fetch {} size {}, vertices {}+{} "
                       "stride {})",
                       fs.slot, size, first_vertex, vertex_count, fs.stride);
-
         return;
       }
     }
@@ -5181,8 +5077,7 @@ namespace sst::native
           }
           else if (ventry->hash && ventry->hash != vhash && ++ventry->changes >= 2)
           {
-            // keeps changing: stop caching it
-            ventry->dynamic = true;
+            ventry->dynamic = true; // keeps changing: stop caching it
             ventry = nullptr;
           }
           else
@@ -5292,8 +5187,7 @@ namespace sst::native
             if (stats_.morph_consumer_bad_logged++ < 8)
               REXLOG_WARN("[sst-native] morph consumer VS {:016X}: {} implausible input values "
                           "(first at vertex {} input {} = {}), vertices {}+{}",
-                          vs_entry->hash, bad, first / (4 * host_elements.size()),
-                          (first / 4) % host_elements.size(), f[first], first_vertex, vertex_count);
+                          vs_entry->hash, bad, first / (4 * host_elements.size()), (first / 4) % host_elements.size(), f[first], first_vertex, vertex_count);
           }
         }
 
@@ -5321,7 +5215,6 @@ namespace sst::native
 
         if (REXCVAR_GET(sst_native_check_vs_all) || (REXCVAR_GET(sst_native_check_vs) && reads_morph))
           CheckVsPositions(base, call, vs_obj, vs_entry, first_vertex, vertex_count, fetch_stream_count ? uint32_t(resolved[0].src - physical_membase_) : 0, reads_morph, reinterpret_cast<const float *>(up.cpu), uint32_t(host_elements.size()));
-
         // Sample of what the first few indexed 3D draws feed the GPU, to check positions / indices / matrices by eye
         if (call.indexed && stats_.sample_logged < 6 && !host_elements.empty() && !indices.empty())
         {
@@ -5352,9 +5245,7 @@ namespace sst::native
                       "range {}-{}; indices{}; first input of first vertices{}; c0-c3 "
                       "[{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} "
                       "{:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}]",
-                      vs_entry->hash, call.prim, call.base_vertex, call.start, call.count, vmin, vmax,
-                      idx, verts, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10],
-                      c[11], c[12], c[13], c[14], c[15]);
+                      vs_entry->hash, call.prim, call.base_vertex, call.start, call.count, vmin, vmax, idx, verts, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
         }
 
         capture_host_ = capture_active_ ? reinterpret_cast<const float *>(up.cpu) : nullptr;
@@ -5550,6 +5441,7 @@ namespace sst::native
 
       clk.Switch(kPhTextures);
       draw_composite_ = false;
+      draw_textures_.clear();
       BindTextures(base, dev, vs_entry, ps ? ps_entry : nullptr, sc);
 
       // Aspect ratio: UI draws (into the full-size UI / final targets) keep their proportions in a centred 16:9 box.
@@ -5559,14 +5451,19 @@ namespace sst::native
       //  - in the 3D scene's target (menus drawn with 3D characters) fitted 2D is clipped to the 16:9 box, as on a 16:9 screen (parked elements).
       bool ui_fit = false, box_clip = false;
       float edge_a = 0.0f, edge_b = 0.0f; // edge-touching layers: clip x' = a x + b (else 0)
-
       if ((ui_fit_x_ != 1.0f || ui_fit_y_ != 1.0f) && REXCVAR_GET(sst_native_ui_fit) && color_rt && !color_rt->depth && color_rt->width * 10 >= width_ * 9 && !shadow_surfaces_.count(rt0))
       {
-        // Draws that test and write depth are 3D (never measured: running every 3D draw's vertex shader on the CPU costs a lot of frame time).
+        // Draws that test and write depth are 3D (never measured: running every 3D draw's vertex shader on the CPU costs a lot of frame time). Small ones (a quad) are measured anyway: 2D sprites drawn with depth (e.g. character select's loading ring) are flat and get fitted
         const bool depth_test = (depthcontrol & 6) == 6; // Z_ENABLE + Z_WRITE_ENABLE
-        const DrawExtent ext = depth_test ? DrawExtent{} : MeasureDraw(base, call, vs_obj, vs_entry, first_vertex, vertex_count);
+        const bool measure = !depth_test || vertex_count <= 6;
+        const DrawExtent ext = measure ? MeasureDraw(base, call, vs_obj, vs_entry, first_vertex, vertex_count) : DrawExtent{};
 
-        if (depth_test)
+        if (depth_test && scene_surfaces_.count(rt0) && vertex_count <= 6 && vs_entry && LogOnce(0xD100000000000000ull ^ vs_entry->hash ^ (uint64_t(ext.ok) << 40) ^ (uint64_t(ext.flat) << 41)))
+          REXLOG_INFO("[sst-native] aspect: small depth-tested draw in the 3D target (vs {:016X}, "
+                      "{} vertices, {}, {}) - {}",
+                      vs_entry->hash, vertex_count, call.up_data ? "user memory" : "vertex buffer", ext.ok ? (ext.flat ? "flat" : "3D") : "not measured", ext.ok && ext.flat ? "fitted" : "not fitted");
+
+        if (depth_test && !(ext.ok && ext.flat))
         {
           ui_fit = false;
         }
@@ -5574,9 +5471,10 @@ namespace sst::native
         {
           const bool touch_l = ext.x0 >= -1.02f && ext.x0 <= -0.98f;
           const bool touch_r = ext.x1 >= 0.98f && ext.x1 <= 1.02f;
-          const bool full = (ext.x0 <= -0.98f && ext.x1 >= 0.98f && vertex_count <= 6) || (touch_l && touch_r);
+          // (A quad reaching well past the frame was laid out for the wider screen - wide layouts, scene_widen.h - and is fitted like the rest.)
+          const bool within = ext.x0 >= -1.05f && ext.x1 <= 1.05f;
+          const bool full = (ext.x0 <= -0.98f && ext.x1 >= 0.98f && vertex_count <= 6 && within) || (touch_l && touch_r);
           ui_fit = ext.flat && !full;
-
           // (Single quads only - a curved shape stretched this way would no longer meet the fitted pieces next to it.)
           if (ui_fit && ui_fit_x_ < 1.0f && (touch_l || touch_r) && vertex_count <= 6)
           {
@@ -5593,24 +5491,31 @@ namespace sst::native
               edge_b = 1.0f - edge_a;
             }
           }
-
-          box_clip = ui_fit && edge_a == 0.0f && scene_surfaces_.count(rt0);
+          // (No clipping to the 16:9 box in the 3D scene's target any more: the wide layouts draw backgrounds there beyond the box, and elements waiting off-screen are moved off the wider screen instead - hud_anchor.h.)
         }
         else
         {
-          ui_fit = !draw_composite_ && !scene_surfaces_.count(rt0);
-        }
+          // Not measurable (e.g. drawn from user memory - the game's animated sprites, like character select's loading ring): UI targets' draws are fitted; in the 3D scene's target only those without depth testing (2D - 3D effects there test depth)
+          const bool z_test = (depthcontrol & 2) != 0;
+          ui_fit = !draw_composite_ && (!scene_surfaces_.count(rt0) || (call.up_data && !z_test));
 
-        // F9 capture: every fitted draw (aspect-ratio debugging).
-        if (capture_active_ && ui_fit)
-          REXLOG_INFO("[sst-native] fit: draw {} rt {:08X}{} prim {} verts {} vs {:016X} depthctl "
+          if (scene_surfaces_.count(rt0) && vs_entry && vertex_count <= 64 && LogOnce(0xD000000000000000ull ^ vs_entry->hash ^ (uint64_t(z_test) << 40)))
+            REXLOG_INFO("[sst-native] aspect: unmeasured draw in the 3D target (vs {:016X}, "
+                        "prim {}, {} vertices, {}, depth {:08X}) - {}",
+                        vs_entry->hash, call.prim, vertex_count, call.up_data ? "user memory" : "vertex buffer", depthcontrol, ui_fit ? "fitted" : "not fitted");
+        }
+        // F9 capture: every fitted draw (aspect-ratio debugging)
+        if (capture_active_ && (ui_fit || (ext.ok && vertex_count <= 64)))
+          REXLOG_INFO("[sst-native] fit{}: draw {} rt {:08X}{} prim {} verts {} vs {:016X} depthctl "
                       "{:08X} measured {} flat {} x {:.3f}..{:.3f} y {:.3f}..{:.3f} edge {:.3f} "
-                      "box {} composite {}",
-                      draw_seq_, rt0, scene_surfaces_.count(rt0) ? " (scene)" : "", call.prim,
-                      vertex_count, vs_entry ? vs_entry->hash : 0, depthcontrol, ext.ok, ext.flat,
-                      ext.x0, ext.x1, ext.y0, ext.y1, edge_a, box_clip, draw_composite_);
+                      "box {} composite {} viewport x {:.1f}+{:.1f} y {:.1f}+{:.1f} vte {:08X}{}",
+                      ui_fit ? "" : " (NOT fitted)", draw_seq_, rt0, scene_surfaces_.count(rt0) ? " (scene)" : "", call.prim, vertex_count, vs_entry ? vs_entry->hash : 0, depthcontrol, ext.ok, ext.flat, ext.x0, ext.x1, ext.y0, ext.y1, edge_a, box_clip, draw_composite_, RegF(base, dev, PA_CL_VPORT_XOFFSET), RegF(base, dev, PA_CL_VPORT_XSCALE), RegF(base, dev, PA_CL_VPORT_YOFFSET), RegF(base, dev, PA_CL_VPORT_YSCALE), Reg(base, dev, PA_CL_VTE_CNTL), draw_textures_);
       }
 
+      if (capture_active_ && color_rt && color_rt->width * 10 < width_ * 9 && vertex_count <= 64)
+        REXLOG_INFO("[sst-native] fit (small target {}x{}): draw {} rt {:08X} prim {} verts {} vs "
+                    "{:016X} depthctl {:08X}{}",
+                    color_rt->width, color_rt->height, draw_seq_, rt0, call.prim, vertex_count, vs_entry ? vs_entry->hash : 0, depthcontrol, draw_textures_);
       const float fit_cx = float(width_) * 0.5f, fit_cy = float(height_) * 0.5f;
       clk.Switch(kPhConstants);
       const uint32_t vs_bools = be32(base, dev + kDevBools);
@@ -5624,7 +5529,6 @@ namespace sst::native
       sc[69] = first_vertex;
       // Viewport (needed for the half-pixel offset too)
       const uint32_t vte = Reg(base, dev, PA_CL_VTE_CNTL);
-
       float xs = RegF(base, dev, PA_CL_VPORT_XSCALE), xo = RegF(base, dev, PA_CL_VPORT_XOFFSET);
       float ys = RegF(base, dev, PA_CL_VPORT_YSCALE), yo = RegF(base, dev, PA_CL_VPORT_YOFFSET);
       float zs = RegF(base, dev, PA_CL_VPORT_ZSCALE), zo = RegF(base, dev, PA_CL_VPORT_ZOFFSET);
@@ -5716,16 +5620,22 @@ namespace sst::native
             }
           }
         }
-
-        // UI scissor rectangles (clipped text boxes) follow the fit; a scissor covering the whole target stays whole (edge-anchored HUD).
-        const bool full_rect = rect.left <= 0 && rect.top <= 0 && rect.right >= LONG(target_w) && rect.bottom >= LONG(target_h);
-
-        if (ui_fit && edge_a == 0.0f && (!full_rect || box_clip))
+        // UI scissor rectangles (clipped text boxes) follow the fit. A side on the frame's edge (a scissor around the whole frame - which the 3D scene's 1280x736 target makes smaller than the target - or a tile of it) goes to the target's edge instead: wide layouts and edge-anchored HUD draw beyond the 16:9 box
+        if (ui_fit && edge_a == 0.0f)
         {
-          rect = {LONG(std::floor(fit_cx + (float(rect.left) - fit_cx) * ui_fit_x_)),
-                  LONG(std::floor(fit_cy + (float(rect.top) - fit_cy) * ui_fit_y_)),
-                  LONG(std::ceil(fit_cx + (float(rect.right) - fit_cx) * ui_fit_x_)),
-                  LONG(std::ceil(fit_cy + (float(rect.bottom) - fit_cy) * ui_fit_y_))};
+          const LONG fw = std::min(LONG(target_w), LONG(width_));
+          const LONG fh = std::min(LONG(target_h), LONG(height_));
+          auto fx = [&](LONG v)
+          {
+            return fit_cx + (float(v) - fit_cx) * ui_fit_x_;
+          };
+
+          auto fy = [&](LONG v)
+          {
+            return fit_cy + (float(v) - fit_cy) * ui_fit_y_;
+          };
+
+          rect = {rect.left <= 0 ? 0 : LONG(std::floor(fx(rect.left))), rect.top <= 0 ? 0 : LONG(std::floor(fy(rect.top))), rect.right >= fw ? LONG(target_w) : LONG(std::ceil(fx(rect.right))), rect.bottom >= fh ? LONG(target_h) : LONG(std::ceil(fy(rect.bottom)))};
         }
 
         rect = Scaled(rect, draw_scale);
@@ -5936,7 +5846,6 @@ namespace sst::native
     // GPU: same pipeline inputs, drawn as points into the stream-output buffer
     const D3D12_GPU_VIRTUAL_ADDRESS so = so_buffer_->GetGPUVirtualAddress();
     const D3D12_STREAM_OUTPUT_BUFFER_VIEW view = {so + c.so_offset, UINT64(vertex_count) * 16, so + kSoDataBytes + captured_.size() * 16};
-
     list_->SOSetTargets(0, 1, &view);
     list_->SetPipelineState(pso);
     list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
@@ -5959,7 +5868,6 @@ namespace sst::native
 
     uint32_t mismatched = 0, gpu_nan = 0, compared = 0;
     uint64_t vertices = 0;
-
     struct Reach
     {
       float extent;
@@ -5997,7 +5905,6 @@ namespace sst::native
 
         if (std::isnan(cp[0]) && std::isnan(cp[3]))
           continue; // no position export on the CPU
-
         // The translated shader adds the half-pixel offset to xy
         const float cx = cp[0] + c.half_x * cp[3], cy = cp[1] + c.half_y * cp[3];
         const bool cfinite = std::isfinite(cx) && std::isfinite(cy) && std::isfinite(cp[2]) && std::isfinite(cp[3]);
@@ -6014,8 +5921,7 @@ namespace sst::native
         else
         {
           const float scale = std::max({1.0f, std::fabs(cp[3]), std::fabs(cx), std::fabs(cy)});
-          diff = std::max({std::fabs(gp[0] - cx), std::fabs(gp[1] - cy), std::fabs(gp[2] - cp[2]), std::fabs(gp[3] - cp[3])}) /
-                 scale;
+          diff = std::max({std::fabs(gp[0] - cx), std::fabs(gp[1] - cy), std::fabs(gp[2] - cp[2]), std::fabs(gp[3] - cp[3])}) / scale;
         }
 
         if (diff > 1e-3f)
@@ -6046,10 +5952,7 @@ namespace sst::native
           REXLOG_WARN("[sst-native] capture MISMATCH: draw #{} VS {:016X} prim {} {} {} vertices "
                       "from {} (buffer {:08X}{}): {} of {} vertices differ (worst {:.4g}); "
                       "vertex {}: GPU ({} {} {} {}) CPU ({} {} {} {});{}",
-                      c.seq, c.vs_hash, c.prim, c.indexed ? "indexed" : "auto", c.vertex_count,
-                      c.first_vertex, c.stream0, c.morph ? ", face" : "", bad, n, worst,
-                      c.first_vertex + first_bad, gp[0], gp[1], gp[2], gp[3],
-                      cp[0] + c.half_x * cp[3], cp[1] + c.half_y * cp[3], cp[2], cp[3], c.detail);
+                      c.seq, c.vs_hash, c.prim, c.indexed ? "indexed" : "auto", c.vertex_count, c.first_vertex, c.stream0, c.morph ? ", face" : "", bad, n, worst, c.first_vertex + first_bad, gp[0], gp[1], gp[2], gp[3], cp[0] + c.half_x * cp[3], cp[1] + c.half_y * cp[3], cp[2], cp[3], c.detail);
         }
       }
     }
@@ -6076,8 +5979,7 @@ namespace sst::native
       const CapturedDraw &c = captured_[reach[i].index];
       REXLOG_INFO("[sst-native]   {:.1f}: draw #{} VS {:016X} prim {} {} vertices from {} "
                   "(buffer {:08X}{})",
-                  reach[i].extent, c.seq, c.vs_hash, c.prim, c.vertex_count, c.first_vertex,
-                  c.stream0, c.morph ? ", face" : "");
+                  reach[i].extent, c.seq, c.vs_hash, c.prim, c.vertex_count, c.first_vertex, c.stream0, c.morph ? ", face" : "");
     }
 
     const D3D12_RANGE none = {0, 0};
@@ -6085,6 +5987,7 @@ namespace sst::native
   }
 
   // textures
+
   const Renderer::TextureUsage &Renderer::GetTextureUsage(const ShaderEntry *entry)
   {
     auto [it, fresh] = texture_usage_.try_emplace(entry);
@@ -6094,7 +5997,6 @@ namespace sst::native
 
     TextureUsage &u = it->second;
     const std::vector<uint8_t> &ct = entry->container;
-
     auto ct32 = [&](size_t at) -> uint32_t
     {
       return at + 4 <= ct.size() ? (uint32_t(ct[at]) << 24) | (uint32_t(ct[at + 1]) << 16) | (uint32_t(ct[at + 2]) << 8) | ct[at + 3] : 0;
@@ -6166,6 +6068,9 @@ namespace sst::native
         if (!composite_pages_.empty() && composite_pages_.count((fetch[1] >> 12) & 0x1FFFF))
           draw_composite_ = true;
 
+        if (capture_active_)
+          draw_textures_ += fmt::format(" t{}={:08X}:{}x{}{}", i, fetch[1] & ~0xFFFu, (fetch[2] & 0x1FFF) + 1, ((fetch[2] >> 13) & 0x1FFF) + 1, composite_pages_.count((fetch[1] >> 12) & 0x1FFFF) ? "c" : "");
+
         const uint32_t slot = textures_->GetTexture(list_.Get(), allocate, fetch, dimension);
 
         if (slot != TextureCache::kNone)
@@ -6203,7 +6108,6 @@ namespace sst::native
       ++stats_.texture_placeholders;
   }
 
-  // stats
   void Renderer::LogStats(uint64_t frame)
   {
     auto &s = stats_;
@@ -6214,25 +6118,18 @@ namespace sst::native
       REXLOG_INFO("[sst-native]   pipelines: {} ready ({} from the pipeline cache), {} compiling, "
                   "{:.1f} ms of background work this period, draws skipped while compiling {}, "
                   "cache file {} KB",
-                  s.pipelines_created, s.pipelines_from_cache, pending_pipelines_.size(),
-                  s.pipeline_ms, s.skip_pipeline_pending, pipeline_workers_->saved_bytes >> 10);
+                  s.pipelines_created, s.pipelines_from_cache, pending_pipelines_.size(), s.pipeline_ms, s.skip_pipeline_pending, pipeline_workers_->saved_bytes >> 10);
       pipeline_workers_->SaveInBackground();
     }
 
     if (textures_)
       REXLOG_INFO("[sst-native] {}; draws with textures {} (placeholders {}, shadow map "
                   "stand-ins {}); scissored draws {}",
-                  textures_->StatusLine(), s.textured_draws, s.texture_placeholders,
-                  s.shadow_placeholders, s.scissored_draws);
-
+                  textures_->StatusLine(), s.textured_draws, s.texture_placeholders, s.shadow_placeholders, s.scissored_draws);
     REXLOG_INFO("[sst-native] frame {}: {} draws, {} drawn ({} depth-only); skipped: shader {} "
                 "pending {} fetch {} prim {} rt {} pipeline {} data {} cull {} memexport-target {}; {} clears; "
                 "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB; resolves {}",
-                frame, s.draws, s.drawn, s.depth_only, s.skip_shader, s.skip_pending, s.skip_decl,
-                s.skip_prim, s.skip_rt, s.skip_pipeline, s.skip_data, s.skip_cull, s.skip_memexport,
-                s.clears,
-                s.pipelines_created, s.pipelines_failed, s.shaders_from_objects,
-                double(s.upload_bytes) / (1 << 20), s.resolves);
+                frame, s.draws, s.drawn, s.depth_only, s.skip_shader, s.skip_pending, s.skip_decl, s.skip_prim, s.skip_rt, s.skip_pipeline, s.skip_data, s.skip_cull, s.skip_memexport, s.clears, s.pipelines_created, s.pipelines_failed, s.shaders_from_objects, double(s.upload_bytes) / (1 << 20), s.resolves);
     std::string prims;
 
     for (auto &[p, n] : s.prims)
@@ -6245,31 +6142,20 @@ namespace sst::native
 
     REXLOG_INFO("[sst-native]   prims{} | clear flags{}", prims, clears);
     const MemexportStats &m = memexport_stats_;
-
     REXLOG_INFO("[sst-native]   memexport: {} draws, {} run ({} in the background, render thread "
                 "waited {} times), constants: {} files uploaded, {} reused",
-                s.memexport_draws, s.memexport_run, s.memexport_async, s.memexport_waits,
-                s.constants_uploaded, s.constants_reused);
-
+                s.memexport_draws, s.memexport_run, s.memexport_async, s.memexport_waits, s.constants_uploaded, s.constants_reused);
     REXLOG_INFO("[sst-native]   render targets: {} host targets made, resolves {} done / {} "
                 "skipped, rectangle lists {}, frames shown from the front-buffer resolve {}",
-                s.host_rts, s.resolves_done, s.resolves_skipped, s.rects_converted,
-                s.presented_from_resolve);
-
+                s.host_rts, s.resolves_done, s.resolves_skipped, s.rects_converted, s.presented_from_resolve);
     REXLOG_INFO("[sst-native]   geometry cache: vertex hits {}, index hits {} ({} trusted without "
                 "re-hashing), stored {} ({:.1f} MB), "
                 "dynamic (decoded each time) {}, flushes {}; {} keys, {:.0f} of {} MB used",
-                s.geo_vertex_hits, s.geo_index_hits, s.geo_trusted, s.geo_stores,
-                double(s.geo_store_bytes) / (1 << 20), s.geo_dynamic, s.geo_flushes,
-                geo_entries_.size(), double(geo_offset_) / (1 << 20), geo_pool_size_ >> 20);
-
+                s.geo_vertex_hits, s.geo_index_hits, s.geo_trusted, s.geo_stores, double(s.geo_store_bytes) / (1 << 20), s.geo_dynamic, s.geo_flushes, geo_entries_.size(), double(geo_offset_) / (1 << 20), geo_pool_size_ >> 20);
     REXLOG_INFO("[sst-native]   memexport: {} draws, {} run ({:.2f} ms total, {:.3f} ms/frame), {} "
                 "cached, {} not run; totals: {} vertices, {} elements, bad address {}, bad format "
                 "{}, out of range {}, fetch out of bounds {}, malformed {}, per-vertex {}",
-                s.memexport_draws, s.memexport_run, s.memexport_ms,
-                s.memexport_ms / double(std::max<uint64_t>(1, frame - last_stats_frame_)),
-                s.memexport_cached, s.memexport_failed, m.vertices, m.elements, m.bad_address,
-                m.bad_format, m.out_of_range, m.fetch_oob, m.malformed, m.per_vertex_draws);
+                s.memexport_draws, s.memexport_run, s.memexport_ms, s.memexport_ms / double(std::max<uint64_t>(1, frame - last_stats_frame_)), s.memexport_cached, s.memexport_failed, m.vertices, m.elements, m.bad_address, m.bad_format, m.out_of_range, m.fetch_oob, m.malformed, m.per_vertex_draws);
 
     if (s.fetch_remapped)
       REXLOG_INFO("[sst-native]   draws whose inputs sat in other fetch slots (matched by "
@@ -6285,9 +6171,7 @@ namespace sst::native
     REXLOG_INFO("[sst-native]   morph checks: {} draws with implausible output; consumers {} "
                 "(reading past the output {}, stale {}, implausible inputs {}); jump checks {}, "
                 "draws with jumping vertices {}; output changed before use {}",
-                s.memexport_bad_outputs, s.morph_consumers, s.morph_consumer_overrun,
-                s.morph_consumer_stale, s.morph_consumer_bad, s.morph_jump_checks,
-                s.morph_jump_draws, s.morph_modified);
+                s.memexport_bad_outputs, s.morph_consumers, s.morph_consumer_overrun, s.morph_consumer_stale, s.morph_consumer_bad, s.morph_jump_checks, s.morph_jump_draws, s.morph_modified);
 
     if (morph_history_.size() > 4096)
       morph_history_.clear();
@@ -6304,17 +6188,14 @@ namespace sst::native
       REXLOG_INFO("[sst-native]   VS check: {} on-screen jump checks, {} draws with a vertex "
                   "jumping alone",
                   s.check_jump_checks, s.check_jump_draws);
-
       std::vector<const CheckEntry *> sometimes;
 
       for (const auto &[k, e] : check_entries_)
-
         if (e.flagged && e.flagged < e.checked)
           sometimes.push_back(&e);
 
       std::sort(sometimes.begin(), sometimes.end(), [](auto *a, auto *b)
                 { return a->flagged > b->flagged; });
-
       REXLOG_INFO("[sst-native]   VS check: {} draws run on the CPU, {} with far-out vertices; {} "
                   "shader/buffer pairs only sometimes far out:",
                   s.check_draws, s.check_flagged, sometimes.size());
@@ -6326,10 +6207,8 @@ namespace sst::native
     }
 
     std::vector<std::pair<uint64_t, uint64_t>> rts(s.render_targets.begin(), s.render_targets.end());
-
     std::sort(rts.begin(), rts.end(), [](auto &a, auto &b)
               { return a.second > b.second; });
-
     std::string rt_text;
 
     for (size_t i = 0; i < rts.size() && i < 6; ++i)
@@ -6339,7 +6218,6 @@ namespace sst::native
     }
 
     REXLOG_INFO("[sst-native]   render target 0 (object[size word]:draws){}", rt_text);
-
     // Per-interval counters
     const uint64_t created = s.pipelines_created, failed = s.pipelines_failed, from_cache = s.pipelines_from_cache;
     const uint64_t logged = s.skip_shader_logged, clear_logged = s.clear_logged, sample_logged = s.sample_logged, bad_logged = s.memexport_bad_logged, consumer_bad_logged = s.morph_consumer_bad_logged, check_logged = s.check_logged, jump_logged = s.morph_jump_logged, modified_logged = s.morph_modified_logged, check_jump_logged = s.check_jump_logged, late_logged = s.late_logged, rebinds_logged = s.shader_rebinds_logged;

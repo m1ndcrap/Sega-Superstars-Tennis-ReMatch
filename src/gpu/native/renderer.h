@@ -76,7 +76,6 @@ namespace sst::native
   {
   public:
     static constexpr uint32_t kSlots = 3;
-
     // Output textures: the last one shown, frames waiting to be shown, the one being rendered
     static constexpr uint32_t kOutputs = 5;
     Renderer();
@@ -91,12 +90,10 @@ namespace sst::native
     void Draw(const uint8_t *base, const DrawCall &call);
     void EndFrame(); // Swap
     void Resolve(const uint8_t *base, const ResolveCall &call);
-
     // Render-target trace (--sst_native_rt_trace / F10): one frame's sequence of passes, clears, resolves and other events, logged at the frame's end
     void TraceEvent(const uint8_t *base, uint32_t device, const std::string &what);
     void LogStats(uint64_t frame);
     uint64_t frames() const { return submitted_; }
-
     // Commands run on a separate render thread (perf log wording only)
     void SetThreaded(bool threaded) { threaded_ = threaded; }
 
@@ -159,13 +156,11 @@ namespace sst::native
     };
 
     static uint64_t Tick() { return __rdtsc(); }
-
     // Attributes elapsed time to one phase at a time; the rest goes to the last
     struct PhaseClock
     {
       PhaseClock(Profile &p, Phase ph) : prof(p), phase(ph), start(Tick()) {}
       ~PhaseClock() { prof.ticks[phase] += Tick() - start; }
-
       void Switch(Phase next)
       {
         const uint64_t now = Tick();
@@ -189,17 +184,13 @@ namespace sst::native
     void CreateTimestampQueries();
     void ReadGpuTime(uint32_t slot);
     void LogProfile();
-
     // Constant files uploaded this frame, by content (XXH3 of the guest bytes)
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> constant_cache_;
-
     // Uploads the first `bytes` of a stage's constant file (the registers its shader reads; 4096 = all)
     D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const uint8_t *guest, uint32_t bytes = 4096);
-
     // Bytes of the constant file a shader reads: up to its highest register, or everything with relative addressing. Cached per entry
     uint32_t ConstantBytes(const ShaderEntry *entry);
     std::unordered_map<const ShaderEntry *, uint32_t> constant_bytes_;
-
     // Geometry cache: decoded vertex / converted index data in one video memory pool (bump allocated; when full, everything is re-stored on next use)
     struct GeoEntry
     {
@@ -214,11 +205,7 @@ namespace sst::native
     };
 
     // An entry whose data never changed in several checks and was already checked this frame is trusted for the rest of the frame (static meshes are drawn several times a frame: shadow cascades + scene). Every entry is still checked once per frame: data rewritten in place between frames (UI, menus, loading screens) must show up on the next frame, not a few later
-    bool GeoTrusted(const GeoEntry &e) const
-    {
-      return e.changes == 0 && e.stable >= 4 && e.size && e.generation == geo_generation_ && e.checked_frame == submitted_;
-    }
-
+    bool GeoTrusted(const GeoEntry &e) const { return e.changes == 0 && e.stable >= 4 && e.size && e.generation == geo_generation_ && e.checked_frame == submitted_; }
     void GeoChecked(GeoEntry &e, bool unchanged)
     {
       e.stable = unchanged ? e.stable + 1 : 0;
@@ -242,11 +229,9 @@ namespace sst::native
     void WaitFence(uint64_t value);
     ShaderEntry *ResolveShader(const uint8_t *base, uint32_t object, bool vertex);
     ShaderEntry *ResolveShaderSlow(const uint8_t *base, uint32_t object, bool vertex, uint32_t vcopy, uint32_t vsize, uint32_t ucode_ptr);
-
     // Memory-export (morph) draws: run on the CPU, writing guest memory
     void RunMemexport(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry);
     void RecordMemexportRanges(const uint8_t *base, uint32_t dev);
-
     // Background memexport jobs not yet collected (oldest first)
     struct PendingMemexport
     {
@@ -262,7 +247,6 @@ namespace sst::native
     void WaitMemexports(uint32_t begin, uint32_t end);
     void CollectMemexports(bool all);
     void FinishMemexport(const PendingMemexport &p);
-
     const char *LoadVsState(const uint8_t *base, uint32_t dev, uint32_t vs_obj, const ShaderEntry *vs_entry, std::vector<uint32_t> &ucode, float *constants, uint32_t bools[8], uint32_t fetch[192], uint32_t loops[32], uint32_t *literals);
     bool ComputeFetchRecords(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count);
     std::unordered_map<uint32_t, std::vector<int32_t>> fetch_records_;
@@ -271,7 +255,6 @@ namespace sst::native
     void CaptureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, const ShaderVariant *vs, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, uint64_t layout_hash, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, float half_x, float half_y);
     void FinishCapture();
     void CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0);
-
     // Screen extent (NDC) of a small draw, from running its vertex shader on the CPU (aspect ratio: tells 2D UI from 3D, and full-screen layers from elements). flat: every vertex has w = 1 (2D)
     struct DrawExtent
     {
@@ -321,10 +304,8 @@ namespace sst::native
     D3D12_GPU_DESCRIPTOR_HANDLE SrvGpu(uint32_t slot) const;
     ResolvedTexture *GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, float scale);
     bool CreateBlitResources();
-
     // kind: 0 copy, 1 copy from MSAA (average / sample 0 for depth), 2 FXAA, 3 FPS counter text (alpha blended)
     ID3D12PipelineState *GetBlitPipeline(DXGI_FORMAT format, uint32_t kind);
-
     // Copies src_srv texels (src_x, src_y)+ into `rtv` at dst rect (draws a triangle; the caller handles states). Restores the draw root signature
     void Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb = false, float gamma = 0, uint32_t src_samples = 1, bool fxaa = false);
     void RestoreDrawState();
@@ -335,7 +316,6 @@ namespace sst::native
     uint32_t rt_rtv_next_ = 0, rt_dsv_next_ = 0, rt_srv_next_ = 0, dsv_size_ = 0, srv_size_ = 0;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> blit_root_;
     std::vector<uint8_t> blit_vs_, blit_ps_, blit_ps_ms_, blit_ps_fxaa_, blit_ps_text_;
-
     // VIDEO > FPS COUNTER: frames shown per second (new frames handed to the display), drawn in the output's top-left corner
     std::atomic<uint64_t> shown_frames_{0};
     uint64_t fps_last_frames_ = 0, fps_last_tick_ = 0;
@@ -345,7 +325,6 @@ namespace sst::native
     uint32_t present_page_ = 0; // page of this frame's front-buffer resolve (0: none)
     HostRT *last_color_rt_ = nullptr;
     uint64_t bound_targets_ = 0; // (rtv, dsv) pair bound for draws, 0 = rebind
-
     // Replaced targets, released once the GPU has passed this fence value
     std::vector<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>> retired_rts_;
 
@@ -389,27 +368,24 @@ namespace sst::native
     ShaderCache *shaders_ = nullptr;
     const uint8_t *physical_membase_ = nullptr;
     uint32_t width_ = 0, height_ = 0; // guest output size (1280x720)
-
     // Internal resolution (latched per frame from the VIDEO page cvars): host render targets, resolve textures and outputs are their guest size x a scale - scale_ (sst_resolution / 720) for the UI / final image and the output, scene_scale_ (x sst_render_scale %) for the 3D scene's targets (the surfaces drawn with MSAA), shadow_scale_ (sst_shadow_size / 1024) for the shadow map's (resolved into stacked textures)
     float scale_ = 1, scene_scale_ = 1, shadow_scale_ = 1;
     bool shadows_off_ = false;
-    bool bloom_off_ = false; // VIDEO > BLOOM OFF: the quarter-size glow / bloom targets stay black
-    bool fxaa_ = false;      // VIDEO > ANTI-ALIASING FXAA: on the 3D scene's colour resolves
-    uint32_t msaa_ = 1;      // VIDEO > ANTI-ALIASING MSAA: samples of the 3D scene's targets
-
+    bool bloom_off_ = false;                              // VIDEO > BLOOM OFF: the quarter-size glow / bloom targets stay black
+    bool fxaa_ = false;                                   // VIDEO > ANTI-ALIASING FXAA: on the 3D scene's colour resolves
+    uint32_t msaa_ = 1;                                   // VIDEO > ANTI-ALIASING MSAA: samples of the 3D scene's targets
     std::unordered_map<uint32_t, uint32_t> msaa_support_; // format << 8 | samples -> usable
     uint32_t UsableSamples(DXGI_FORMAT format, uint32_t samples);
     bool BloomSurface(const HostRT &rt, uint32_t surface) const;
-    float gamma_ = 1; // present: output = colour ^ gamma_ (sst_brightness)
-
+    float gamma_ = 1;                // present: output = colour ^ gamma_ (sst_brightness)
     std::atomic<bool> fps30_{false}; // read by Acquire (plugin thread)
     std::unordered_set<uint32_t> scene_surfaces_, shadow_surfaces_;
-
     // VIDEO > ASPECT RATIO. The game's camera uses the chosen aspect (see graphics_menu.cpp) and the presenter stretches the 16:9 frame to it; the UI is drawn squeezed by ui_fit_ about the frame's centre so it keeps its proportions in a 16:9 box. Draws that sample full-screen copies (the 3D scene, the glow) are composites and stay stretched
     float ui_fit_x_ = 1.0f, ui_fit_y_ = 1.0f;
     int aspect_ = 1;
     std::unordered_set<uint32_t> composite_pages_; // resolve textures holding full-screen images
     bool draw_composite_ = false;                  // this draw samples one of them
+    std::string draw_textures_;                    // F9 capture: textures this draw samples
     std::array<float, kOutputs> output_scale_{};
     float depth_scale_ = 1;
     uint64_t fps30_acquires_ = 0;
@@ -442,7 +418,6 @@ namespace sst::native
 
     // Guest physical ranges written by memexport draws that were *not* run on the CPU this frame (--sst_native_memexport=false or failure); draws fetching vertices from them are skipped
     std::vector<std::pair<uint32_t, uint32_t>> memexport_ranges_;
-
     // Ranges the CPU memexport wrote this / last frame (diagnostics)
     std::vector<std::pair<uint32_t, uint32_t>> memexport_written_, memexport_written_prev_;
 
@@ -455,7 +430,6 @@ namespace sst::native
     // CPU memexport
     std::unique_ptr<MemexportRunner> memexport_;
     MemexportStats memexport_stats_;
-
     struct MemexportCacheEntry
     {
       uint64_t input_hash = 0, output_hash = 0;
@@ -476,7 +450,6 @@ namespace sst::native
     };
 
     std::unordered_map<uint64_t, CheckEntry> check_entries_;
-
     // Morph consumer jump check
     struct MorphHistory
     {
@@ -486,7 +459,6 @@ namespace sst::native
     };
 
     std::unordered_map<uint64_t, MorphHistory> morph_history_;
-
     struct ClipHistory
     {
       std::vector<float> ndc; // x/w, y/w per vertex (NaN behind the camera)
@@ -495,7 +467,6 @@ namespace sst::native
 
     std::unordered_map<uint64_t, ClipHistory> clip_history_;
     std::unordered_map<uint64_t, uint32_t> clip_occurrence_; // per frame
-
     struct LateRange
     {
       const uint8_t *ptr;
@@ -534,7 +505,6 @@ namespace sst::native
     const float *capture_host_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D12Resource> so_buffer_, so_readback_, so_zero_;
     std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> so_pipelines_;
-
     struct MorphWrite
     {
       uint64_t frame = 0, draw = 0;
@@ -545,11 +515,9 @@ namespace sst::native
 
     std::unordered_map<uint32_t, MorphWrite> morph_writes_;
     uint64_t draw_seq_ = 0;
-
     // Shader object address -> hash of its container copy at the last bind
     std::unordered_map<uint32_t, uint64_t> object_vhash_;
     std::unordered_map<uint32_t, uint32_t> object_ucode_; // microcode pointer at the last bind
-
     // Objects already validated this frame (ResolveShader fast path)
     struct ResolvedObject
     {
@@ -576,7 +544,6 @@ namespace sst::native
     std::mutex slot_mutex_;
     int latest_ = -1;
     int pinned_ = -1;
-
     // Frame pacing at the hand-off (slot_mutex_): frames finished vs taken by the plugin at the guest's swaps; repeats = the same frame taken twice, skips = finished frames never taken
     uint64_t latest_seq_ = 0, acquired_seq_ = 0;
     int acquired_slot_ = -1;

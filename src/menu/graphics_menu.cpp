@@ -4,6 +4,7 @@
 #include "menu/hud_anchor.h"
 #include "menu/pause_patch.h"
 #include "menu/restart.h"
+#include "menu/scene_widen.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -24,36 +25,57 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-REXCVAR_DEFINE_BOOL(sst_graphics_menu, true, "SST", "Replace Options > Settings > VIDEO with the port's VIDEO page");
-REXCVAR_DEFINE_INT32(sst_resolution, 720, "SST", "Internal resolution in lines: 480, 720, 1080, 1440, 2160 (VIDEO page)");
-REXCVAR_DEFINE_INT32(sst_render_scale, 100, "SST", "3D render scale in percent of the internal resolution, 50-100 (the "
-                                                   "UI stays at the internal resolution; VIDEO page)");
-REXCVAR_DEFINE_INT32(sst_shadow_size, 1024, "SST", "Shadow map size: 0 (shadows off), 128-2048 (the game's is 1024; 3D textures stop at 2048 in D3D12; VIDEO page)");
+REXCVAR_DEFINE_BOOL(sst_wide_layouts, true, "SST",
+                    "Ultrawide aspect ratios: menus, loading screens and backgrounds get "
+                    "layouts that fill the extra width (generated from the 16:9 ones)");
+
+REXCVAR_DEFINE_BOOL(sst_graphics_menu, true, "SST",
+                    "Replace Options > Settings > VIDEO with the port's VIDEO page");
+
+REXCVAR_DEFINE_INT32(sst_resolution, 720, "SST",
+                     "Internal resolution in lines: 480, 720, 1080, 1440, 2160 (VIDEO page)");
+
+REXCVAR_DEFINE_INT32(sst_render_scale, 100, "SST",
+                     "3D render scale in percent of the internal resolution, 50-100 (the "
+                     "UI stays at the internal resolution; VIDEO page)");
+
+REXCVAR_DEFINE_INT32(sst_shadow_size, 1024, "SST",
+                     "Shadow map size: 0 (shadows off), 128-2048 (the game's is 1024; 3D textures stop at 2048 in D3D12; VIDEO page)");
+
 REXCVAR_DEFINE_INT32(sst_aa_type, 0, "SST", "Anti-aliasing: 0 off, 1 FXAA, 2 MSAA (VIDEO page)");
+
 REXCVAR_DEFINE_INT32(sst_aa_level, 4, "SST", "MSAA samples: 2, 4, 8 (VIDEO page)");
-REXCVAR_DEFINE_INT32(sst_aspect, 1, "SST", "Aspect ratio: 0 4:3, 1 16:9, 2 16:10, 3 21:9, 4 32:9 (VIDEO page)");
+
+REXCVAR_DEFINE_INT32(sst_aspect, 1, "SST",
+                     "Aspect ratio: 0 4:3, 1 16:9, 2 16:10, 3 21:9, 4 32:9 (VIDEO page)");
+
 REXCVAR_DEFINE_INT32(sst_fps_limit, 60, "SST", "Frame rate limit: 30 or 60 (VIDEO page)");
+
 REXCVAR_DEFINE_BOOL(sst_vsync, true, "SST", "VSync (VIDEO page)");
-REXCVAR_DEFINE_INT32(sst_brightness, 50, "SST", "Brightness 0-100, 50 = the game's default (VIDEO page)");
+
+REXCVAR_DEFINE_INT32(sst_brightness, 50, "SST",
+                     "Brightness 0-100, 50 = the game's default (VIDEO page)");
+
 REXCVAR_DEFINE_BOOL(sst_fullscreen, false, "SST", "Borderless fullscreen (VIDEO page)");
+
 REXCVAR_DEFINE_BOOL(sst_bloom, true, "SST", "Bloom / glow (VIDEO page)");
+
 REXCVAR_DEFINE_BOOL(sst_fps_counter, false, "SST", "FPS counter in the top-left corner (VIDEO page)");
 
 namespace sst::menu
 {
   namespace
   {
-
 #include "menu/graphics_script.inc"
 
     constexpr uint32_t kVideoScript = 0x4B585196; // lookup2("video")
     constexpr uint32_t kNativeGroup = 0x53;
-
     enum Native : uint32_t
     {
       kBegin = 0,
@@ -67,10 +89,10 @@ namespace sst::menu
       kPauseLabel = pause::kNativeLabel,
       kPauseValue = pause::kNativeValue,
       kRestart = 9, // the restart dialog was confirmed
+      kPauseStep = pause::kNativeStep,
     };
 
     static_assert(pause::kNativeResult == kResult);
-
     enum Event : int
     {
       kLeft = 0,
@@ -131,7 +153,6 @@ namespace sst::menu
         {"vsync", "VSYNC", 2, false},
         {"brightness", "BRIGHTNESS", 21, true},
     }};
-
     constexpr int kVisible = 4;                 // Settings > VIDEO (GENERAL's four rows)
     constexpr int kPauseVisible = pause::kRows; // in-match pause menu
     constexpr int kPresetCustom = 3;
@@ -182,6 +203,7 @@ namespace sst::menu
     }
 
     bool g_boot_four_three = false; // ASPECT RATIO 4:3 at startup (see NativeFourThree)
+    int g_boot_aspect = 1;          // ASPECT RATIO at startup: the one in use until a restart
 
     std::string ValueText(const Settings &s, int row)
     {
@@ -193,26 +215,35 @@ namespace sst::menu
         return v == 0 ? "LOW" : v == 1 ? "MEDIUM"
                             : v == 2   ? "HIGH"
                                        : "CUSTOM";
+
       case kFullscreen:
       case kBloom:
       case kFpsCounter:
       case kVSync:
         return v ? "ON" : "OFF";
+
       case kShadows:
         return v == 0 ? "OFF" : std::to_string(kShadowSizes[v]);
+
       case kResolution:
         return std::to_string(kResolutions[v]) + "P";
-      case kAspect: // 4:3 is the game's own mode: switching to or from it needs a restart
-        return (v == 0) != g_boot_four_three ? std::string(kAspects[v]) + " (RESTART)" : std::string(kAspects[v]);
+
+      case kAspect: // layouts are set up as scenes load: a change needs a restart
+        return v != g_boot_aspect ? std::string(kAspects[v]) + " (RESTART)" : std::string(kAspects[v]);
+
       case kRenderScale:
         return std::to_string(50 + 5 * v) + "%";
+
       case kAaType:
         return v == 0 ? "OFF" : v == 1 ? "FXAA"
                                        : "MSAA";
+
       case kAaLevel:
         return s.v[kAaType] == 2 ? std::to_string(kAaLevels[v]) + "X" : "N/A";
+
       case kFpsLimit:
         return v ? "60" : "30";
+
       case kBrightness:
         return std::to_string(5 * v);
       }
@@ -252,7 +283,6 @@ namespace sst::menu
 
         if (c == ':')
           c = 'X'; // 16:9 -> 16X9
-
         const bool ok = (c >= 'A' && c <= 'Y' && c != 'J' && c != 'Q') || (c >= '1' && c <= '4') || (digits && c >= '0' && c <= '9') || c == ' ' || c == '(' || c == ')' || c == '.' || c == '?';
 
         if (ok)
@@ -266,7 +296,6 @@ namespace sst::menu
     {
       if (row == kPreset)
         return "PRESET"; // no Q in the font
-
       return PauseText(kList[row].label, false);
     }
 
@@ -299,7 +328,6 @@ namespace sst::menu
 
     constexpr uint32_t kPoolSize = 0x10000;
     constexpr uint32_t kTextIdBase = 0x53540000;
-
     struct Guest
     {
       uint32_t script = 0; // our "video" module
@@ -315,34 +343,35 @@ namespace sst::menu
 
     void SetupGuest(uint8_t *base)
     {
-      std::call_once(g_guest_once, [base]
+      std::call_once(g_guest_once,
+                     [base]
                      {
-        const uint32_t script_size = (uint32_t(sizeof(kGraphicsScript)) + 31) & ~31u;
-        auto *memory = rex::system::kernel_memory();
-        const uint32_t block = memory ? memory->SystemHeapAlloc(script_size + kPoolSize) : 0;
+                       const uint32_t script_size = (uint32_t(sizeof(kGraphicsScript)) + 31) & ~31u;
+                       auto *memory = rex::system::kernel_memory();
+                       const uint32_t block = memory ? memory->SystemHeapAlloc(script_size + kPoolSize) : 0;
 
-        if (!block)
-        {
-          REXLOG_ERROR("[sst-menu] could not allocate guest memory for the VIDEO page");
-          return;
-        }
+                       if (!block)
+                       {
+                         REXLOG_ERROR("[sst-menu] could not allocate guest memory for the VIDEO page");
+                         return;
+                       }
 
-        std::memcpy(GuestPtr(base, block), kGraphicsScript, sizeof(kGraphicsScript));
-        g_guest.script = block;
-        g_guest.pool = block + script_size;
-        g_guest.ok = true;
+                       std::memcpy(GuestPtr(base, block), kGraphicsScript, sizeof(kGraphicsScript));
+                       g_guest.script = block;
+                       g_guest.pool = block + script_size;
+                       g_guest.ok = true;
+                       // Fixed ids the patched pause scene uses
+                       for (auto [id, text] : {std::pair<uint32_t, const char *>{pause::kTextBlank, " "}, {pause::kTextVideo, "VIDEO"}})
+                       {
+                         const uint32_t n = uint32_t(std::strlen(text)) + 1;
+                         const uint32_t at = g_guest.pool + g_guest.pool_used;
+                         std::memcpy(GuestPtr(base, at), text, n);
+                         g_guest.pool_used += n;
+                         g_guest.texts.emplace(id, at);
+                       }
 
-        // Fixed ids the patched pause scene uses
-        for (auto [id, text] : {std::pair<uint32_t, const char *>{pause::kTextBlank, " "}, {pause::kTextVideo, "VIDEO"}})
-        {
-          const uint32_t n = uint32_t(std::strlen(text)) + 1;
-          const uint32_t at = g_guest.pool + g_guest.pool_used;
-          std::memcpy(GuestPtr(base, at), text, n);
-          g_guest.pool_used += n;
-          g_guest.texts.emplace(id, at);
-        }
-
-        REXLOG_INFO("[sst-menu] VIDEO page script ({} bytes) at {:08X}", sizeof(kGraphicsScript), block); });
+                       REXLOG_INFO("[sst-menu] VIDEO page script ({} bytes) at {:08X}", sizeof(kGraphicsScript), block);
+                     });
     }
 
     // Text id for a string (made once, kept in guest memory). Under g_mutex
@@ -370,23 +399,13 @@ namespace sst::menu
     bool g_loaded_from_file = false;
     std::function<void(bool)> g_set_fullscreen;
     std::function<void()> g_request_quit;
-
     struct ListState
     {
       int visible = kVisible; // rows on screen
       bool pause = false;     // in-match page: no ASPECT RATIO (cameras are set up per match)
       bool dialog = false;    // this event: show the restart dialog (4:3 switched)
-
-      int Count() const
-      {
-        return pause ? kRows - 1 : kRows;
-      }
-
-      int Row(int i) const
-      {
-        return pause && i >= kAspect ? i + 1 : i; // list index -> Row
-      }
-
+      int Count() const { return pause ? kRows - 1 : kRows; }
+      int Row(int i) const { return pause && i >= kAspect ? i + 1 : i; } // list index -> Row
       int cursor = 0, top = 0;
       int old_visible = 0, new_visible = 0;
       bool redraw = false, leave = false;
@@ -426,7 +445,6 @@ namespace sst::menu
     Settings FromFlags()
     {
       Settings s;
-
       auto index_of = [](const int *values, int n, int value)
       {
         int best = 0;
@@ -522,12 +540,10 @@ namespace sst::menu
 
       if (row == kAaLevel && s.v[kAaType] != 2)
         return; // only MSAA has levels
-
       int count = info.count;
 
       if (row == kPreset)
         count = 3; // CUSTOM is shown, not picked
-
       int v = s.v[row];
 
       if (row == kPreset && v == kPresetCustom)
@@ -555,10 +571,10 @@ namespace sst::menu
       }
     }
 
-    // Switching to or from 4:3 (the game's own mode) needs a restart
+    // A new aspect ratio needs a restart: 4:3 is the game's own mode, and the wide layouts are made as scenes load (the main menu's at boot)
     bool RestartNeeded()
     {
-      return (g_current.v[kAspect] == 0) != g_boot_four_three;
+      return g_current.v[kAspect] != g_boot_aspect;
     }
 
     // Restart dialog: the game's message box with a one-button (OK) message whose texts are swapped while it is up (see sub_82594AD0 below)
@@ -610,9 +626,9 @@ namespace sst::menu
           l.sound = kMove;
           REXLOG_INFO("[sst-menu] {}", Describe(g_current));
         }
-
         break;
       }
+
       case kUp:
       case kDown:
       {
@@ -629,6 +645,7 @@ namespace sst::menu
         l.sound = kMove;
         break;
       }
+
       case kSelect:
         Save(g_current);
         REXLOG_INFO("[sst-menu] VIDEO saved: {}", Describe(g_current));
@@ -643,6 +660,7 @@ namespace sst::menu
 
         l.leave = true;
         break;
+
       case kBack:
         if (g_current.v != g_snapshot.v)
         {
@@ -674,8 +692,8 @@ namespace sst::menu
 
       const uint32_t raw = Load32(base, values + 4 * i);
 
-      if (*GuestPtr(base, types + i) == 1) // float
-      {
+      if (*GuestPtr(base, types + i) == 1)
+      { // float
         float f;
         std::memcpy(&f, &raw, 4);
         return int(f);
@@ -692,15 +710,10 @@ namespace sst::menu
       const uint32_t values = ctx.r8.u32, types = ctx.r9.u32, count = ctx.r10.u32;
       std::lock_guard lock(g_mutex);
       SetupGuest(base);
-
       struct AspectOnExit
       {
         uint8_t *base;
-
-        ~AspectOnExit()
-        {
-          ApplyAspect(base);
-        }
+        ~AspectOnExit() { ApplyAspect(base); }
       } aspect_on_exit{base};
 
       switch (id & 0xFF)
@@ -714,6 +727,7 @@ namespace sst::menu
         REXLOG_INFO("[sst-menu] VIDEO page opened{}: {}", (id & 0xFF) == kPauseBegin ? " (pause menu)" : "", Describe(g_current));
         SetResult(base, out, 0, 2);
         break;
+
       case kPauseEvent:
       {
         // The pause menu's input events (3:18): up, down, left, right, select, back
@@ -739,6 +753,7 @@ namespace sst::menu
         SetResult(base, out, 0, 2);
         break;
       }
+
       case kPauseLabel:
       case kPauseValue:
       {
@@ -747,27 +762,68 @@ namespace sst::menu
         SetResult(base, out, TextId(base, text), 3);
         break;
       }
+
       case kEvent:
         HandleEvent(ArgInt(base, values, types, count, 0));
         SetResult(base, out, 0, 2);
         break;
+
       case kResult:
       {
         const int k = ArgInt(base, values, types, count, 0);
         const ListState &l = g_list;
-        const int v = k == 0 ? l.old_visible : k == 1 ? l.new_visible
-                                           : k == 2   ? int(l.redraw)
-                                           : k == 3   ? int(l.leave)
-                                           : k == 4   ? l.sound
-                                                      : int(l.dialog);
+        // (Pause page: lines 0-6 are drawn on the rows in their screen order.)
+        auto at = [&](int line)
+        {
+          return l.pause && line >= 0 && line < pause::kRows ? pause::kVisualOrder[line] : line;
+        };
+
+        const int v = k == 0 ? at(l.old_visible) : k == 1 ? at(l.new_visible)
+                                               : k == 2   ? int(l.redraw)
+                                               : k == 3   ? int(l.leave)
+                                               : k == 4   ? l.sound
+                                                          : int(l.dialog);
         SetResult(base, out, uint32_t(v), 2);
         break;
       }
+
+      case kPauseStep:
+      {
+        // Pause menu up / down: the next row in screen order (pause::kVisualOrder) among rows first .. first + count - 1, wrapping
+        const int row = ArgInt(base, values, types, count, 0);
+        const int dir = ArgInt(base, values, types, count, 1) < 0 ? -1 : 1;
+        const int first = ArgInt(base, values, types, count, 2);
+        const int n = ArgInt(base, values, types, count, 3);
+        std::vector<int> order;
+
+        for (int r : pause::kVisualOrder)
+          if (r >= first && r < first + n)
+            order.push_back(r);
+
+        for (int r = first; r < first + n; ++r) // (any rows the order doesn't list)
+          if (std::find(order.begin(), order.end(), r) == order.end())
+            order.push_back(r);
+
+        int next = row;
+
+        if (!order.empty())
+        {
+          const auto it = std::find(order.begin(), order.end(), row);
+          const int i = it == order.end() ? (dir > 0 ? -1 : 0) : int(it - order.begin());
+          const int sz = int(order.size());
+          next = order[((i + dir) % sz + sz) % sz];
+        }
+
+        SetResult(base, out, uint32_t(next), 2);
+        break;
+      }
+
       case kRestart:
         g_restart_dialog = false;
         Restart();
         SetResult(base, out, 0, 2);
         break;
+
       case kLabel:
       case kValue:
       {
@@ -776,6 +832,7 @@ namespace sst::menu
         SetResult(base, out, TextId(base, text), 3);
         break;
       }
+
       default:
         REXLOG_WARN("[sst-menu] unknown native {:04X}", id);
         SetResult(base, out, 0, 0);
@@ -829,13 +886,12 @@ namespace sst::menu
 
     void ApplyAspect(uint8_t *base)
     {
-      // 4:3 runs as the game's own 4:3 mode (cameras already 4:3); a 4:3 picked since startup waits for the restart: meanwhile 16:9
-      const int v = std::clamp(g_current.v[kAspect], 0, 4);
-      const float want = g_boot_four_three || v == 0 ? 16.0f / 9.0f : kAspectValues[v];
+      // The aspect ratio the game started with (a new one waits for the restart). 4:3 runs as the game's own 4:3 mode (cameras already 4:3)
+      const int v = g_boot_aspect;
+      const float want = v == 0 ? 16.0f / 9.0f : kAspectValues[v];
 
       if (g_camera_aspect.exchange(want) != want)
-        REXLOG_INFO("[sst-menu] camera aspect {:.4f} ({}{})", want, kAspects[v], g_boot_four_three ? ", game's 4:3 mode" : v == 0 ? ", after a restart"
-                                                                                                                                  : "");
+        REXLOG_INFO("[sst-menu] camera aspect {:.4f} ({}{})", want, kAspects[v], v == 0 ? ", game's 4:3 mode" : "");
 
       if (!base)
         return;
@@ -866,10 +922,30 @@ namespace sst::menu
       heap->Protect(page, 0x1000, old_protect);
     }
 
-    // f2 of a perspective builder: 16:9 becomes the chosen aspect (other values, e.g. split views, are left alone)
-    void FixCameraAspect(PPCContext &ctx)
+    // f2 of a perspective builder: 16:9 becomes the chosen aspect (other values, e.g. split views, are left alone). Each (caller, aspect) a perspective builder sees is logged once (cameras that do not follow the wide aspect are found this way)
+    void LogBuilder(uint32_t builder, uint32_t caller, double aspect, double replaced)
+    {
+      static std::mutex mutex;
+      static std::set<uint64_t> seen;
+      const uint64_t key = (uint64_t(caller) << 32) ^ uint64_t(builder) ^ uint64_t(std::llround(aspect * 10000.0));
+      std::lock_guard lock(mutex);
+
+      if (seen.size() > 512 || !seen.insert(key).second)
+        return;
+
+      REXLOG_INFO("[sst-menu] camera: builder {:08X} from {:08X} aspect {:.4f}{}", builder, caller, aspect, replaced != aspect ? fmt::format(" -> {:.4f}", replaced) : std::string());
+    }
+
+    void FixCameraAspect(PPCContext &ctx, uint32_t builder)
     {
       const double a = ctx.f2.f64;
+      struct Log
+      {
+        PPCContext &c;
+        uint32_t b;
+        double a;
+        ~Log() { LogBuilder(b, uint32_t(c.lr), a, c.f2.f64); }
+      } log{ctx, builder, a};
 
       if (std::fabs(a - 16.0 / 9.0) < 0.002)
         ctx.f2.f64 = double(g_camera_aspect.load());
@@ -878,11 +954,11 @@ namespace sst::menu
     // in-match pause menu (pause_patch.h)
     std::mutex g_pause_mutex;
     std::unordered_map<uint32_t, uint32_t> g_pause_modules; // game's module -> patched copy
-
     // PauseMenu file buffer -> {its size, where the loader keeps the file's size}
     struct PauseBuffer
     {
       uint32_t room, size_at;
+      std::string name; // lower-case file name
     };
 
     std::unordered_map<uint32_t, PauseBuffer> g_pause_rooms;
@@ -1003,7 +1079,6 @@ namespace sst::menu
 
       return kind;
     }
-
   }
 
   void Initialize(std::function<void(bool)> set_fullscreen, std::function<void()> request_quit)
@@ -1017,9 +1092,9 @@ namespace sst::menu
     Apply(g_current);
     REXLOG_INFO("[sst-menu] video settings{}: {}", g_loaded_from_file ? " (sst_settings.ini)" : "", Describe(g_current));
     // ASPECT RATIO 4:3: a 4:3 video mode (1280x1024, the game's HD 4:3 mode) makes the game pick its 4:3 layouts and cameras at boot
-    g_boot_four_three = g_current.v[kAspect] == 0;
+    g_boot_aspect = std::clamp(g_current.v[kAspect], 0, 4);
+    g_boot_four_three = g_boot_aspect == 0;
     ApplyAspect(nullptr); // scenes loaded at boot already see the aspect
-
     if (g_boot_four_three)
     {
       rex::cvar::SetFlagByName("video_mode_width", "1280");
@@ -1039,7 +1114,6 @@ namespace sst::menu
 
     if (g_loaded_from_file)
       return;
-
     // First boot (no sst_settings.ini): pick a preset from the GPU's memory
     const int preset = video_memory_mb < 3000 ? 0 : video_memory_mb < 7000 ? 1
                                                                            : 2;
@@ -1135,8 +1209,19 @@ extern "C" REX_FUNC(sub_82594AD0)
   __imp__sub_82594AD0(ctx, base);
 }
 
-// SumoTool reads PauseMenu.DAT / .REL through sub_82594618 (synchronous) or sub_825946B0 (asynchronous: the in-match loader). Both: r3 path, r4 -> buffer pointer, r5 -> size, r6 alignment. For the pause scene the buffer gets room for the VIDEO row; the patch itself happens in sub_82595158, once both files have arrived
-void ReadPauseFile(PPCContext &ctx, uint8_t *base, int kind, bool async)
+// Ultrawide layouts (scene_widen.h): when the game started with an aspect ratio wider than 16:9
+bool WideLayouts()
+{
+  return REXCVAR_GET(sst_wide_layouts) && !g_boot_four_three && hud::ShiftFor(g_camera_aspect.load()) > 0.001f;
+}
+// The star field's spare columns (scene_widen.cpp) apply at any aspect but the game's own 4:3 mode
+bool WideLayoutFor(const std::string &dat_name)
+{
+  return WideLayouts() || ((dat_name == "starbg.dat" || dat_name.starts_with("whtfade")) && REXCVAR_GET(sst_wide_layouts) && !g_boot_four_three);
+}
+
+// SumoTool reads scene files through sub_82594618 (synchronous) or sub_825946B0 (asynchronous: the in-match loader). Both: r3 path, r4 -> buffer pointer, r5 -> size, r6 alignment. Scenes the port rewrites get a buffer with room to grow (PauseMenu: the VIDEO row; others: wide layouts); the rewrite happens in sub_82595158, once both files (DAT, REL) are in. kind: 1 PauseMenu.DAT, 2 PauseMenu.REL, 3 another .DAT, 4 another .REL
+void ReadPauseFile(PPCContext &ctx, uint8_t *base, int kind, bool async, const std::string &name)
 {
   const uint32_t path = ctx.r3.u32, out_buf = ctx.r4.u32, out_size = ctx.r5.u32, align = ctx.r6.u32;
   ctx.r3.u32 = path;
@@ -1144,13 +1229,15 @@ void ReadPauseFile(PPCContext &ctx, uint8_t *base, int kind, bool async)
   const int32_t size = int32_t(ctx.r3.u32);
   Store32(base, out_size, uint32_t(size));
 
-  if (size <= 0 || size > 0x100000)
+  if (size <= 0 || size > 0x800000)
   {
     ctx.r3.u32 = async ? 0 : uint32_t(size);
     return;
   }
 
-  const uint32_t room = (uint32_t(size) + (kind == 1 ? 0x4000u : 0x1000u) + 0x7FF) & ~0x7FFu;
+  const uint32_t extra = kind == 1 ? 0x4000u : kind == 2 ? 0x1000u
+                                                         : widen::ExtraRoom(uint32_t(size), kind == 4);
+  const uint32_t room = (uint32_t(size) + extra + 0x7FF) & ~0x7FFu;
   ctx.r3.u32 = room;
   ctx.r4.u32 = align;
   sub_82122480(ctx, base);
@@ -1160,7 +1247,10 @@ void ReadPauseFile(PPCContext &ctx, uint8_t *base, int kind, bool async)
   if (buffer)
   {
     std::lock_guard lock(g_pause_mutex);
-    g_pause_rooms[buffer] = {room, out_size};
+    g_pause_rooms[buffer] = {room, out_size, name};
+
+    if (kind == 3)
+      g_hud_buffers[buffer] = name;
   }
 
   ctx.r3.u32 = 0x82DB97A0; // the game's file system
@@ -1187,31 +1277,51 @@ void ReadOtherFile(PPCContext &ctx, uint8_t *base)
   const std::string name = GuestFileName(base, path);
   Original(ctx, base);
 
-  if (name.ends_with(".dat")) // every scene: off-screen elements (all) / HUD sides
-  {
+  if (name.ends_with(".dat"))
+  { // every scene: off-screen elements (all) / HUD sides
     std::lock_guard lock(g_pause_mutex);
     g_hud_buffers[Load32(base, out_buf)] = name;
   }
 }
 
+// Which kind of scene file (see ReadPauseFile) a path is, 0 = read as usual
+int SceneFileKind(uint8_t *base, uint32_t path, std::string &name)
+{
+  int kind = REXCVAR_GET(sst_graphics_menu) ? PauseSceneFile(base, path) : 0;
+  name = GuestFileName(base, path);
+
+  if (!kind)
+  {
+    const bool dat = name.ends_with(".dat"), rel = name.ends_with(".rel");
+    const std::string as_dat = rel ? name.substr(0, name.size() - 4) + ".dat" : name;
+
+    if ((dat || rel) && WideLayoutFor(as_dat) && widen::WantsWideLayout(as_dat))
+      kind = dat ? 3 : 4;
+  }
+
+  return kind;
+}
+
 extern "C" REX_FUNC(sub_82594618)
 {
-  const int kind = REXCVAR_GET(sst_graphics_menu) ? PauseSceneFile(base, ctx.r3.u32) : 0;
+  std::string name;
+  const int kind = SceneFileKind(base, ctx.r3.u32, name);
 
   if (!kind)
     return ReadOtherFile<__imp__sub_82594618>(ctx, base);
 
-  ReadPauseFile(ctx, base, kind, false);
+  ReadPauseFile(ctx, base, kind, false, name);
 }
 
 extern "C" REX_FUNC(sub_825946B0)
 {
-  const int kind = REXCVAR_GET(sst_graphics_menu) ? PauseSceneFile(base, ctx.r3.u32) : 0;
+  std::string name;
+  const int kind = SceneFileKind(base, ctx.r3.u32, name);
 
   if (!kind)
     return ReadOtherFile<__imp__sub_825946B0>(ctx, base);
 
-  ReadPauseFile(ctx, base, kind, true);
+  ReadPauseFile(ctx, base, kind, true, name);
 }
 
 // SumoTool: set up a scene from its DAT and REL, r4 = {DAT pointer, size}, r5 = {REL pointer, size} (pointer in the high word). The PauseMenu scene is patched here, both files together, or not at all
@@ -1220,8 +1330,7 @@ extern "C" REX_FUNC(sub_82595158)
   const uint32_t dat = uint32_t(ctx.r4.u64 >> 32), dat_size = uint32_t(ctx.r4.u64);
   const uint32_t rel = uint32_t(ctx.r5.u64 >> 32), rel_size = uint32_t(ctx.r5.u64);
   uint32_t dat_room = 0, rel_room = 0, dat_size_at = 0, rel_size_at = 0;
-  std::string hud_name;
-
+  std::string hud_name, dat_name;
   {
     std::lock_guard lock(g_pause_mutex);
 
@@ -1232,7 +1341,7 @@ extern "C" REX_FUNC(sub_82595158)
     }
 
     if (auto it = g_pause_rooms.find(dat); it != g_pause_rooms.end())
-      dat_room = it->second.room, dat_size_at = it->second.size_at;
+      dat_room = it->second.room, dat_size_at = it->second.size_at, dat_name = it->second.name;
 
     if (auto it = g_pause_rooms.find(rel); it != g_pause_rooms.end())
       rel_room = it->second.room, rel_size_at = it->second.size_at;
@@ -1243,7 +1352,6 @@ extern "C" REX_FUNC(sub_82595158)
     if (rel_room)
       g_pause_rooms.erase(rel);
   }
-
   // Ultrawide: in-match HUD elements to the screen edges
   if (!hud_name.empty() && dat && dat_size && !NativeFourThree())
   {
@@ -1265,7 +1373,52 @@ extern "C" REX_FUNC(sub_82595158)
     }
   }
 
-  if (dat_room && rel_room && dat_size <= dat_room && rel_size <= rel_room)
+  const bool rooms = dat_room && rel_room && dat_size <= dat_room && rel_size <= rel_room;
+  // Ultrawide: the scene's wide layout
+  if (rooms && dat_name != "pausemenu.dat" && WideLayoutFor(dat_name) && widen::WantsWideLayout(dat_name))
+  {
+    std::vector<uint8_t> d(GuestPtr(base, dat), GuestPtr(base, dat) + dat_size);
+    std::vector<uint8_t> r(GuestPtr(base, rel), GuestPtr(base, rel) + rel_size);
+    widen::Bytes new_dat, new_rel;
+    widen::Stats stats;
+    std::vector<std::string> log;
+    std::string error;
+    const float shift = hud::ShiftFor(g_camera_aspect.load());
+
+    if (!widen::Widen(dat_name, d.data(), d.size(), r.data(), r.size(), shift, new_dat, new_rel, stats, &log, error))
+    {
+      REXLOG_WARN("[sst-menu] {}: no wide layout ({})", dat_name, error);
+    }
+    else if (stats.Total())
+    {
+      if (new_dat.size() <= dat_room && new_rel.size() <= rel_room)
+      {
+        std::memcpy(GuestPtr(base, dat), new_dat.data(), new_dat.size());
+        std::memcpy(GuestPtr(base, rel), new_rel.data(), new_rel.size());
+        ctx.r4.u64 = (uint64_t(dat) << 32) | uint32_t(new_dat.size());
+        ctx.r5.u64 = (uint64_t(rel) << 32) | uint32_t(new_rel.size());
+
+        if (Load32(base, dat_size_at) == dat_size)
+          Store32(base, dat_size_at, uint32_t(new_dat.size()));
+
+        if (Load32(base, rel_size_at) == rel_size)
+          Store32(base, rel_size_at, uint32_t(new_rel.size()));
+
+        REXLOG_INFO("[sst-menu] {}: wide layout (shift {:.3f}): {} bars, {} mirrored strips, "
+                    "{} cropped backgrounds, {} swoosh, {} stars (DAT {} -> {}, REL {} -> {} bytes)",
+                    dat_name, shift, stats.bars, stats.strips, stats.cropped, stats.swoosh, stats.stars, dat_size, new_dat.size(), rel_size, new_rel.size());
+
+        for (const std::string &line : log)
+          REXLOG_INFO("[sst-menu]   {}", line);
+      }
+      else
+      {
+        REXLOG_WARN("[sst-menu] {}: wide layout too large for its buffer ({} / {})", dat_name, new_dat.size(), dat_room);
+      }
+    }
+  }
+
+  if (rooms && dat_name == "pausemenu.dat")
   {
     std::vector<uint8_t> d(GuestPtr(base, dat), GuestPtr(base, dat) + dat_size);
     std::vector<uint8_t> r(GuestPtr(base, rel), GuestPtr(base, rel) + rel_size);
@@ -1285,7 +1438,6 @@ extern "C" REX_FUNC(sub_82595158)
       std::memcpy(GuestPtr(base, rel), new_rel->data(), new_rel->size());
       ctx.r4.u64 = (uint64_t(dat) << 32) | uint32_t(new_dat->size());
       ctx.r5.u64 = (uint64_t(rel) << 32) | uint32_t(new_rel->size());
-
       // The loader's own record of the sizes (used again when the scene is released) must match the patched files
       if (Load32(base, dat_size_at) == dat_size)
         Store32(base, dat_size_at, uint32_t(new_dat->size()));
@@ -1310,21 +1462,20 @@ extern "C" REX_FUNC(sub_82595158)
 extern "C" void __imp__sub_8231F950(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_822C2480(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_821227C0(PPCContext &__restrict, uint8_t *);
-
 extern "C" REX_FUNC(sub_8231F950)
 {
-  FixCameraAspect(ctx);
+  FixCameraAspect(ctx, 0x8231F950);
   __imp__sub_8231F950(ctx, base);
 }
 
 extern "C" REX_FUNC(sub_822C2480)
 {
-  FixCameraAspect(ctx);
+  FixCameraAspect(ctx, 0x822C2480);
   __imp__sub_822C2480(ctx, base);
 }
 
 extern "C" REX_FUNC(sub_821227C0)
 {
-  FixCameraAspect(ctx);
+  FixCameraAspect(ctx, 0x821227C0);
   __imp__sub_821227C0(ctx, base);
 }
