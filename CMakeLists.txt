@@ -22,6 +22,8 @@ set(SSTREMATCH_SOURCES
     src/menu/main_menu_quit.cpp
     src/movie/movie_debug.cpp
     src/input/controls.cpp
+    src/debug/crash_log.cpp
+    src/debug/scene_guard.cpp
     src/input/cursor.cpp
     src/input/lightbar.cpp
 )

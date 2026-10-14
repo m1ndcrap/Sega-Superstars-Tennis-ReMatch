@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "debug/crash_log.h"
 #include "gpu/native/native.h"
 #include "input/controls.h"
 #include "menu/graphics_menu.h"
@@ -67,6 +68,8 @@ public:
         if (auto* w = window(); w && w->IsFullscreen() != fullscreen) w->SetFullscreen(fullscreen); }); }, [this]
                           { app_context().RequestDeferredQuit(); });
     sst::native::Initialize(runtime());
+    // After the runtime's own handlers: a crash is logged with the guest functions on the stack
+    sst::debug::InstallCrashLog();
   }
   void OnShutdown() override { sst::native::Shutdown(); }
 
