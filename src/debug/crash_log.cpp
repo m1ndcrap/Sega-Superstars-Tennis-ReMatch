@@ -68,6 +68,7 @@ namespace sst::debug
       return fmt::format("0x{:X}", addr);
     }
 
+
     // Reads a big-endian guest word; false when the page is not readable
     bool ReadGuest(uint8_t *base, uint32_t addr, uint32_t &out)
     {
@@ -139,9 +140,7 @@ namespace sst::debug
         std::string report = fmt::format("[sst-crash] exception 0x{:08X} at {}", uint32_t(rec.ExceptionCode), Describe(reinterpret_cast<uintptr_t>(rec.ExceptionAddress)));
 
         if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec.NumberParameters >= 2)
-          report += fmt::format(" ({} 0x{:X})", rec.ExceptionInformation[0] == 1 ? "write" : rec.ExceptionInformation[0] == 8 ? "execute"
-                                                                                                                              : "read",
-                                rec.ExceptionInformation[1]);
+          report += fmt::format(" ({} 0x{:X})", rec.ExceptionInformation[0] == 1 ? "write" : rec.ExceptionInformation[0] == 8 ? "execute" : "read", rec.ExceptionInformation[1]);
 
         report += "\n";
 #if defined(_M_X64) || defined(__x86_64__)

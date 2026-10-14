@@ -2161,8 +2161,9 @@ extern "C" REX_FUNC(sub_82595158)
     if (shift > 0.0f)
     {
       std::vector<std::string> log;
-      const bool sides = hud::IsHudScene(hud_name);
-      const int moved = hud::Anchor(GuestPtr(base, dat), dat_size, shift, sides ? &log : nullptr, sides);
+      const bool edge_only = hud::IsEdgeHudScene(hud_name);
+      const bool sides = edge_only || hud::IsHudScene(hud_name);
+      const int moved = hud::Anchor(GuestPtr(base, dat), dat_size, shift, sides ? &log : nullptr, sides, edge_only);
 
       if (sides)
       {

@@ -68,7 +68,12 @@ namespace sst::menu::hud
     return false;
   }
 
-  int Anchor(uint8_t *d, size_t n, float shift, std::vector<std::string> *log, bool sides)
+  bool IsEdgeHudScene(const std::string &name)
+  {
+    return name == "bghuds.dat";
+  }
+
+  int Anchor(uint8_t *d, size_t n, float shift, std::vector<std::string> *log, bool sides, bool edge_only)
   {
     if (shift <= 0.0f)
       return 0;
@@ -302,9 +307,11 @@ namespace sst::menu::hud
 
       const float centre = 0.5f * (lo + hi);
       // Elements spanning most of the width (backgrounds, banners) stay centred.
-      const float side = !sides || (hi - lo) > 0.6f ? 0.0f : centre < 0.42f ? -1.0f
+      const float side_by_centre = !sides || (hi - lo) > 0.6f ? 0.0f : centre < 0.42f ? -1.0f
                                                          : centre > 0.58f   ? 1.0f
                                                                             : 0.0f;
+      // (Edge-only scenes: the element must also reach the outer part of its side)
+      const float side = edge_only && ((side_by_centre < 0.0f && lo > 0.15f) || (side_by_centre > 0.0f && hi < 0.85f)) ? 0.0f : side_by_centre;
 
       if (log)
         log->push_back(fmt::format("{:08X} x {:.3f}-{:.3f} -> {}", h, lo, hi, side < 0 ? "left" : side > 0 ? "right"

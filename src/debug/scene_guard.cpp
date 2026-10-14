@@ -42,21 +42,6 @@ namespace
     return a >= 0x40000000 && (a & 3) == 0 && !(a >= 0x82000000 && a < 0x83000000) && a < 0xFFFF0000;
   }
 
-  // A scene object: its vtable lies in the image and its +0x20 entry is code
-  bool LooksLikeSceneObject(uint8_t *base, uint32_t obj)
-  {
-    if (!HeapPointer(obj))
-      return false;
-
-    const uint32_t vtable = Load32(base, obj);
-
-    if (vtable < 0x82000000 || vtable >= 0x83000000 || (vtable & 3))
-      return false;
-
-    const uint32_t update = Load32(base, vtable + 0x20);
-    return update >= 0x82000000 && update < 0x83000000 && (update & 3) == 0;
-  }
-
   std::string Dump(uint8_t *base, uint32_t a, uint32_t words)
   {
     std::string s;
@@ -101,30 +86,22 @@ namespace
 
       if (owner != obj)
       {
-        const bool alive = LooksLikeSceneObject(base, obj);
-
+        // A live object's node always holds the object. The object was freed while still listed and its memory now belongs to another object (in the ring mission: one with vtable 8207A338, whose +0x24 is a running count), so the node is taken out of the list without writing to it
         if (g_reports.fetch_add(1) < 16)
-          REXLOG_ERROR("[sst-scene] update list: node {:08X} (#{}) holds {:08X} instead of its object {:08X} ({}); object: {} | node links: next {:08X} prev {:08X} | before: {}",
-                       node, n, owner, obj, alive ? "repaired" : "unlinked", Dump(base, obj, 16), next, Load32(base, node + 8), Dump(base, obj - 0x20, 8));
+          REXLOG_WARN("[sst-scene] update list: node {:08X} (#{}) holds {:08X} instead of its object {:08X} - unlinked (memory now: {})", node, n, owner, obj, Dump(base, obj, 12));
 
-        if (alive)
-          Store32(base, node, obj);
+        if (prev)
+          Store32(base, prev + 4, next);
         else
-        {
-          // Out of the list without writing to the node (its memory may belong to something else now)
-          if (prev)
-            Store32(base, prev + 4, next);
-          else
-            Store32(base, list, next);
+          Store32(base, list, next);
 
-          if (next && HeapPointer(next))
-            Store32(base, next + 8, prev);
-          else
-            Store32(base, list + 4, prev);
+        if (next && HeapPointer(next))
+          Store32(base, next + 8, prev);
+        else
+          Store32(base, list + 4, prev);
 
-          node = next;
-          continue;
-        }
+        node = next;
+        continue;
       }
 
       prev = node;
