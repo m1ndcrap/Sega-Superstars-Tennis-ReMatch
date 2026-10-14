@@ -75,14 +75,19 @@ namespace sst::menu::widen
 
   bool AddAchievementList(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, AchievementList &list, Bytes &out_dat, Bytes &out_rel, std::string &error);
 
-  // Unlock popup: a new page (scene entry `page_hash`) in MsgBox.DAT with one group that slides down from above the screen (key hide_label, frame 0) to the top of it (show_label, frame 10): panel, title bar, header text, icon (icon_base + slot, one object per slot), name, gamerscore and description texts
+  // Unlock popup: a new page (scene entry `page_hash`) in MsgBox.DAT with one group that slides down from above the screen (key hide_label, frame 0) to the top of it (show_label, frame 10): title bar, header text, icon (icon_base + slot, one object per slot), name and up to three description lines; the panel picture comes in three heights (panel[n - 1] for n description lines; the popup shows one)
   struct AchievementPopup
   {
-    uint32_t page_hash = 0, group = 0, panel = 0, bar = 0, header = 0, name = 0, score = 0, desc = 0, icon_base = 0;
+    static constexpr int kLines = 3;
+    uint32_t page_hash = 0, group = 0, bar = 0, header = 0, name = 0, icon_base = 0;
+    uint32_t panel[kLines] = {}, desc[kLines] = {};
     uint32_t hide_label = 0, show_label = 0;
     uint32_t text_blank = 0;
     IconPage page;
   };
+
+  // The popup's description: lines of at most this width (font units of the MsgBox body font at scale 1)
+  constexpr float kPopupDescWidth = 535.0f;
 
   bool AddAchievementPopup(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, const AchievementPopup &popup, Bytes &out_dat, Bytes &out_rel, std::string &error);
 

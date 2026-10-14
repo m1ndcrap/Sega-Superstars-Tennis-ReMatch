@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -28,6 +30,8 @@
 REXCVAR_DEFINE_BOOL(sst_achievements_ui, true, "SST",
                     "Achievements in the game's own style: Options > ACHIEVEMENTS list and unlock popups (instead of the SDK's overlay and toasts)");
 REXCVAR_DEFINE_INT32(sst_achievement_popup_ms, 4000, "SST", "How long an achievement popup stays on screen (milliseconds)");
+REXCVAR_DEFINE_STRING(sst_achievement_popup_sound, "Start", "SST",
+                      "Sound the achievement popup plays: one of the menu sounds (Start, Select, Move, Back), a sound hash (#1234ABCD), or none");
 REXCVAR_DEFINE_BOOL(sst_achievement_popup_test, false, "SST", "Test: show the first achievement's popup once the game is up (nothing is unlocked)");
 
 // Scene natives (thin wrappers around the scene manager 0x82DB4370): r5 values, r6 types, r7 count, r3 result
@@ -38,6 +42,7 @@ extern "C" void sub_82282C28(PPCContext &__restrict, uint8_t *); // 4:5 hide (ob
 extern "C" void sub_82282AA0(PPCContext &__restrict, uint8_t *); // 4:10 play keys (object, from, to, loop)
 extern "C" void sub_82283210(PPCContext &__restrict, uint8_t *); // 4:15 set text (object, text id)
 extern "C" void sub_82283318(PPCContext &__restrict, uint8_t *); // 4:18 alpha (object, 0-255)
+extern "C" void sub_82287EB8(PPCContext &__restrict, uint8_t *); // 7:1 play sound (name hash)
 
 namespace sst::ach
 {
@@ -50,16 +55,21 @@ namespace sst::ach
     constexpr uint32_t kRowGroup = 0x53411000, kRowPanel = 0x53412000, kRowIcon = 0x53413000, kRowIconLocked = 0x53414000;
     constexpr uint32_t kRowName = 0x53415000, kRowDesc = 0x53416000, kRowScore = 0x53417000;
     constexpr uint32_t kTexture = 0x53418000; // + slot
-    constexpr uint32_t kPopupPage = 0x5341E000, kPopupGroup = 0x5341E001, kPopupPanel = 0x5341E002, kPopupBar = 0x5341E003;
-    constexpr uint32_t kPopupHeader = 0x5341E004, kPopupName = 0x5341E005, kPopupScore = 0x5341E006, kPopupDesc = 0x5341E007;
-    constexpr uint32_t kPopupIcon = 0x5341E010; // + slot
+    constexpr uint32_t kPopupPage = 0x5341E000, kPopupGroup = 0x5341E001, kPopupBar = 0x5341E003;
+    constexpr uint32_t kPopupHeader = 0x5341E004, kPopupName = 0x5341E005;
+    constexpr uint32_t kPopupPanels[3] = {0x5341E002, 0x5341E00A, 0x5341E00B}; // for 1 / 2 / 3 description lines
+    constexpr uint32_t kPopupDesc[3] = {0x5341E007, 0x5341E008, 0x5341E009};   // description lines
+    constexpr uint32_t kPopupIcon = 0x5341E010;                                // + slot
     constexpr uint32_t kPopupHide = 0x5341E100, kPopupShow = 0x5341E101;
     // text ids
     constexpr uint32_t kTextBlank = 0x5341F000;
-    constexpr uint32_t kTextName = 0x5341A000, kTextDesc = 0x5341B000, kTextScore = 0x5341C000; // + row
-    constexpr uint32_t kTextSummary = 0x5341F010;                                               // + 0 / 1 (alternating: a new id makes the text redraw)
+    constexpr uint32_t kTextName = 0x5341A000, kTextDesc = 0x5341B000;    // + row
+    constexpr uint32_t kTextDate = 0x5341C000, kTextDateAlt = 0x5341D000; // + row: the unlock date (alternating with each page opening, so changed texts redraw)
+    constexpr uint32_t kTextSummary = 0x5341F010;                         // + 0 / 1 (alternating: a new id makes the text redraw)
     constexpr uint32_t kTextPopupHeader = 0x5341F020;
-    constexpr uint32_t kTextPopupName = 0x5341F021, kTextPopupScore = 0x5341F023, kTextPopupDesc = 0x5341F025; // + 0 / 1
+    constexpr uint32_t kTextPopupName = 0x5341F021; // + 0 / 1
+    constexpr uint32_t kTextPopupDesc = 0x5341F030; // + line x 2 + 0 / 1
+    constexpr uint32_t kPopupFont = 0x69995503;     // MsgBox body font (its advances wrap the description)
     // scripts (lookup2)
     constexpr uint32_t kScriptAchievements = 0xDB57BE7A, kScriptRecords = 0x92CC7DA7, kScriptMainMenu = 0x9E754704;
     // icons: slots of 64 x 64 in one 512 x 64 page; slots 0-3 the pictures, 4-7 the same greyed (locked)
@@ -111,11 +121,85 @@ namespace sst::ach
       bool tested = false;  // sst_achievement_popup_test done
       bool menu_up = false; // the main menu has started once
       bool frames_seen = false;
-      uint32_t front_end = 0;                  // the script front end (its directory holds the modules)
+      uint32_t front_end = 0; // the script front end (its directory holds the modules)
+      uint32_t font_file = 0; // msgbox_en.dat in guest memory (the popup's font)
+      std::vector<uint16_t> advances;
       uint32_t menu_module = 0, menu_site = 0; // the main menu module, its ACHIEVEMENTS action's 15:82 call
     };
 
     State g;
+
+    // Bob Jenkins' lookup2 (initval 0x04C11DB7), the game's name hash
+    uint32_t Lookup2(const std::string &key)
+    {
+      auto mix = [](uint32_t &a, uint32_t &b, uint32_t &c)
+      {
+        a -= b, a -= c, a ^= c >> 13;
+        b -= c, b -= a, b ^= a << 8;
+        c -= a, c -= b, c ^= b >> 13;
+        a -= b, a -= c, a ^= c >> 12;
+        b -= c, b -= a, b ^= a << 16;
+        c -= a, c -= b, c ^= b >> 5;
+        a -= b, a -= c, a ^= c >> 3;
+        b -= c, b -= a, b ^= a << 10;
+        c -= a, c -= b, c ^= b >> 15;
+      };
+      const uint8_t *k = reinterpret_cast<const uint8_t *>(key.data());
+      uint32_t len = uint32_t(key.size()), a = 0x9E3779B9u, b = 0x9E3779B9u, c = 0x04C11DB7u;
+      auto le = [](const uint8_t *p)
+      { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); };
+
+      while (len >= 12)
+      {
+        a += le(k), b += le(k + 4), c += le(k + 8);
+        mix(a, b, c);
+        k += 12, len -= 12;
+      }
+
+      c += uint32_t(key.size());
+
+      switch (len)
+      {
+      case 11:
+        c += uint32_t(k[10]) << 24;
+        [[fallthrough]];
+      case 10:
+        c += uint32_t(k[9]) << 16;
+        [[fallthrough]];
+      case 9:
+        c += uint32_t(k[8]) << 8;
+        [[fallthrough]];
+      case 8:
+        b += uint32_t(k[7]) << 24;
+        [[fallthrough]];
+      case 7:
+        b += uint32_t(k[6]) << 16;
+        [[fallthrough]];
+      case 6:
+        b += uint32_t(k[5]) << 8;
+        [[fallthrough]];
+      case 5:
+        b += k[4];
+        [[fallthrough]];
+      case 4:
+        a += uint32_t(k[3]) << 24;
+        [[fallthrough]];
+      case 3:
+        a += uint32_t(k[2]) << 16;
+        [[fallthrough]];
+      case 2:
+        a += uint32_t(k[1]) << 8;
+        [[fallthrough]];
+      case 1:
+        a += k[0];
+        [[fallthrough]];
+      default:
+        break;
+      }
+
+      mix(a, b, c);
+      return c;
+    }
 
     uint8_t *GuestPtr(uint8_t *base, uint32_t a)
     {
@@ -325,7 +409,6 @@ namespace sst::ach
       {
         PutText(base, kTextName + uint32_t(i), g.list[i].name.empty() ? " " : g.list[i].name);
         PutText(base, kTextDesc + uint32_t(i), g.list[i].desc.empty() ? " " : g.list[i].desc);
-        PutText(base, kTextScore + uint32_t(i), g.list[i].score);
       }
     }
 
@@ -383,6 +466,178 @@ namespace sst::ach
     {
       return g.manager ? g.manager->IsUnlocked(id) : false;
     }
+
+    // "10/14/2026  12:49 PM" (local time) from the unlock's FILETIME; "UNLOCKED" when the time is unknown
+    std::string UnlockDate(uint32_t id)
+    {
+      const uint64_t ft = g.manager ? g.manager->GetUnlockTime(id) : 0;
+      constexpr uint64_t kUnixEpoch = 116444736000000000ull; // 1970-01-01 in FILETIME units (100 ns since 1601)
+
+      if (ft <= kUnixEpoch)
+        return "UNLOCKED";
+
+      const std::time_t t = std::time_t((ft - kUnixEpoch) / 10000000ull);
+      std::tm tm{};
+#if defined(_WIN32)
+      if (localtime_s(&tm, &t) != 0)
+        return "UNLOCKED";
+#else
+      if (!localtime_r(&t, &tm))
+        return "UNLOCKED";
+#endif
+      const int hour = tm.tm_hour % 12 == 0 ? 12 : tm.tm_hour % 12;
+      return fmt::format("{:02}/{:02}/{}  {}:{:02} {}", tm.tm_mon + 1, tm.tm_mday, tm.tm_year + 1900, hour, tm.tm_min, tm.tm_hour < 12 ? "AM" : "PM");
+    }
+
+    // The MsgBox body font's advances (from the language file's FONT chunk: 0x20-byte fonts {hash, glyph count, 0, glyphs offset, ...}, 0x18-byte glyphs {texture, char, x, y, w, h, x offset, advance, ...}). Under g.mutex
+    void ReadAdvances(uint8_t *base)
+    {
+      if (!g.advances.empty() || !g.font_file)
+        return;
+
+      // chunks {tag, chunk size, data size, 0x44332211, data}
+      uint32_t at = g.font_file;
+
+      for (int n = 0; n < 64; ++n)
+      {
+        const uint32_t tag = Load32(base, at), size = Load32(base, at + 4), data = Load32(base, at + 8);
+
+        if (!tag || size < 16 || size > 0x400000 || Load32(base, at + 12) != 0x44332211)
+          return;
+
+        if (tag == 0x464F4E54) // "FONT"
+        {
+          const uint32_t d = at + 16, fonts = Load32(base, d + 8);
+
+          for (uint32_t f = 0; f < fonts && f < 64; ++f)
+          {
+            const uint32_t e = d + 12 + 0x20 * f;
+
+            if (Load32(base, e) != kPopupFont)
+              continue;
+
+            const uint32_t glyphs = Load32(base, e + 4) >> 16, go = Load32(base, e + 8);
+
+            // (the glyph offset is chunk-relative in the file; the loader may have made it an address)
+            const uint32_t glyph_base = go >= g.font_file ? go : d + go;
+
+            if (glyphs > 0x400 || (go < g.font_file && go + 0x18 * glyphs > data))
+              return;
+
+            g.advances.assign(256, 0);
+
+            for (uint32_t i = 0; i < glyphs; ++i)
+            {
+              const uint32_t gl = glyph_base + 0x18 * i;
+              const uint32_t ch = Load32(base, gl + 4) >> 16;
+              const uint32_t adv = Load32(base, gl + 16) >> 16;
+
+              if (ch < 256)
+                g.advances[ch] = uint16_t(adv);
+            }
+
+            REXLOG_INFO("[sst-ach] popup font: {} glyphs", glyphs);
+            return;
+          }
+
+          return;
+        }
+
+        at += size;
+      }
+    }
+
+    float TextWidth(const std::string &s)
+    {
+      float w = 0;
+
+      for (const char c : s)
+      {
+        const uint8_t u = uint8_t(c);
+        w += (u < g.advances.size() && g.advances[u]) ? float(g.advances[u]) : 16.0f;
+      }
+
+      return w;
+    }
+
+    // Word wrap to `width` (font units), at most `max_lines` (the last one cut with "..." when the text goes on). Under g.mutex
+    std::vector<std::string> Wrap(uint8_t *base, const std::string &text, float width, size_t max_lines)
+    {
+      ReadAdvances(base);
+      std::vector<std::string> words, lines;
+      size_t p = 0;
+
+      while (p < text.size())
+      {
+        const size_t q = text.find(' ', p);
+        const std::string w = text.substr(p, q == std::string::npos ? std::string::npos : q - p);
+
+        if (!w.empty())
+          words.push_back(w);
+
+        if (q == std::string::npos)
+          break;
+
+        p = q + 1;
+      }
+
+      std::string line;
+
+      for (size_t i = 0; i < words.size(); ++i)
+      {
+        const std::string candidate = line.empty() ? words[i] : line + " " + words[i];
+
+        if (line.empty() || TextWidth(candidate) <= width)
+        {
+          line = candidate;
+          continue;
+        }
+
+        lines.push_back(line);
+        line = words[i];
+
+        if (lines.size() == max_lines)
+        {
+          // no room for the rest: the last line ends with "..."
+          std::string last = lines.back();
+
+          while (!last.empty() && TextWidth(last + "...") > width)
+            last.pop_back();
+
+          lines.back() = last + "...";
+          return lines;
+        }
+      }
+
+      if (!line.empty())
+        lines.push_back(line);
+
+      return lines;
+    }
+
+    // sst_achievement_popup_sound -> sound hash (lookup2 of the name, or #hex), 0 for none
+    uint32_t PopupSound()
+    {
+      std::string name = REXCVAR_GET(sst_achievement_popup_sound);
+
+      if (name.empty() || name == "none" || name == "off")
+        return 0;
+
+      if (name[0] == '#')
+        return uint32_t(std::strtoul(name.c_str() + 1, nullptr, 16));
+
+      return Lookup2(name);
+    }
+  }
+
+  void OnSceneFile(uint8_t *base, const std::string &name, uint32_t buffer)
+  {
+    if (name != "msgbox_en.dat" || !buffer)
+      return;
+
+    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    g.font_file = buffer;
+    g.advances.clear(); // read when first needed (the read may still be under way)
   }
 
   bool UseGameUi()
@@ -402,7 +657,7 @@ namespace sst::ach
 
       std::lock_guard<std::recursive_mutex> lock(g.mutex);
       g.queue.push_back(event.achievement.id);
-      REXLOG_INFO("[sst-ach] unlocked {} \"{}\" ({} G)", event.achievement.id, event.achievement.label, event.achievement.gamerscore); });
+      REXLOG_INFO("[sst-ach] unlocked {} \"{}\"", event.achievement.id, event.achievement.label); });
   }
 
   uint32_t ExtraRoom(const std::string &name)
@@ -492,12 +747,12 @@ namespace sst::ach
     sst::menu::widen::AchievementPopup popup;
     popup.page_hash = kPopupPage;
     popup.group = kPopupGroup;
-    popup.panel = kPopupPanel;
     popup.bar = kPopupBar;
     popup.header = kPopupHeader;
     popup.name = kPopupName;
-    popup.score = kPopupScore;
-    popup.desc = kPopupDesc;
+
+    for (int k = 0; k < 3; ++k)
+      popup.panel[k] = kPopupPanels[k], popup.desc[k] = kPopupDesc[k];
     popup.icon_base = kPopupIcon;
     popup.hide_label = kPopupHide;
     popup.show_label = kPopupShow;
@@ -695,6 +950,7 @@ namespace sst::ach
     case 0:
     {
       uint32_t unlocked = 0, score = 0, total = 0;
+      g.summary_alt = !g.summary_alt;
       // Shown first: showing a group shows its children (both icons of every row)
       Show(ctx, base, kList, true);
       Show(ctx, base, kSummary, true);
@@ -709,7 +965,10 @@ namespace sst::ach
         total += e.gamerscore;
         SetText(ctx, base, kRowName + r, kTextName + r);
         SetText(ctx, base, kRowDesc + r, kTextDesc + r);
-        SetText(ctx, base, kRowScore + r, kTextScore + r);
+        // Unlock date and time in the gamerscore's place (local time; blank while locked)
+        const uint32_t date = (g.summary_alt ? kTextDateAlt : kTextDate) + r;
+        PutText(base, date, on ? UnlockDate(e.id) : std::string(" "), 32);
+        SetText(ctx, base, kRowScore + r, date);
         Show(ctx, base, kRowIcon + r, on);
         Show(ctx, base, kRowIconLocked + r, !on);
 
@@ -717,13 +976,14 @@ namespace sst::ach
           Alpha(ctx, base, obj, on ? 0xFF : 0x78);
       }
 
-      g.summary_alt = !g.summary_alt;
       const uint32_t text = kTextSummary + (g.summary_alt ? 1 : 0);
-      PutText(base, text, fmt::format("{} / {}      {} / {}G", unlocked, g.list.size(), score, total), 64);
+      PutText(base, text, fmt::format("{} / {} UNLOCKED", unlocked, g.list.size()), 64);
       SetText(ctx, base, kSummary, text);
       const int steps = std::max(0, int(g.list.size()) - kVisibleRows);
       SetResult(base, out, uint32_t(steps), 2);
-      REXLOG_INFO("[sst-ach] ACHIEVEMENTS page: {} / {} unlocked, {} / {} G", unlocked, g.list.size(), score, total);
+      REXLOG_INFO("[sst-ach] ACHIEVEMENTS page: {} / {} unlocked", unlocked, g.list.size());
+      (void)score;
+      (void)total;
       break;
     }
 
@@ -787,21 +1047,32 @@ namespace sst::ach
       g.popup_alt = !g.popup_alt;
       const uint32_t alt = g.popup_alt ? 1 : 0;
       PutText(base, kTextPopupName + alt, it->name, kPopupText);
-      PutText(base, kTextPopupScore + alt, it->score, 16);
-      // The description when it fits on one line in the popup
-      PutText(base, kTextPopupDesc + alt, it->desc.size() <= 48 ? it->desc : std::string(" "), kPopupText);
+      // The description wrapped to the popup's width (up to three lines; the panel picture of that height)
+      const std::vector<std::string> lines = Wrap(base, it->desc, sst::menu::widen::kPopupDescWidth, 3);
+
+      for (uint32_t k = 0; k < 3; ++k)
+        PutText(base, kTextPopupDesc + k * 2 + alt, k < lines.size() ? lines[k] : std::string(" "), kPopupText);
+
       Native(ctx, base, sub_82282830, {{kPopupPage, kHash}});
       SetText(ctx, base, kPopupHeader, kTextPopupHeader);
       SetText(ctx, base, kPopupName, kTextPopupName + alt);
-      SetText(ctx, base, kPopupScore, kTextPopupScore + alt);
-      SetText(ctx, base, kPopupDesc, kTextPopupDesc + alt);
+
+      for (uint32_t k = 0; k < 3; ++k)
+      {
+        SetText(ctx, base, kPopupDesc[k], kTextPopupDesc + k * 2 + alt);
+        Show(ctx, base, kPopupPanels[k], k + 1 == std::max<size_t>(lines.size(), 1));
+      }
 
       for (uint32_t k = 0; k < kSlots; ++k)
         Show(ctx, base, kPopupIcon + k, k == uint32_t(it->slot));
 
       Native(ctx, base, sub_82282AA0, {{kPopupGroup, kHash}, {kPopupHide, kHash}, {kPopupShow, kHash}, {0, kInt}});
+
+      if (const uint32_t sound = PopupSound())
+        Native(ctx, base, sub_82287EB8, {{sound, kHash}});
+
       g.popup = State::Popup::kShown;
-      REXLOG_INFO("[sst-ach] popup: {} \"{}\" ({}, icon slot {})", it->id, it->name, it->score, it->slot);
+      REXLOG_INFO("[sst-ach] popup: {} \"{}\" (icon slot {})", it->id, it->name, it->slot);
       g.since = now;
       break;
     }

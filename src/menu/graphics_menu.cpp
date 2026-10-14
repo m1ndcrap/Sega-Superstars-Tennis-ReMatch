@@ -2107,6 +2107,8 @@ void ReadOtherFile(PPCContext &ctx, uint8_t *base)
     std::lock_guard lock(g_pause_mutex);
     g_hud_buffers[Load32(base, out_buf)] = name;
   }
+
+  sst::ach::OnSceneFile(base, name, Load32(base, out_buf));
 }
 
 // Which kind of scene file (see ReadPauseFile) a path is, 0 = read as usual

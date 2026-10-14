@@ -27,6 +27,9 @@ namespace sst::ach
   // Scene files: extra buffer room for a scene .DAT / .REL (lower-case name) this module patches
   uint32_t ExtraRoom(const std::string &name);
 
+  // A scene file was read (lower-case name, guest buffer): the popup's font comes from msgbox_en.dat
+  void OnSceneFile(uint8_t *base, const std::string &name, uint32_t buffer);
+
   // Scene setup (sub_82595158): the patched sstmainmenu.dat (list) / msgbox.dat (popup) and their .REL; false: not patched (logged)
   bool BuildScene(const std::string &dat_name, const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, std::vector<uint8_t> &out_dat, std::vector<uint8_t> &out_rel);
 

@@ -1807,7 +1807,7 @@ namespace sst::menu::widen
       } texts[] = {
           {list.row_name + i, kLabel, 0, text_x, top + pitch * 0.385f, 1.0f, 0xFFFFFFFF},
           {list.row_desc + i, kLabel, 0, text_x, top + pitch * 0.72f, list.desc_scale[i], 0xBFD4F2FF},
-          {list.row_score + i, kValue, 2, value_x, top + pitch * 0.385f, 1.0f, 0xFFD54AFF},
+          {list.row_score + i, kValue, 2, value_x, top + pitch * 0.385f, 0.85f, 0xD7E4F7FF}, // (the unlock date)
       };
 
       for (const auto &tx : texts)
@@ -1853,13 +1853,16 @@ namespace sst::menu::widen
       if (!s.objects.count(h) || !s.tracks.count(h))
         return error = fmt::format("object {:08X} missing", h), false;
 
-    std::vector<uint32_t> fresh = {popup.group, popup.panel, popup.bar, popup.header, popup.name, popup.score, popup.desc};
+    std::vector<uint32_t> fresh = {popup.group, popup.bar, popup.header, popup.name};
+
+    for (int k = 0; k < AchievementPopup::kLines; ++k)
+      fresh.push_back(popup.panel[k]), fresh.push_back(popup.desc[k]);
 
     for (size_t k = 0; k < popup.page.slots.size(); ++k)
       fresh.push_back(popup.icon_base + uint32_t(k));
 
     for (uint32_t h : fresh)
-      if (s.used.count(h))
+      if (!h || s.used.count(h))
         return error = fmt::format("{:08X} already used", h), false;
 
     for (const SceneEntry &se : s.scenes)
@@ -1872,17 +1875,27 @@ namespace sst::menu::widen
     if (!AddIconPage(s, popup.page, error))
       return false;
 
-    // Box: top centre of the 16:9 layout
-    constexpr float kX = 0.30f, kY = 0.03f, kW = 0.40f, kH = 0.118f, kBarH = 0.032f;
+    // Box: top centre of the 16:9 layout. Body: the name's baseline, then the description lines (scale 0.78)
+    constexpr float kX = 0.30f, kY = 0.03f, kW = 0.40f, kBarH = 0.032f;
+    constexpr float kName = 0.040f, kFirstLine = 0.070f, kLine = 0.027f, kBottom = 0.018f, kDescScale = 0.78f;
+    auto body_height = [&](int lines)
+    {
+      return kFirstLine + kLine * float(lines - 1) + kBottom;
+    };
+    const float max_h = kBarH + body_height(AchievementPopup::kLines);
     const uint8_t *gk = s.tracks[kGroup].Key(0);
-    AddObject(s, kGroup, popup.group, MakeTrack(s, 1.0f, 1.0f, {MakeKey(gk, popup.hide_label, 0, 0xFFFFFFFF, 0.0f, -(kY + kH + 0.03f), 1.0f, 1.0f), MakeKey(gk, popup.show_label, 10, 0xFFFFFFFF, 0.0f, 0.0f, 1.0f, 1.0f)}));
-    // panel picture
+    AddObject(s, kGroup, popup.group, MakeTrack(s, 1.0f, 1.0f, {MakeKey(gk, popup.hide_label, 0, 0xFFFFFFFF, 0.0f, -(kY + max_h + 0.03f), 1.0f, 1.0f), MakeKey(gk, popup.show_label, 10, 0xFFFFFFFF, 0.0f, 0.0f, 1.0f, 1.0f)}));
+
+    // panel pictures, one per description height
+    for (int k = 0; k < AchievementPopup::kLines; ++k)
     {
       const Track &pt = s.tracks[kPicture];
-      Object &o = AddObject(s, kPicture, popup.panel, MakeTrack(s, pt.w, pt.h, {MakeKey(pt.keys.data(), 0x5E391A57, 0, 0xFFFFFFFF, kX, kY, kW / pt.w, kH / pt.h)}));
+      const float h = kBarH + body_height(k + 1);
+      Object &o = AddObject(s, kPicture, popup.panel[k], MakeTrack(s, pt.w, pt.h, {MakeKey(pt.keys.data(), 0x5E391A57, 0, 0xFFFFFFFF, kX, kY, kW / pt.w, h / pt.h)}));
       Wr32(o.blob.data() + 0xC, 0); // no clip
-      AddChild(s, popup.group, popup.panel);
+      AddChild(s, popup.group, popup.panel[k]);
     }
+
     // title bar (a gradient rectangle: kind 2 keys, same layout up to the scale)
     {
       Track t = s.tracks[kBar];
@@ -1898,15 +1911,16 @@ namespace sst::menu::widen
       AddObject(s, kBar, popup.bar, std::move(t));
       AddChild(s, popup.group, popup.bar);
     }
-    // icons, one per slot (the page shows the one for the achievement)
+
+    // icons, one per slot (the page shows the one for the achievement), centred on the name and first line
     const float icon_w = float(popup.page.height) / 1280.0f, icon_h = float(popup.page.height) / 720.0f, icon_s = 0.72f;
-    const float body_top = kY + kBarH, body_h = kH - kBarH;
+    const float body_top = kY + kBarH;
 
     for (size_t k = 0; k < popup.page.slots.size(); ++k)
     {
       const Track &pt = s.tracks[kPicture];
       const uint32_t h = popup.icon_base + uint32_t(k);
-      Object &o = AddObject(s, kPicture, h, MakeTrack(s, icon_w, icon_h, {MakeKey(pt.keys.data(), 0x5E391A57, 0, 0xFFFFFFFF, kX + 0.012f, body_top + (body_h - icon_h * icon_s) / 2, icon_s, icon_s)}));
+      Object &o = AddObject(s, kPicture, h, MakeTrack(s, icon_w, icon_h, {MakeKey(pt.keys.data(), 0x5E391A57, 0, 0xFFFFFFFF, kX + 0.012f, body_top + (body_height(1) - icon_h * icon_s) / 2, icon_s, icon_s)}));
       Wr32(o.blob.data(), popup.page.slots[k]);
       Wr32(o.blob.data() + 0xC, 0);
       Wr32(o.blob.data() + 0x28, 0); // in front of the panel
@@ -1915,20 +1929,24 @@ namespace sst::menu::widen
       AddChild(s, popup.group, h);
     }
 
-    // texts: header (title font, centred in the bar), name and description (body font), gamerscore (right)
+    // texts: header (title font, centred in the bar), name and description lines (body font)
     const float text_x = kX + 0.012f + icon_w * icon_s + 0.014f;
-    struct
+    struct Text
     {
       uint32_t h, from;
       int align;
       float x, y, scale;
       uint32_t colour;
-    } texts[] = {
-        {popup.header, kTitle, 1, kX + kW / 2, kY + kBarH * 0.78f, 0.62f, 0xFFFFFFFF},
-        {popup.name, kBody, 0, text_x, body_top + body_h * 0.45f, 1.0f, 0xFFFFFFFF},
-        {popup.score, kBody, 2, kX + kW - 0.012f, body_top + body_h * 0.45f, 1.0f, 0xFFD54AFF},
-        {popup.desc, kBody, 0, text_x, body_top + body_h * 0.80f, 0.78f, 0xD7E4F7FF},
     };
+    std::vector<Text> texts = {
+        {popup.header, kTitle, 1, kX + kW / 2, kY + kBarH * 0.78f, 0.62f, 0xFFFFFFFF},
+        {popup.name, kBody, 0, text_x, body_top + kName, 1.0f, 0xFFFFFFFF},
+    };
+
+    for (int k = 0; k < AchievementPopup::kLines; ++k)
+      texts.push_back({popup.desc[k], kBody, 0, text_x, body_top + kFirstLine + kLine * float(k), kDescScale, 0xD7E4F7FF});
+
+    // (kPopupDescWidth = the room from text_x to the box's right edge less 0.012, 0.326 x 1280 px, at kDescScale)
 
     for (const auto &tx : texts)
     {
