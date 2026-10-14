@@ -1,6 +1,7 @@
 // sst_rematch - in-game VIDEO page
 
 #include "menu/graphics_menu.h"
+#include "menu/achievements.h"
 #include "input/controls.h"
 #include "menu/hud_anchor.h"
 #include "menu/main_menu_quit.h"
@@ -1583,6 +1584,9 @@ extern "C" REX_FUNC(sub_821CCA28)
       REXLOG_WARN("[sst-menu] \"video\" not found in the script directory");
   }
 
+  // Options > ACHIEVEMENTS / RECORDS (achievements.cpp)
+  sst::ach::OnScriptStart(ctx, base, ctx.r3.u32, ctx.r4.u32);
+
   __imp__sub_821CCA28(ctx, base);
 }
 
@@ -1743,6 +1747,15 @@ namespace
 extern "C" REX_FUNC(sub_821DFBC0)
 {
   const uint32_t id = ctx.r5.u32 & 0xFFFF;
+
+  if ((id >> 8) == sst::ach::kNativeGroup)
+  {
+    sst::ach::HandleNative(ctx, base, id);
+    return;
+  }
+
+  if (sst::ach::OverrideNative(ctx, base, id))
+    return;
 
   if ((id >> 8) == kNativeGroup)
   {
@@ -1943,6 +1956,16 @@ extern "C" REX_FUNC(sub_821DFBC0)
 // SumoTool: text tables r3, text id r4 -> string (0 if not found)
 extern "C" REX_FUNC(sub_82594AD0)
 {
+  {
+    uint32_t text = 0;
+
+    if (sst::ach::ResolveText(base, ctx.r4.u32, text))
+    {
+      ctx.r3.u32 = text;
+      return;
+    }
+  }
+
   if (g_restart_dialog && (ctx.r4.u32 == kDialogBody || ctx.r4.u32 == kDialogTitle))
   {
     SetupGuest(base);
@@ -2036,8 +2059,9 @@ void ReadPauseFile(PPCContext &ctx, uint8_t *base, int kind, bool async, const s
     return;
   }
 
-  const uint32_t extra = kind == 1 ? 0x4000u : kind == 2 ? 0x1000u
-                                                         : widen::ExtraRoom(uint32_t(size), kind == 4);
+  const uint32_t extra = (kind == 1 ? 0x4000u : kind == 2 ? 0x1000u
+                                                          : widen::ExtraRoom(uint32_t(size), kind == 4)) +
+                         sst::ach::ExtraRoom(name);
   const uint32_t room = (uint32_t(size) + extra + 0x7FF) & ~0x7FFu;
   ctx.r3.u32 = room;
   ctx.r4.u32 = align;
@@ -2083,6 +2107,8 @@ void ReadOtherFile(PPCContext &ctx, uint8_t *base)
     std::lock_guard lock(g_pause_mutex);
     g_hud_buffers[Load32(base, out_buf)] = name;
   }
+
+  sst::ach::OnSceneFile(base, name, Load32(base, out_buf));
 }
 
 // Which kind of scene file (see ReadPauseFile) a path is, 0 = read as usual
@@ -2096,7 +2122,7 @@ int SceneFileKind(uint8_t *base, uint32_t path, std::string &name)
     const bool dat = name.ends_with(".dat"), rel = name.ends_with(".rel");
     const std::string as_dat = rel ? name.substr(0, name.size() - 4) + ".dat" : name;
 
-    if ((dat || rel) && ((WideLayoutFor(as_dat) && widen::WantsWideLayout(as_dat)) || (as_dat == "sstmainmenu.dat" && (REXCVAR_GET(sst_quit_item) || REXCVAR_GET(sst_graphics_menu)))))
+    if ((dat || rel) && ((WideLayoutFor(as_dat) && widen::WantsWideLayout(as_dat)) || (as_dat == "sstmainmenu.dat" && (REXCVAR_GET(sst_quit_item) || REXCVAR_GET(sst_graphics_menu))) || sst::ach::ExtraRoom(name)))
       kind = dat ? 3 : 4;
   }
 
@@ -2237,6 +2263,40 @@ extern "C" REX_FUNC(sub_82595158)
     {
       REXLOG_WARN("[sst-menu] sstmainmenu.dat: list arrows not added ({})", error.empty() ? std::string("too large") : error);
     }
+  }
+
+  // Achievements: the list on the RECORDS page (main menu), the unlock popup (MsgBox); before the wide layout, which then covers them too
+  if (rooms && (dat_name == "sstmainmenu.dat" || dat_name == "msgbox.dat"))
+  {
+    widen::Bytes new_dat, new_rel;
+    bool ok = false;
+
+    if (sst::ach::BuildScene(dat_name, GuestPtr(base, dat), dat_size, GuestPtr(base, rel), rel_size, new_dat, new_rel))
+    {
+      if (new_dat.size() <= dat_room && new_rel.size() <= rel_room)
+      {
+        std::memcpy(GuestPtr(base, dat), new_dat.data(), new_dat.size());
+        std::memcpy(GuestPtr(base, rel), new_rel.data(), new_rel.size());
+
+        if (Load32(base, dat_size_at) == dat_size)
+          Store32(base, dat_size_at, uint32_t(new_dat.size()));
+
+        if (Load32(base, rel_size_at) == rel_size)
+          Store32(base, rel_size_at, uint32_t(new_rel.size()));
+
+        dat_size = uint32_t(new_dat.size());
+        rel_size = uint32_t(new_rel.size());
+        ctx.r4.u64 = (uint64_t(dat) << 32) | dat_size;
+        ctx.r5.u64 = (uint64_t(rel) << 32) | rel_size;
+        ok = true;
+      }
+      else
+      {
+        REXLOG_ERROR("[sst-ach] {}: patched scene too large for its buffer ({} / {}, {} / {})", dat_name, new_dat.size(), dat_room, new_rel.size(), rel_room);
+      }
+    }
+
+    sst::ach::SceneReady(dat_name, ok);
   }
 
   // Ultrawide: the scene's wide layout
