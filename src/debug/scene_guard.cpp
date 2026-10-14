@@ -1,5 +1,7 @@
 // sst_rematch - guard for the scene manager's update list
 
+#include "menu/achievements.h"
+
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
@@ -114,6 +116,8 @@ namespace
 extern "C" void __imp__sub_82581DE8(PPCContext &__restrict, uint8_t *);
 extern "C" REX_FUNC(sub_82581DE8)
 {
+  // Once a frame, before the update: the achievement popups (they add their own objects to the list)
+  sst::ach::Frame(ctx, base);
   CheckUpdateList(base, ctx.r3.u32);
   __imp__sub_82581DE8(ctx, base);
 }

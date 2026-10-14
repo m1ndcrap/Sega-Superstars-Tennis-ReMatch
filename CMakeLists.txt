@@ -15,6 +15,7 @@ set(SSTREMATCH_SOURCES
     src/main.cpp
     src/gpu/d3d_trace.cpp
     src/menu/graphics_menu.cpp
+    src/menu/achievements.cpp
     src/menu/pause_patch.cpp
     src/menu/restart.cpp
     src/menu/hud_anchor.cpp
