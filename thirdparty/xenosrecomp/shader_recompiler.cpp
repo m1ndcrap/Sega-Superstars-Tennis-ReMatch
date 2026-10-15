@@ -1693,8 +1693,10 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
         out += "\n\tuint pc = 0;\n";
         out += "\twhile (true)\n";
         out += "\t{\n";
+#ifndef SST_RECOMP
         out += "\t\tswitch (pc)\n";
         out += "\t\t{\n";
+#endif
     }
 
     controlFlowCode = code;
@@ -1713,7 +1715,17 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
             if (!simpleControlFlow)
             {
                 indentation = 3;
+#ifdef SST_RECOMP
+                // SST: an if-chain instead of a switch with fall-through cases. Block N runs when pc <= N, so control falls
+                // through in order from pc on; a jump sets pc and restarts the loop. Intel's shader compiler mishandled the
+                // switch form (character materials drawn wrong on Intel GPUs only).
+                if (pc != 0)
+                    out += "\t\t}\n";
+                println("\t\tif (pc <= {})", pc);
+                out += "\t\t{\n";
+#else
                 println("\t\tcase {}:", pc);
+#endif
             }
             else
             {
@@ -1923,35 +1935,41 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
             {
                 if (isPixelShader)
                 {
-                    specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
+#ifdef SST_RECOMP
+                    // SST: in the loop form the alpha test runs once after the loop (below), not at each exit inside it
+                    if (simpleControlFlow)
+#endif
+                    {
+                        specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
 
-                    indent();
-                    out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)";
-                    indent();
-                    out += '{';
+                        indent();
+                        out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)";
+                        indent();
+                        out += '{';
 
-                    indent();
-                    out += "\tclip(oC0.w - g_AlphaThreshold);\n";
+                        indent();
+                        out += "\tclip(oC0.w - g_AlphaThreshold);\n";
 
-                    indent();
-                    out += "}";
+                        indent();
+                        out += "}";
 
 #ifdef UNLEASHED_RECOMP
-                    specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
+                        specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
 
-                    indent();
-                    out += "else if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_COVERAGE)";
-                    indent();
-                    out += '{';
+                        indent();
+                        out += "else if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_COVERAGE)";
+                        indent();
+                        out += '{';
 
-                    indent();
-                    out += "\toC0.w *= 1.0 + computeMipLevel(pixelCoord) * 0.25;\n";
-                    indent();
-                    out += "\toC0.w = 0.5 + (oC0.w - g_AlphaThreshold) / max(fwidth(oC0.w), 1e-6);\n";
+                        indent();
+                        out += "\toC0.w *= 1.0 + computeMipLevel(pixelCoord) * 0.25;\n";
+                        indent();
+                        out += "\toC0.w = 0.5 + (oC0.w - g_AlphaThreshold) / max(fwidth(oC0.w), 1e-6);\n";
 
-                    indent();
-                    out += '}';
+                        indent();
+                        out += '}';
 #endif
+                    }
                 }
                 else
                 {
@@ -2001,10 +2019,26 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
 
     if (!simpleControlFlow)
     {
+#ifdef SST_RECOMP
         out += "\t\t\tbreak;\n";
         out += "\t\t}\n";
         out += "\t\tbreak;\n";
         out += "\t}\n";
+
+        if (isPixelShader)
+        {
+            specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
+            out += "\t[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)\n";
+            out += "\t{\n";
+            out += "\t\tclip(oC0.w - g_AlphaThreshold);\n";
+            out += "\t}\n";
+        }
+#else
+        out += "\t\t\tbreak;\n";
+        out += "\t\t}\n";
+        out += "\t\tbreak;\n";
+        out += "\t}\n";
+#endif
     }
 
 #ifdef UNLEASHED_RECOMP

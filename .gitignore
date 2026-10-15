@@ -18,6 +18,7 @@ shader_key_report.txt
 *.res
 
 tools/*
+!tools/shader_bake/
 sst_menu_files.zip
 sst_aspect_scenes.zip
 sst_menu_scenes2.zip

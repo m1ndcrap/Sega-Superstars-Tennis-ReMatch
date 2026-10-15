@@ -28,6 +28,7 @@
 #include <cfloat>
 #include <chrono>
 #include <thread>
+#include <unordered_set>
 #include <cmath>
 #include <cstring>
 
@@ -99,6 +100,23 @@ REXCVAR_DEFINE_BOOL(sst_native_check_vs, false, "SST",
 REXCVAR_DEFINE_BOOL(sst_native_check_vs_all, false, "SST",
                     "Native renderer debug: like sst_native_check_vs for every draw (slow)");
 
+REXCVAR_DEFINE_INT32(sst_native_decal_depth_bias, 0, "SST",
+                     "Native renderer test: depth bias (in depth ULPs) towards the camera for draws that test depth "
+                     "without writing it (decals drawn over a surface: eyes, moustaches, markings), so they stay in front "
+                     "of the surface under them on GPUs that interpolate depth less precisely (0 = off)");
+
+REXCVAR_DEFINE_BOOL(sst_native_debug_markers, false, "SST",
+                    "Native renderer debug: label every draw for RenderDoc / PIX (shader hashes, depth / colour state)");
+
+REXCVAR_DEFINE_BOOL(sst_native_debug_depth_always, false, "SST",
+                    "Native renderer debug: depth test always passes (draw order decides what is on top). Use with "
+                    "--sst_native_pipeline_library=false");
+
+REXCVAR_DEFINE_BOOL(sst_native_debug_bisect, false, "SST",
+                    "Native renderer debug: find the pixel shader that draws something wrong. Home = start (takes "
+                    "the pixel shaders drawn since the last stop; half of them are hidden), Page Up = the problem is still "
+                    "visible, Page Down = the problem is gone, End = stop. Each step is logged");
+
 REXCVAR_DEFINE_BOOL(sst_native_skip_blended, false, "SST",
                     "Native renderer debug: skip alpha-blended draws (effects, glows, light "
                     "beams), which look like solid white shapes until textures are emulated");
@@ -127,6 +145,7 @@ REXCVAR_DEFINE_BOOL(sst_native_scissor, true, "SST",
 // VIDEO page settings (src/menu/graphics_menu.cpp)
 REXCVAR_DECLARE(int32_t, sst_resolution);
 REXCVAR_DECLARE(int32_t, sst_render_scale);
+REXCVAR_DECLARE(bool, sst_native_depth_flip_vs);
 REXCVAR_DECLARE(int32_t, sst_shadow_size);
 REXCVAR_DECLARE(int32_t, sst_brightness);
 REXCVAR_DECLARE(int32_t, sst_fps_limit);
@@ -143,6 +162,77 @@ REXCVAR_DEFINE_STRING(sst_native_rt, "auto", "SST",
 
 namespace sst::native
 {
+  namespace
+  {
+    // --sst_native_debug_bisect (render thread only): halves the candidate pixel shaders on each key press
+    struct ShaderBisect
+    {
+      std::unordered_set<uint64_t> recent; // pixel shaders drawn since the last start
+      std::vector<uint64_t> candidates;    // sorted; the first `hidden` are skipped
+      size_t hidden = 0;
+      bool active = false;
+
+      bool Hidden(uint64_t ps) const
+      {
+        return active && std::binary_search(candidates.begin(), candidates.begin() + ptrdiff_t(hidden), ps);
+      }
+
+      void Log(const char *what) const
+      {
+        std::string list;
+
+        for (size_t i = 0; i < candidates.size() && i < 64; ++i)
+          list += fmt::format(" {:016X}{}", candidates[i], i < hidden ? "*" : "");
+
+        REXLOG_INFO("[sst-bisect] {}: {} candidate pixel shaders, {} hidden (*):{}", what, candidates.size(), hidden, list);
+
+        if (candidates.size() == 1)
+          REXLOG_INFO("[sst-bisect] FOUND: pixel shader {:016X}", candidates[0]);
+      }
+
+      void Split() { hidden = candidates.size() > 1 ? candidates.size() / 2 : candidates.size(); }
+
+      void Poll()
+      {
+        if (!REXCVAR_GET(sst_native_debug_bisect))
+          return;
+
+        if (GetAsyncKeyState(VK_HOME) & 1)
+        {
+          candidates.assign(recent.begin(), recent.end());
+          std::sort(candidates.begin(), candidates.end());
+          active = !candidates.empty();
+          Split();
+          Log("start");
+        }
+        else if (active && (GetAsyncKeyState(VK_PRIOR) & 1))
+        { // still visible: the culprit is among the shown ones
+          candidates.erase(candidates.begin(), candidates.begin() + ptrdiff_t(hidden));
+          Split();
+          Log("still visible");
+        }
+        else if (active && (GetAsyncKeyState(VK_NEXT) & 1))
+        { // gone: the culprit is among the hidden ones
+          candidates.resize(hidden);
+          Split();
+          Log("gone");
+        }
+        else if (GetAsyncKeyState(VK_END) & 1)
+        {
+          active = false;
+          recent.clear();
+          REXLOG_INFO("[sst-bisect] stopped");
+        }
+      }
+    };
+
+    ShaderBisect &Bisect()
+    {
+      static ShaderBisect b;
+      return b;
+    }
+  }
+
   using Microsoft::WRL::ComPtr;
   using rex::ui::d3d12::D3D12Presenter;
   using rex::ui::d3d12::D3D12Provider;
@@ -2855,6 +2945,7 @@ namespace sst::native
       FinishCapture();
       captured_.clear();
     }
+    Bisect().Poll();
     // F9 (or --sst_native_capture_frame) captures the next frame
     capture_quiet_ = REXCVAR_GET(sst_native_capture_frame) == -1;
 
@@ -3254,6 +3345,9 @@ namespace sst::native
     d.DepthStencilState.DepthEnable = key.depth_enable;
     d.DepthStencilState.DepthWriteMask = key.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(key.depth_func + 1); // xenos 0-7
+
+    if (REXCVAR_GET(sst_native_debug_depth_always))
+      d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
 
     d.InputLayout = {layout.data(), UINT(layout.size())};
     d.IBStripCutValue = key.strip_cut == 1 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : key.strip_cut == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
@@ -4815,15 +4909,29 @@ namespace sst::native
       return;
     }
 
-    // Shader variants (compiled on worker threads; skip until ready)
-    const ShaderVariant *vs = shaders_->GetVariant(vs_entry, vs_spec);
-    const ShaderVariant *ps = ps_entry ? shaders_->GetVariant(ps_entry, ps_spec) : nullptr;
+    // Shader variants (from the exe's shader pack, or compiled on worker threads; skip until ready). urgent: a draw waits for them, so
+    // they jump the compile queue.
+    const ShaderVariant *vs = shaders_->GetVariant(vs_entry, vs_spec, true);
+    const ShaderVariant *ps = ps_entry ? shaders_->GetVariant(ps_entry, ps_spec, true) : nullptr;
     const bool debug_shading = REXCVAR_GET(sst_native_debug_shading) && debug_ps_;
 
     if (!vs || (ps_entry && !ps))
     {
       ++stats_.skip_pending;
       return;
+    }
+
+    // Bisect: a hidden draw still runs in full, it just writes no colour (so nothing else changes)
+    bool bisect_hide = false;
+
+    if (ps_entry && REXCVAR_GET(sst_native_debug_bisect))
+    {
+      ShaderBisect &bisect = Bisect();
+
+      if (!bisect.active && bisect.recent.size() < 4096)
+        bisect.recent.insert(ps_entry->hash);
+
+      bisect_hide = bisect.Hidden(ps_entry->hash);
     }
 
     // Pipeline
@@ -4844,7 +4952,7 @@ namespace sst::native
       return;
     }
 
-    key.color_mask = ps ? uint8_t(Reg(base, dev, RB_COLOR_MASK) & 0xF) : 0;
+    key.color_mask = ps && !bisect_hide ? uint8_t(Reg(base, dev, RB_COLOR_MASK) & 0xF) : 0;
 
     if (LogOnce(0xD000000000000000ull | (uint64_t(key.color_mask) << 32) | key.blend))
       REXLOG_INFO("[sst-native] new state: colour mask {:X} blend {:08X} depth {:08X} colour "
@@ -4881,6 +4989,21 @@ namespace sst::native
           REXLOG_INFO("[sst-native] polygon offset: scale {} offset {} (mode {:08X}) -> depth bias "
                       "{} slope {}",
                       scale, offset, mode, key.depth_bias, key.slope_bias);
+      }
+    }
+
+    // Decals: a depth test without depth writes, no polygon offset of its own. Nudge towards the camera (window-space depth: larger
+    // passes GREATER / GEQUAL, smaller passes LESS / LEQUAL)
+    if (const int32_t decal_bias = REXCVAR_GET(sst_native_decal_depth_bias); decal_bias > 0 && key.depth_enable && !key.depth_write && key.depth_bias == 0 && key.slope_bias == 0.0f)
+    {
+      const uint8_t f = key.depth_func; // xenos: 1 less, 3 lequal, 4 greater, 6 gequal
+      const int32_t dir = (f == 4 || f == 6) ? 1 : (f == 1 || f == 3) ? -1
+                                                                      : 0;
+
+      if (dir)
+      {
+        key.depth_bias = dir * decal_bias;
+        ++stats_.decal_biased;
       }
     }
 
@@ -5595,7 +5718,7 @@ namespace sst::native
       return;
 
     {
-      uint32_t sc[76] = {};
+      uint32_t sc[80] = {}; // [76]: depth flip in the vertex shader (shader_cache.cpp, sst_native_depth_flip_vs)
 
       for (int i = 0; i < 16; ++i)
       {
@@ -5709,6 +5832,14 @@ namespace sst::native
         vp.Height = 2 * std::fabs(ys);
         vp.MinDepth = std::clamp(zo, 0.0f, 1.0f);
         vp.MaxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
+
+        // A negative z scale (the game's reversed depth) gives an inverted depth range (MinDepth > MaxDepth). Instead the vertex shader
+        // outputs w - z and the range is the normal way round: same window depth, without the inverted viewport
+        if (zs < 0 && REXCVAR_GET(sst_native_depth_flip_vs))
+        {
+          std::swap(vp.MinDepth, vp.MaxDepth);
+          sc[76] = 1;
+        }
 
         if (ys > 0 && LogOnce(0xC000000000000001ull))
           REXLOG_WARN("[sst-native] positive viewport y scale ({}): image may be flipped", ys);
@@ -5840,6 +5971,14 @@ namespace sst::native
     list_->SetGraphicsRootConstantBufferView(kRootPSConstantsRaw, psc_gpu);
     list_->SetGraphicsRootConstantBufferView(kRootShared, shared.gpu);
     list_->IASetPrimitiveTopology(topology);
+
+    // RenderDoc / PIX: name the draw by its shaders and state (Event Browser)
+    if (REXCVAR_GET(sst_native_debug_markers))
+    {
+      const std::string label = fmt::format("vs {:016X} ps {:016X} depth {:08X} colour {:08X} blend {:08X} bias {}", vs_entry ? vs_entry->hash : 0, ps_entry ? ps_entry->hash : 0, depthcontrol, colorcontrol, key.blend, key.depth_bias);
+      const std::wstring wide(label.begin(), label.end());
+      list_->SetMarker(0, wide.c_str(), UINT((wide.size() + 1) * sizeof(wchar_t)));
+    }
 
     if (draw_indexed)
       list_->DrawIndexedInstanced(draw_count, 1, 0, convert || rect_list ? 0 : -int32_t(vmin), 0);
@@ -6296,6 +6435,8 @@ namespace sst::native
                 "pending {} fetch {} prim {} rt {} pipeline {} data {} cull {} memexport-target {}; {} clears; "
                 "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB; resolves {}",
                 frame, s.draws, s.drawn, s.depth_only, s.skip_shader, s.skip_pending, s.skip_decl, s.skip_prim, s.skip_rt, s.skip_pipeline, s.skip_data, s.skip_cull, s.skip_memexport, s.clears, s.pipelines_created, s.pipelines_failed, s.shaders_from_objects, double(s.upload_bytes) / (1 << 20), s.resolves);
+    if (s.decal_biased)
+      REXLOG_INFO("[sst-native] decal depth bias {} applied to {} draws", REXCVAR_GET(sst_native_decal_depth_bias), s.decal_biased);
     if (s.measured_draws)
       REXLOG_INFO("[sst-native] ui fit: {} draws measured on the CPU ({} 3D, stopped after the probe; {} big batches sampled)", s.measured_draws, s.measured_3d_early, s.measured_sampled);
     std::string prims;

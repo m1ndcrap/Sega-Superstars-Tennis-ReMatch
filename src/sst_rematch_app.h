@@ -5,6 +5,9 @@
 #pragma once
 
 #include "debug/crash_log.h"
+#ifdef _WIN32
+#include "gpu/d3d12_setup.h"
+#endif
 #include "gpu/native/native.h"
 #include "input/controls.h"
 #include "menu/achievements.h"
@@ -54,6 +57,10 @@ public:
 
       config.gpu_plugin = have_sst ? "sst" : "xenos";
     }
+#ifdef _WIN32
+    // Dual-GPU PCs: the dedicated GPU unless --d3d12_adapter says otherwise
+    sst::gpu::ConfigureDevice();
+#endif
     // Keyboard controls (on by default) and the input system that tracks which device is in use, for the button prompts
     sst::input::ApplyDefaults();
     config.input_factory = [](bool tool_mode)
