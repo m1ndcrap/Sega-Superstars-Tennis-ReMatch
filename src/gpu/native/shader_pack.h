@@ -1,4 +1,8 @@
-// sst_rematch - native renderer: shader pack shared by the build-time baker (tools/shader_bake) and the runtime shader cache
+// sst_rematch - native renderer: shader pack shared by the build-time baker (tools/shader_bake) and the runtime shader cache.
+//
+// The build translates and compiles every shader container in the game's ShaderCache files (plus optional dumps) ahead of time and embeds the
+// resulting DXIL in the exe as a resource. At runtime ShaderCache looks shaders up there first, so players never compile them.
+// Header-only and free of Windows / D3D dependencies so the baker and tests can include it anywhere.
 
 #pragma once
 
@@ -13,8 +17,9 @@ namespace sst::native::pack
   // Bump when the translator, the prelude or the compile options change: stale disk cache files are rebuilt and an embedded pack built
   // with another version is ignored.
   // 2: D3D9 multiply rule; 3: vertex index in r0.x; 4: 3D fetch offsets; 5: screen position / render scale; 6: clip transform (c18);
-  // 7: render scale per axis (c17.zw); 8: loop-form shaders as an if-chain, alpha test after the loop
-  inline constexpr uint32_t kCacheVersion = 8;
+  // 7: render scale per axis (c17.zw); 8: loop-form shaders as an if-chain, alpha test after the loop;
+  // 9: reversed depth flipped in the vertex shader (g_SstDepthFlip, c19.x)
+  inline constexpr uint32_t kCacheVersion = 9;
 
   // DXC arguments for every translated shader (after "-T <profile>")
   inline constexpr const wchar_t *kDxcArgs[] = {

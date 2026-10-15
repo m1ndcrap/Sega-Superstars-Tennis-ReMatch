@@ -58,6 +58,10 @@ target_include_directories(sst_rematch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if(WIN32)
     target_link_libraries(sst_rematch PRIVATE hid setupapi)
 endif()
+# Linker map next to the exe: turns the "sst_rematch.exe+0x..." frames of a crash report (sst_crash.txt) into function names
+if(WIN32 AND (MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC"))
+    target_link_options(sst_rematch PRIVATE "LINKER:/MAP:$<TARGET_FILE_DIR:sst_rematch>/sst_rematch.map")
+endif()
 
 # src/input/controls.cpp builds the SDK's input drivers itself; sdl_input_driver.h includes SDL3's headers (types only - the driver code lives in rexruntime)
 if(TARGET SDL3::SDL3)

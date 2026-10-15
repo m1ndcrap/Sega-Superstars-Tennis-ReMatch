@@ -1,6 +1,7 @@
 // sst_rematch - native renderer: D3D12 frame recording and draws
 
 #include "gpu/native/renderer.h"
+#include "gpu/native/guest_memory.h"
 
 #include "gpu/native/shader_cache.h"
 #include "gpu/native/texture_cache.h"
@@ -100,17 +101,12 @@ REXCVAR_DEFINE_BOOL(sst_native_check_vs, false, "SST",
 REXCVAR_DEFINE_BOOL(sst_native_check_vs_all, false, "SST",
                     "Native renderer debug: like sst_native_check_vs for every draw (slow)");
 
-REXCVAR_DEFINE_INT32(sst_native_decal_depth_bias, 0, "SST",
-                     "Native renderer test: depth bias (in depth ULPs) towards the camera for draws that test depth "
-                     "without writing it (decals drawn over a surface: eyes, moustaches, markings), so they stay in front "
-                     "of the surface under them on GPUs that interpolate depth less precisely (0 = off)");
+REXCVAR_DEFINE_BOOL(sst_native_depth_flip_vs, true, "SST",
+                    "Native renderer: flip the game's reversed depth in the vertex shader (z = w - z) instead of with an "
+                    "inverted viewport depth range, which loses small depth gaps on Intel GPUs (eyes, moustaches, decals)");
 
 REXCVAR_DEFINE_BOOL(sst_native_debug_markers, false, "SST",
                     "Native renderer debug: label every draw for RenderDoc / PIX (shader hashes, depth / colour state)");
-
-REXCVAR_DEFINE_BOOL(sst_native_debug_depth_always, false, "SST",
-                    "Native renderer debug: depth test always passes (draw order decides what is on top). Use with "
-                    "--sst_native_pipeline_library=false");
 
 REXCVAR_DEFINE_BOOL(sst_native_debug_bisect, false, "SST",
                     "Native renderer debug: find the pixel shader that draws something wrong. Home = start (takes "
@@ -145,7 +141,6 @@ REXCVAR_DEFINE_BOOL(sst_native_scissor, true, "SST",
 // VIDEO page settings (src/menu/graphics_menu.cpp)
 REXCVAR_DECLARE(int32_t, sst_resolution);
 REXCVAR_DECLARE(int32_t, sst_render_scale);
-REXCVAR_DECLARE(bool, sst_native_depth_flip_vs);
 REXCVAR_DECLARE(int32_t, sst_shadow_size);
 REXCVAR_DECLARE(int32_t, sst_brightness);
 REXCVAR_DECLARE(int32_t, sst_fps_limit);
@@ -3346,9 +3341,6 @@ namespace sst::native
     d.DepthStencilState.DepthWriteMask = key.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(key.depth_func + 1); // xenos 0-7
 
-    if (REXCVAR_GET(sst_native_debug_depth_always))
-      d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-
     d.InputLayout = {layout.data(), UINT(layout.size())};
     d.IBStripCutValue = key.strip_cut == 1 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : key.strip_cut == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
                                                                                                             : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
@@ -4096,7 +4088,7 @@ namespace sst::native
     {
       const uint32_t ib = be32(base, dev + kDevIndices);
 
-      if (!ib)
+      if (!ib || !GuestReadable(ib, 0x1C))
         return fail("no index buffer");
 
       const uint32_t common = be32(base, ib);
@@ -4111,6 +4103,9 @@ namespace sst::native
       const uint32_t first_byte = call.start * isz;
       const uint32_t aligned_begin = first_byte & ~3u;
       const uint32_t aligned_end = (first_byte + call.count * isz + 3) & ~3u;
+
+      if (!GuestReadable(ib_addr + aligned_begin, aligned_end - aligned_begin))
+        return fail("index buffer memory gone");
       std::vector<uint8_t> raw(aligned_end - aligned_begin);
       SwapVertexData(index_endian, GuestPtr(base, ib_addr + aligned_begin), raw.data(), raw.size());
       const uint8_t *src = raw.data() + (first_byte - aligned_begin);
@@ -4992,21 +4987,6 @@ namespace sst::native
       }
     }
 
-    // Decals: a depth test without depth writes, no polygon offset of its own. Nudge towards the camera (window-space depth: larger
-    // passes GREATER / GEQUAL, smaller passes LESS / LEQUAL)
-    if (const int32_t decal_bias = REXCVAR_GET(sst_native_decal_depth_bias); decal_bias > 0 && key.depth_enable && !key.depth_write && key.depth_bias == 0 && key.slope_bias == 0.0f)
-    {
-      const uint8_t f = key.depth_func; // xenos: 1 less, 3 lequal, 4 greater, 6 gequal
-      const int32_t dir = (f == 4 || f == 6) ? 1 : (f == 1 || f == 3) ? -1
-                                                                      : 0;
-
-      if (dir)
-      {
-        key.depth_bias = dir * decal_bias;
-        ++stats_.decal_biased;
-      }
-    }
-
     key.topology_type = uint8_t(topology_type);
 
     clk.Switch(kPhIndices);
@@ -5031,7 +5011,7 @@ namespace sst::native
     {
       const uint32_t ib = be32(base, dev + kDevIndices);
 
-      if (!ib || call.count > kMaxDrawIndices)
+      if (!ib || call.count > kMaxDrawIndices || !GuestReadable(ib, 0x1C))
       {
         ++stats_.skip_data;
         return;
@@ -5055,6 +5035,17 @@ namespace sst::native
       const uint32_t first_byte = call.start * isz;
       const uint32_t aligned_begin = first_byte & ~3u;
       const uint32_t aligned_end = (first_byte + call.count * isz + 3) & ~3u;
+      // Freed by the game while this draw waited (a model loading): skip it
+      if (!GuestReadable(ib_addr + aligned_begin, aligned_end - aligned_begin))
+      {
+        ++stats_.skip_data;
+
+        if (LogOnce(0xC200000000000000ull))
+          REXLOG_WARN("[sst-native] index data at {:08X} is no longer mapped (freed while the draw was queued): draws like this are skipped", ib_addr + aligned_begin);
+
+        return;
+      }
+
       ib_src = GuestPtr(base, ib_addr + aligned_begin);
       ib_src_bytes = aligned_end - aligned_begin;
       const uint32_t restart = index32 ? 0xFFFFFFFFu : 0xFFFFu;
@@ -5192,7 +5183,7 @@ namespace sst::native
       if (call.up_data && fs.slot == 95)
       {
         // DrawVerticesUP: stream 0 data comes from the caller's buffer
-        if (!PlausibleAddress(call.up_data))
+        if (!PlausibleAddress(call.up_data) || !GuestReadable(call.up_data, call.up_stride * (call.start + call.count)))
         {
           ++stats_.skip_data;
           return;
@@ -5214,6 +5205,16 @@ namespace sst::native
 
           if (LogOnce(0xF000000000000000ull | fs.slot))
             REXLOG_WARN("[sst-native] fetch constant {} is not a vertex buffer: {:08X} {:08X}", fs.slot, dw0, dw1);
+
+          return;
+        }
+
+        if (!GuestPhysicalReadable(phys, size))
+        {
+          ++stats_.skip_data;
+
+          if (LogOnce(0xC300000000000000ull))
+            REXLOG_WARN("[sst-native] vertex data at {:08X} is no longer mapped (freed while the draw was queued): draws like this are skipped", phys);
 
           return;
         }
@@ -5718,7 +5719,7 @@ namespace sst::native
       return;
 
     {
-      uint32_t sc[80] = {}; // [76]: depth flip in the vertex shader (shader_cache.cpp, sst_native_depth_flip_vs)
+      uint32_t sc[80] = {}; // [76] (c19.x): g_SstDepthFlip
 
       for (int i = 0; i < 16; ++i)
       {
@@ -5833,8 +5834,9 @@ namespace sst::native
         vp.MinDepth = std::clamp(zo, 0.0f, 1.0f);
         vp.MaxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
 
-        // A negative z scale (the game's reversed depth) gives an inverted depth range (MinDepth > MaxDepth). Instead the vertex shader
-        // outputs w - z and the range is the normal way round: same window depth, without the inverted viewport
+        // A negative z scale (the game's reversed depth) gives an inverted depth range (MinDepth > MaxDepth), which Intel GPUs
+        // evaluate too coarsely: eyes and moustaches drawn just in front of the face fail the depth test. Instead the vertex shader
+        // outputs w - z (g_SstDepthFlip, XenosRecomp under SST_RECOMP) and the range is the normal way round: same window depth
         if (zs < 0 && REXCVAR_GET(sst_native_depth_flip_vs))
         {
           std::swap(vp.MinDepth, vp.MaxDepth);
@@ -6435,8 +6437,6 @@ namespace sst::native
                 "pending {} fetch {} prim {} rt {} pipeline {} data {} cull {} memexport-target {}; {} clears; "
                 "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB; resolves {}",
                 frame, s.draws, s.drawn, s.depth_only, s.skip_shader, s.skip_pending, s.skip_decl, s.skip_prim, s.skip_rt, s.skip_pipeline, s.skip_data, s.skip_cull, s.skip_memexport, s.clears, s.pipelines_created, s.pipelines_failed, s.shaders_from_objects, double(s.upload_bytes) / (1 << 20), s.resolves);
-    if (s.decal_biased)
-      REXLOG_INFO("[sst-native] decal depth bias {} applied to {} draws", REXCVAR_GET(sst_native_decal_depth_bias), s.decal_biased);
     if (s.measured_draws)
       REXLOG_INFO("[sst-native] ui fit: {} draws measured on the CPU ({} 3D, stopped after the probe; {} big batches sampled)", s.measured_draws, s.measured_3d_early, s.measured_sampled);
     std::string prims;

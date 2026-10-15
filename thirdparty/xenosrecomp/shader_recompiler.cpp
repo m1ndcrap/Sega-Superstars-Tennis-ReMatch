@@ -1940,34 +1940,34 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
                     if (simpleControlFlow)
 #endif
                     {
-                        specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
+                    specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
 
-                        indent();
-                        out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)";
-                        indent();
-                        out += '{';
+                    indent();
+                    out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)";
+                    indent();
+                    out += '{';
 
-                        indent();
-                        out += "\tclip(oC0.w - g_AlphaThreshold);\n";
+                    indent();
+                    out += "\tclip(oC0.w - g_AlphaThreshold);\n";
 
-                        indent();
-                        out += "}";
+                    indent();
+                    out += "}";
 
 #ifdef UNLEASHED_RECOMP
-                        specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
+                    specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
 
-                        indent();
-                        out += "else if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_COVERAGE)";
-                        indent();
-                        out += '{';
+                    indent();
+                    out += "else if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_COVERAGE)";
+                    indent();
+                    out += '{';
 
-                        indent();
-                        out += "\toC0.w *= 1.0 + computeMipLevel(pixelCoord) * 0.25;\n";
-                        indent();
-                        out += "\toC0.w = 0.5 + (oC0.w - g_AlphaThreshold) / max(fwidth(oC0.w), 1e-6);\n";
+                    indent();
+                    out += "\toC0.w *= 1.0 + computeMipLevel(pixelCoord) * 0.25;\n";
+                    indent();
+                    out += "\toC0.w = 0.5 + (oC0.w - g_AlphaThreshold) / max(fwidth(oC0.w), 1e-6);\n";
 
-                        indent();
-                        out += '}';
+                    indent();
+                    out += '}';
 #endif
                     }
                 }
@@ -1982,6 +1982,12 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
                         out += "\toPos.xy = oPos.xy * g_ClipTransform.xy + g_ClipTransform.zw * oPos.w;\n";
 #endif
                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+#ifdef SST_RECOMP
+                        // Port: the game's reversed depth (negative viewport z scale) is flipped here (z = w - z) and the viewport's
+                        // depth range kept the normal way round: an inverted range (MinDepth > MaxDepth) loses the small depth gaps of
+                        // eyes / moustaches / decals over the surface under them on Intel GPUs
+                        out += "\tif (g_SstDepthFlip != 0)\n\t\toPos.z = oPos.w - oPos.z;\n";
+#endif
                     }
                 }
 

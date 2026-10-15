@@ -1,6 +1,7 @@
 // sst_rematch - native renderer: textures and samplers (see texture_cache.h)
 
 #include "gpu/native/texture_cache.h"
+#include "gpu/native/guest_memory.h"
 
 #include "gpu/native/prompts.h"
 
@@ -871,6 +872,13 @@ namespace sst::native
 
       if (!t)
         return kNone;
+    }
+
+    // Freed by the game while the draw waited (a model loading): placeholder for this draw
+    if ((t->key.base_page && t->base_size && !GuestPhysicalReadable(t->key.base_page << 12, t->base_size)) || (t->key.mip_page && t->mip_size && !GuestPhysicalReadable(t->key.mip_page << 12, t->mip_size)))
+    {
+      ++stats_.bad;
+      return kNone;
     }
 
     t->used_frame = frame_;

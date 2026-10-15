@@ -27,21 +27,6 @@ REXCVAR_DEFINE_STRING(sst_shader_override, "", "SST",
                       "adds DXC arguments to every shader. Overridden shaders are compiled at startup / first use, not "
                       "taken from the exe's shader pack");
 
-REXCVAR_DEFINE_BOOL(sst_native_depth_flip_vs, false, "SST",
-                    "Native renderer test: for the game's reversed depth (negative viewport z scale), flip depth in the vertex "
-                    "shader (z = w - z) instead of with an inverted viewport depth range. Vertex shaders are compiled at "
-                    "startup / first use instead of from the exe's shader pack");
-
-REXCVAR_DEFINE_BOOL(sst_shader_precise_vs, false, "SST",
-                    "Native renderer debug: compile vertex shaders with every temporary and the position marked precise "
-                    "(no fused or reordered maths), at startup / first use instead of from the exe's shader pack");
-
-REXCVAR_DEFINE_BOOL(sst_native_depth_float24, false, "SST",
-                    "Native renderer test: pixel shaders round their depth to the Xbox 360's 24-bit float depth format "
-                    "(20-bit mantissa) before the depth test, so layers the game draws at the same float24 depth (eyes, "
-                    "moustaches, decals) pass a GREATER_EQUAL test as on the console. Pixel shaders are compiled at "
-                    "startup / first use instead of from the exe's shader pack");
-
 namespace sst::native
 {
   using Microsoft::WRL::ComPtr;
@@ -90,69 +75,6 @@ namespace sst::native
 
       flush();
       return out;
-    }
-
-    // `precise` on the VS position and temporaries: the driver may not fuse multiply-adds or reorder them, so separate draws of the
-    // same surface (a face and the eyes / moustache drawn over it) get bit-identical depth, as on the console
-    std::string MakeVertexShaderPrecise(std::string s)
-    {
-      auto replace_all = [&](const std::string &from, const std::string &to)
-      {
-        for (size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size()))
-          s.replace(at, from.size(), to);
-      };
-
-      replace_all("out float4 oPos : SV_Position", "out precise float4 oPos : SV_Position");
-      replace_all("\n\tfloat ps =", "\n\tprecise float ps =");
-
-      for (int i = 0; i < 128; ++i)
-        replace_all(fmt::format("\n\tfloat4 r{} =", i), fmt::format("\n\tprecise float4 r{} =", i));
-
-      return s;
-    }
-
-    // Pixel shader writes its depth rounded to float24 (Xbox 360 D24FS8: 4-bit exponent, 20-bit mantissa), round to nearest even as
-    // the console's depth conversion. Below 2^-14 float24 is denormal: fixed steps of 2^-34.
-    constexpr const char *kDepthFloat24Function = R"(
-float SstDepthF24(float z)
-{
-	z = saturate(z);
-	uint u = asuint(z);
-	if (u < 0x38800000u)
-		return round(z * 17179869184.0) * (1.0 / 17179869184.0);
-	u = (u + 3u + ((u >> 3) & 1u)) & ~7u;
-	return asfloat(u);
-}
-
-)";
-
-    std::string MakePixelShaderDepthFloat24(std::string s)
-    {
-      const std::string sig = "\tout float4 oC0 : SV_Target0)\n{";
-      const size_t at = s.find(sig);
-      const size_t main_at = s.find("void main(");
-
-      if (at == std::string::npos || main_at == std::string::npos || s.find("SV_Position") == std::string::npos)
-        return s;
-
-      s.replace(at, sig.size(), "\tout float4 oC0 : SV_Target0,\n\tout float oSstDepth : SV_Depth)\n{\n\toSstDepth = SstDepthF24(iPos.z);");
-      s.insert(main_at, kDepthFloat24Function);
-      return s;
-    }
-
-    // sst_native_depth_flip_vs: a shared constant (c19.x, renderer.cpp sc[76]) says when to output w - z
-    std::string MakeVertexShaderDepthFlip(std::string s)
-    {
-      const std::string decl = "float4 g_ClipTransform : packoffset(c18);";
-      const std::string tail = "\toPos.xy += g_HalfPixelOffset * oPos.w;";
-      const size_t d = s.find(decl), t = s.find(tail);
-
-      if (d == std::string::npos || t == std::string::npos)
-        return s;
-
-      s.insert(t + tail.size(), "\n\tif (g_SstDepthFlip != 0)\n\t\toPos.z = oPos.w - oPos.z;");
-      s.replace(d, decl.size(), decl + " \\\n    uint g_SstDepthFlip : packoffset(c19.x);");
-      return s;
     }
 
     std::string ReadText(const std::filesystem::path &path)
@@ -402,8 +324,7 @@ float SstDepthF24(float z)
 
   bool ShaderCache::FromPack(ShaderEntry *entry, uint32_t spec, ShaderVariant *variant)
   {
-    if (override_all_ || FindOverride(entry->hash) || (entry->stage == ShaderStage::kVertex && (REXCVAR_GET(sst_shader_precise_vs) || REXCVAR_GET(sst_native_depth_flip_vs))) ||
-        (entry->stage == ShaderStage::kPixel && REXCVAR_GET(sst_native_depth_float24)))
+    if (override_all_ || FindOverride(entry->hash))
       return false;
 
     const pack::Entry *e = pack_.Find(entry->hash, spec);
@@ -596,10 +517,7 @@ float SstDepthF24(float z)
     };
 
     const Override *over = FindOverride(entry.hash);
-    const bool precise_vs = entry.stage == ShaderStage::kVertex && REXCVAR_GET(sst_shader_precise_vs);
-    const bool flip_vs = entry.stage == ShaderStage::kVertex && REXCVAR_GET(sst_native_depth_flip_vs);
-    const bool depth_f24 = entry.stage == ShaderStage::kPixel && REXCVAR_GET(sst_native_depth_float24);
-    const bool overridden = over || override_all_ || precise_vs || flip_vs || depth_f24;
+    const bool overridden = over || override_all_;
 
     // Disk cache
     std::ifstream in;
@@ -647,16 +565,7 @@ float SstDepthF24(float z)
     if (!tr.ok)
       return fail("translation failed: " + tr.error, {});
 
-    std::string source = (over && !over->source.empty() ? over->source : tr.hlsl) + sst::xenos::SpecConstantsDefinition(job.spec);
-
-    if (precise_vs && !tr.pixel_shader)
-      source = MakeVertexShaderPrecise(std::move(source));
-
-    if (flip_vs && !tr.pixel_shader)
-      source = MakeVertexShaderDepthFlip(std::move(source));
-
-    if (depth_f24 && tr.pixel_shader)
-      source = MakePixelShaderDepthFloat24(std::move(source));
+    const std::string source = (over && !over->source.empty() ? over->source : tr.hlsl) + sst::xenos::SpecConstantsDefinition(job.spec);
 
     if (over)
       REXLOG_INFO("[sst-native] shader override: compiling {:016X} variant {} from the override folder", entry.hash, job.spec);

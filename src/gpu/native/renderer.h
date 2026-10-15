@@ -565,7 +565,7 @@ namespace sst::native
     struct Stats
     {
       uint64_t draws = 0, drawn = 0;
-      uint64_t skip_shader = 0, skip_pending = 0, skip_decl = 0, skip_prim = 0, skip_rt = 0, skip_pipeline = 0, skip_data = 0, skip_cull = 0, skip_memexport = 0, decal_biased = 0;
+      uint64_t skip_shader = 0, skip_pending = 0, skip_decl = 0, skip_prim = 0, skip_rt = 0, skip_pipeline = 0, skip_data = 0, skip_cull = 0, skip_memexport = 0;
       uint64_t memexport_draws = 0, memexport_run = 0, memexport_cached = 0, memexport_failed = 0;
       uint64_t memexport_async = 0, memexport_waits = 0;
       double memexport_wait_ms = 0;
