@@ -247,13 +247,10 @@ namespace sst::gpu
     SstFrameSource g_source = {};
     bool g_has_source = false;
 
-    // Slowly cycling colour around SST's blue, so a moving image proves frames are being produced and presented. Replaced by real rendering in later milestones.
-    void FrameColor(uint64_t frame, float out[4])
+    // Color of screen before the game draws
+    void FrameColor(uint64_t, float out[4])
     {
-      const float t = float(frame % 600) / 600.0f * 6.2831853f;
-      out[0] = 0.10f + 0.10f * std::sin(t);
-      out[1] = 0.25f + 0.10f * std::sin(t + 2.1f);
-      out[2] = 0.60f + 0.15f * std::sin(t + 4.2f);
+      out[0] = out[1] = out[2] = 0.0f;
       out[3] = 1.0f;
     }
   }
