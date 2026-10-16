@@ -114,6 +114,9 @@ namespace sst::native
                     const std::filesystem::path &cache_dir);
     void Shutdown();
 
+    // SHADER PRECISION: FAST in use (fixed at startup)
+    bool fast() const { return fast_; }
+
     // Game thread
     ShaderEntry *Register(const uint8_t *container, uint32_t size);
 
@@ -149,6 +152,8 @@ namespace sst::native
 
     const rex::ui::d3d12::D3D12Provider *provider_ = nullptr;
     std::filesystem::path cache_dir_;
+    bool fast_ = false;         // SHADER PRECISION: FAST (sst_fast_shaders at startup, and the exe has the fast pack)
+    uint32_t version_ = 0;      // disk cache version: pack::CacheVersion(fast_)
     std::filesystem::path containers_dir_; // <exe>/cache/containers: shaders missing from the pack, for the next build to bake
 
     mutable std::shared_mutex entries_mutex_;

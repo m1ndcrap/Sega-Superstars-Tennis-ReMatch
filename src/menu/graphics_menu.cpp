@@ -76,6 +76,7 @@ REXCVAR_DEFINE_BOOL(sst_fullscreen, false, "SST", "Borderless fullscreen (VIDEO 
 REXCVAR_DEFINE_BOOL(sst_bloom, true, "SST", "Bloom / glow (VIDEO page)");
 
 REXCVAR_DEFINE_BOOL(sst_fps_counter, false, "SST", "FPS counter in the top-left corner (VIDEO page)");
+REXCVAR_DECLARE(bool, sst_fast_shaders); // SHADER PRECISION (gpu/native/shader_cache.cpp)
 
 namespace sst::menu
 {
@@ -148,6 +149,7 @@ namespace sst::menu
       kFullscreen,
       kShadows,
       kBloom,
+      kShaderPrecision,
       kResolution,
       kAspect,
       kRenderScale,
@@ -173,6 +175,7 @@ namespace sst::menu
         {"fullscreen", "FULLSCREEN", 2, false},
         {"shadows", "SHADOWS", 6, false},
         {"bloom", "BLOOM", 2, false},
+        {"shader_precision", "SHADER QUALITY", 2, false}, // "SHADER PRECISION" is wider than the label column was made for
         {"resolution", "RESOLUTION", 5, false},
         {"aspect_ratio", "ASPECT RATIO", 5, false},
         {"render_scale", "RENDER SCALE", 11, true},
@@ -185,6 +188,19 @@ namespace sst::menu
     }};
     constexpr int kVisible = 4;                 // Settings > VIDEO (GENERAL's four rows)
     constexpr int kPauseVisible = pause::kRows; // in-match pause menu
+    // The in-match VIDEO page: every row but those needing a restart (ASPECT RATIO: cameras are set up per match; SHADER PRECISION)
+    constexpr int kPauseRowCount = kRows - 2;
+    constexpr std::array<int, kPauseRowCount> kPauseRows = []
+    {
+      std::array<int, kPauseRowCount> rows{};
+      int n = 0;
+
+      for (int r = 0; r < kRows; ++r)
+        if (r != kAspect && r != kShaderPrecision)
+          rows[n++] = r;
+
+      return rows;
+    }();
     constexpr int kPresetCustom = 3;
     constexpr int kShadowSizes[6] = {0, 128, 256, 512, 1024, 2048};
     constexpr int kResolutions[5] = {480, 720, 1080, 1440, 2160};
@@ -193,7 +209,7 @@ namespace sst::menu
 
     struct Settings
     {
-      std::array<int, kRows> v = {1, 0, 4, 1, 1, 1, 10, 0, 1, 1, 0, 1, 10};
+      std::array<int, kRows> v = {1, 0, 4, 1, 0, 1, 1, 10, 0, 1, 1, 0, 1, 10};
     };
 
     // Quality presets: shadows, resolution, render scale, AA type, AA level
@@ -234,6 +250,7 @@ namespace sst::menu
 
     bool g_boot_four_three = false; // ASPECT RATIO 4:3 at startup (see NativeFourThree)
     int g_boot_aspect = 1;          // ASPECT RATIO at startup: the one in use until a restart
+    int g_boot_precision = 0;       // SHADER PRECISION at startup (the shader pack is picked once, when the renderer starts)
 
     std::string ValueText(const Settings &s, int row)
     {
@@ -257,6 +274,12 @@ namespace sst::menu
 
       case kResolution:
         return std::to_string(kResolutions[v]) + "P";
+
+      case kShaderPrecision: // the shaders and pipelines are made once per run: a change needs a restart
+      {
+        const std::string text = v ? "FAST" : "ACCURATE";
+        return v != g_boot_precision ? text + " (RESTART)" : text;
+      }
 
       case kAspect: // layouts are set up as scenes load: a change needs a restart
         return v != g_boot_aspect ? std::string(kAspects[v]) + " (RESTART)" : std::string(kAspects[v]);
@@ -454,8 +477,8 @@ namespace sst::menu
       bool pause = false;     // in-match page: no ASPECT RATIO (cameras are set up per match)
       bool dialog = false;    // this event: show the restart dialog (4:3 switched)
       bool keys = false;      // CONTROLS > KEY BINDINGS instead of VIDEO
-      int Count() const { return keys ? sst::input::KeyBindingCount() : pause ? kRows - 1 : kRows; }
-      int Row(int i) const { return !keys && pause && i >= kAspect ? i + 1 : i; } // list index -> Row
+      int Count() const { return keys ? sst::input::KeyBindingCount() : pause ? kPauseRowCount : kRows; }
+      int Row(int i) const { return !keys && pause ? kPauseRows[std::clamp(i, 0, kPauseRowCount - 1)] : i; } // list index -> Row
       int cursor = 0, top = 0;
       int old_visible = 0, new_visible = 0;
       bool redraw = false, leave = false;
@@ -478,7 +501,7 @@ namespace sst::menu
       int shown = -1, pos = -1; // pause page: scroll bar shown, thumb position
     } g_markers;
 
-    static_assert(pause::kScrollCount == kRows - 1 && pause::kScrollVisible == kPauseVisible, "the pause page's scroll bar is built for its list");
+    static_assert(pause::kScrollCount == kPauseRowCount && pause::kScrollVisible == kPauseVisible, "the pause page's scroll bar is built for its list");
 
     // With g_mutex held, after the list moved
     void UpdateListMarkers()
@@ -541,6 +564,7 @@ namespace sst::menu
       set("sst_brightness", std::to_string(5 * s.v[kBrightness]));
       set("sst_bloom", s.v[kBloom] ? "true" : "false");
       set("sst_fps_counter", s.v[kFpsCounter] ? "true" : "false");
+      set("sst_fast_shaders", s.v[kShaderPrecision] ? "true" : "false"); // read when the renderer starts
       const bool fullscreen = s.v[kFullscreen] != 0;
       set("sst_fullscreen", fullscreen ? "true" : "false");
 
@@ -574,6 +598,7 @@ namespace sst::menu
       s.v[kFullscreen] = REXCVAR_GET(sst_fullscreen) ? 1 : 0;
       s.v[kBloom] = REXCVAR_GET(sst_bloom) ? 1 : 0;
       s.v[kFpsCounter] = REXCVAR_GET(sst_fps_counter) ? 1 : 0;
+      s.v[kShaderPrecision] = REXCVAR_GET(sst_fast_shaders) ? 1 : 0;
       UpdatePreset(s);
       return s;
     }
@@ -631,7 +656,7 @@ namespace sst::menu
 
       f << "# sst_rematch video settings (Options > Settings > VIDEO). Values are list\n"
            "# positions: preset 0 low 1 medium 2 high 3 custom; shadows 0 off, 1-5 = 128-2048;\n"
-           "# bloom 0 off 1 on; resolution 0-4 = 480p 720p 1080p 1440p 2160p; aspect_ratio 0-4 = 4:3 16:9 16:10\n"
+           "# bloom 0 off 1 on; shader_precision 0 accurate 1 fast; resolution 0-4 = 480p 720p 1080p 1440p 2160p; aspect_ratio 0-4 = 4:3 16:9 16:10\n"
            "# 21:9 32:9; render_scale 0-10 = 50-100%; aa_type 0 off 1 FXAA 2 MSAA; aa_level\n"
            "# 0-2 = 2x 4x 8x; fps_limit 0 = 30, 1 = 60; brightness 0-20 = 0-100.\n";
 
@@ -677,23 +702,24 @@ namespace sst::menu
       }
     }
 
-    // A new aspect ratio needs a restart: 4:3 is the game's own mode, and the wide layouts are made as scenes load (the main menu's at boot)
+    // A new aspect ratio needs a restart: 4:3 is the game's own mode, and the wide layouts are made as scenes load (the main menu's at boot).
+    // So does a new shader precision: the renderer picks its shader pack once, at startup
     bool RestartNeeded()
     {
-      return g_current.v[kAspect] != g_boot_aspect;
+      return g_current.v[kAspect] != g_boot_aspect || g_current.v[kShaderPrecision] != g_boot_precision;
     }
 
     // Restart dialog: the game's message box with a one-button (OK) message whose texts are swapped while it is up (see sub_82594AD0 below)
     std::atomic<bool> g_restart_dialog{false};
     constexpr uint32_t kDialogBody = 0x84D43E5B;  // "Unable to find any Superstars Channels"
     constexpr uint32_t kDialogTitle = 0xEDDAB5CE; // "NO CHANNELS FOUND"
-    constexpr const char *kDialogBodyText = "The game will now restart to apply the new aspect ratio.";
+    constexpr const char *kDialogBodyText = "The game will now restart to apply the new settings.";
     constexpr const char *kDialogTitleText = "RESTART REQUIRED";
 
     // The dialog was confirmed: start the new copy, then close this one (forced after a few seconds if the normal shutdown stalls)
     void Restart()
     {
-      REXLOG_INFO("[sst-menu] restarting for the aspect ratio change");
+      REXLOG_INFO("[sst-menu] restarting for the aspect ratio / shader precision change");
 
       if (RestartGame())
       {
@@ -704,7 +730,7 @@ namespace sst::menu
       }
       else
       {
-        REXLOG_ERROR("[sst-menu] restart failed: the aspect ratio applies at the next start");
+        REXLOG_ERROR("[sst-menu] restart failed: the change applies at the next start");
       }
     }
 
@@ -1209,17 +1235,19 @@ namespace sst::menu
     }
 
     // f2 of a perspective builder: 16:9 becomes the chosen aspect (other values, e.g. split views, are left alone). Each (caller, aspect) a perspective builder sees is logged once (cameras that do not follow the wide aspect are found this way)
-    void LogBuilder(uint32_t builder, uint32_t caller, double aspect, double replaced)
+    // f1 (FOV), f3 and f4 (near / far plane) are logged too; a new far value is a new line. (A shorter far plane, 50% / 25%, changed nothing:
+    // logs 034-036, so there is no draw distance option)
+    void LogBuilder(uint32_t builder, uint32_t caller, double aspect, double replaced, double f1, double f3, double f4)
     {
       static std::mutex mutex;
       static std::set<uint64_t> seen;
-      const uint64_t key = (uint64_t(caller) << 32) ^ uint64_t(builder) ^ uint64_t(std::llround(aspect * 10000.0));
+      const uint64_t key = (uint64_t(caller) << 32) ^ uint64_t(builder) ^ uint64_t(std::llround(aspect * 10000.0)) ^ (uint64_t(std::llround(std::fabs(f4))) << 20);
       std::lock_guard lock(mutex);
 
       if (seen.size() > 512 || !seen.insert(key).second)
         return;
 
-      REXLOG_INFO("[sst-menu] camera: builder {:08X} from {:08X} aspect {:.4f}{}", builder, caller, aspect, replaced != aspect ? fmt::format(" -> {:.4f}", replaced) : std::string());
+      REXLOG_INFO("[sst-menu] camera: builder {:08X} from {:08X} aspect {:.4f}{} (f1 {:.4f}, f3 {:.3f}, f4 {:.1f})", builder, caller, aspect, replaced != aspect ? fmt::format(" -> {:.4f}", replaced) : std::string(), f1, f3, f4);
     }
 
     void FixCameraAspect(PPCContext &ctx, uint32_t builder)
@@ -1230,7 +1258,7 @@ namespace sst::menu
         PPCContext &c;
         uint32_t b;
         double a;
-        ~Log() { LogBuilder(b, uint32_t(c.lr), a, c.f2.f64); }
+        ~Log() { LogBuilder(b, uint32_t(c.lr), a, c.f2.f64, c.f1.f64, c.f3.f64, c.f4.f64); }
       } log{ctx, builder, a};
 
       if (std::fabs(a - 16.0 / 9.0) < 0.002)
@@ -1442,6 +1470,7 @@ namespace sst::menu
     REXLOG_INFO("[sst-menu] video settings{}: {}", g_loaded_from_file ? " (sst_settings.ini)" : "", Describe(g_current));
     // ASPECT RATIO 4:3: a 4:3 video mode (1280x1024, the game's HD 4:3 mode) makes the game pick its 4:3 layouts and cameras at boot
     g_boot_aspect = std::clamp(g_current.v[kAspect], 0, 4);
+    g_boot_precision = g_current.v[kShaderPrecision];
     g_boot_four_three = g_boot_aspect == 0;
     ApplyAspect(nullptr); // scenes loaded at boot already see the aspect
     if (g_boot_four_three)
@@ -1467,6 +1496,9 @@ namespace sst::menu
     const int preset = video_memory_mb < 3000 ? 0 : video_memory_mb < 7000 ? 1
                                                                            : 2;
     ApplyPreset(g_current, preset);
+    // LOW (integrated GPUs, small video memory): FAST shaders too. Before the renderer starts, so this run already uses them
+    g_current.v[kShaderPrecision] = preset == 0 ? 1 : 0;
+    g_boot_precision = g_current.v[kShaderPrecision];
     Apply(g_current);
     Save(g_current);
     g_loaded_from_file = true;

@@ -198,6 +198,10 @@ if(WIN32)
     # recompiled code itself. Shaders the game generates at runtime (not in any
     # game file) still compile on first use, ahead of everything else.
     option(SST_SHADER_BAKE "Precompile the game's shaders at build time and embed them in the exe" ON)
+    # VIDEO > SHADER PRECISION: FAST uses plain IEEE multiplies instead of the Xenos/D3D9 rule (0 * anything = 0),
+    # ~2-3 ms less GPU time a frame on integrated GPUs. It needs a second pack (~40 MB more exe, about twice the bake
+    # time on a clean build). Off: FAST falls back to ACCURATE.
+    option(SST_SHADER_BAKE_FAST "Also bake the SHADER PRECISION: FAST shader pack" ON)
     set(SST_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets" CACHE PATH
         "Extracted game (the folder holding default.xex): source of the ShaderCache files")
     set(SST_SHADER_DUMP_DIR "" CACHE PATH
@@ -261,11 +265,24 @@ if(WIN32)
             DEPENDS sst_shader_bake ${_bake_inputs}
             COMMENT "Compiling the game's shaders (sst_shader_bake)"
             VERBATIM)
-        add_custom_target(sst_shader_pack DEPENDS "${_pack}")
-        file(CONFIGURE OUTPUT "${_xr_gen}/sst_shader_pack.rc"
-             CONTENT "SST_SHADER_PACK RCDATA \"${_pack}\"\n")
+        set(_packs "${_pack}")
+        set(_pack_rc "SST_SHADER_PACK RCDATA \"${_pack}\"\n")
+        if(SST_SHADER_BAKE_FAST)
+            set(_pack_fast "${_xr_gen}/sst_shaders_fast.pack")
+            add_custom_command(
+                OUTPUT "${_pack_fast}"
+                COMMAND sst_shader_bake --fast --out "${_pack_fast}" --dxc "${_dxc_dir}"
+                        --work "${CMAKE_CURRENT_BINARY_DIR}/shader_bake_work_fast" ${_bake_args}
+                DEPENDS sst_shader_bake ${_bake_inputs}
+                COMMENT "Compiling the game's shaders, SHADER PRECISION: FAST (sst_shader_bake --fast)"
+                VERBATIM)
+            list(APPEND _packs "${_pack_fast}")
+            string(APPEND _pack_rc "SST_SHADER_PACK_FAST RCDATA \"${_pack_fast}\"\n")
+        endif()
+        add_custom_target(sst_shader_pack DEPENDS ${_packs})
+        file(CONFIGURE OUTPUT "${_xr_gen}/sst_shader_pack.rc" CONTENT "${_pack_rc}")
         target_sources(sst_rematch PRIVATE "${_xr_gen}/sst_shader_pack.rc")
-        set_source_files_properties("${_xr_gen}/sst_shader_pack.rc" PROPERTIES OBJECT_DEPENDS "${_pack}")
+        set_source_files_properties("${_xr_gen}/sst_shader_pack.rc" PROPERTIES OBJECT_DEPENDS "${_packs}")
         add_dependencies(sst_rematch sst_shader_pack)
     endif()
 endif()

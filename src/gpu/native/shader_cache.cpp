@@ -27,14 +27,18 @@ REXCVAR_DEFINE_STRING(sst_shader_override, "", "SST",
                       "adds DXC arguments to every shader. Overridden shaders are compiled at startup / first use, not "
                       "taken from the exe's shader pack");
 
+REXCVAR_DEFINE_BOOL(sst_fast_shaders, false, "SST",
+                    "SHADER PRECISION: FAST (VIDEO page): plain IEEE multiplies instead of the Xbox 360 / D3D9 rule "
+                    "(0 x anything = 0). Cheaper on weak GPUs. Read at startup (the exe carries a shader pack for each)");
+
 namespace sst::native
 {
   using Microsoft::WRL::ComPtr;
 
   namespace
   {
-    // Shared with the build-time baker (shader_pack.h): bump it there when the translator, the prelude or the compile options change
-    constexpr uint32_t kCacheVersion = pack::kCacheVersion;
+    // Shared with the build-time baker (shader_pack.h): bump it there when the translator, the prelude or the compile options change.
+    // ShaderCache::version_ is this or pack::kCacheVersionFast (SHADER PRECISION: FAST)
     constexpr uint32_t kFileMagic = 0x53535453; // "SSTS"
 
     struct FileHeader
@@ -101,10 +105,10 @@ namespace sst::native
     // The pack CMake embeds as RCDATA "SST_SHADER_PACK" (see CMakeLists.txt, SST_SHADER_BAKE), normally compressed (shader_pack.h).
     // It is unpacked once into `storage`, which lives as long as the cache, so variants can point into it. An uncompressed pack is
     // used in place (resource memory stays mapped for the life of the process).
-    bool LoadEmbeddedPack(pack::View &view, std::vector<uint8_t> &storage)
+    bool LoadEmbeddedPack(pack::View &view, std::vector<uint8_t> &storage, const wchar_t *name, uint32_t version)
     {
       HMODULE module = GetModuleHandleW(nullptr);
-      HRSRC res = FindResourceW(module, L"SST_SHADER_PACK", MAKEINTRESOURCEW(10)); // RT_RCDATA
+      HRSRC res = FindResourceW(module, name, MAKEINTRESOURCEW(10)); // RT_RCDATA
 
       if (!res)
         return false;
@@ -120,7 +124,7 @@ namespace sst::native
       std::memcpy(&ch, data, sizeof(ch));
 
       if (ch.magic != pack::kCompressedMagic)
-        return view.Open(data, size);
+        return view.Open(data, size, version);
 
       if (ch.raw_size > (1ull << 31))
         return false;
@@ -147,7 +151,7 @@ namespace sst::native
       }
 
       REXLOG_INFO("[sst-native] shader pack: {:.1f} MB unpacked from {:.1f} MB in {:.0f} ms", double(storage.size()) / (1 << 20), double(size) / (1 << 20), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
-      return view.Open(storage.data(), storage.size());
+      return view.Open(storage.data(), storage.size(), version);
     }
   }
 
@@ -159,14 +163,34 @@ namespace sst::native
   bool ShaderCache::Initialize(const rex::ui::d3d12::D3D12Provider &provider, const std::filesystem::path &cache_dir)
   {
     provider_ = &provider;
-    cache_dir_ = cache_dir;
+    fast_ = REXCVAR_GET(sst_fast_shaders);
+
+    // SHADER PRECISION: FAST needs its own pack; without one (a build with SST_SHADER_BAKE_FAST off) every shader would compile at
+    // run time, which is far slower than the accuracy is worth on the PCs that want FAST: use ACCURATE then
+    if (fast_ && !LoadEmbeddedPack(pack_, pack_storage_, pack::kResourceNameFast, pack::kCacheVersionFast))
+    {
+      if (LoadEmbeddedPack(pack_, pack_storage_, pack::kResourceName, pack::kCacheVersion))
+      {
+        REXLOG_WARN("[sst-native] shader precision FAST: this exe has no fast shader pack (SST_SHADER_BAKE_FAST off); using ACCURATE");
+        fast_ = false;
+      }
+    }
+    else if (!fast_)
+    {
+      LoadEmbeddedPack(pack_, pack_storage_, pack::kResourceName, pack::kCacheVersion);
+    }
+
+    version_ = pack::CacheVersion(fast_);
+    cache_dir_ = fast_ ? cache_dir / "fast" : cache_dir; // FAST DXIL kept apart, so switching back and forth keeps both caches
     std::error_code ec;
     std::filesystem::create_directories(cache_dir_, ec);
     std::filesystem::create_directories(cache_dir_ / "failed", ec);
-    containers_dir_ = cache_dir_.parent_path() / "containers";
+    containers_dir_ = cache_dir.parent_path() / "containers";
     std::filesystem::create_directories(containers_dir_, ec);
 
-    if (LoadEmbeddedPack(pack_, pack_storage_))
+    REXLOG_INFO("[sst-native] shader precision: {}", fast_ ? "FAST (plain multiplies)" : "ACCURATE (Xbox 360 multiply rule)");
+
+    if (pack_.count())
       REXLOG_INFO("[sst-native] shader pack: {} precompiled shader variants built into the exe", pack_.count());
     else
       REXLOG_INFO("[sst-native] no shader pack in the exe (built without SST_SHADER_BAKE or game files): shaders compile on first use");
@@ -529,7 +553,7 @@ namespace sst::native
     {
       FileHeader header{};
 
-      if (in.read(reinterpret_cast<char *>(&header), sizeof(header)) && header.magic == kFileMagic && header.version == kCacheVersion && header.dxil_size > 0 && header.dxil_size < (16u << 20))
+      if (in.read(reinterpret_cast<char *>(&header), sizeof(header)) && header.magic == kFileMagic && header.version == version_ && header.dxil_size > 0 && header.dxil_size < (16u << 20))
       {
         variant.dxil.resize(header.dxil_size);
 
@@ -578,6 +602,9 @@ namespace sst::native
     std::vector<const wchar_t *> args = {L"-T", tr.pixel_shader ? L"ps_6_0" : L"vs_6_0"};
     args.insert(args.end(), std::begin(pack::kDxcArgs), std::end(pack::kDxcArgs));
 
+    if (fast_)
+      args.push_back(pack::kFastMathArg);
+
     for (const auto &a : override_all_args_)
       args.push_back(a.c_str());
 
@@ -618,7 +645,7 @@ namespace sst::native
     // Store (write to a temp name, then rename, so a crash never leaves a truncated file under the real name). Overrides aren't stored.
     if (IsSigned(variant.dxil) && !overridden)
     {
-      const FileHeader header = {kFileMagic, kCacheVersion, tr.spec_constants_mask, uint32_t(variant.dxil.size())};
+      const FileHeader header = {kFileMagic, version_, tr.spec_constants_mask, uint32_t(variant.dxil.size())};
       auto tmp = path;
       tmp += ".tmp";
       {

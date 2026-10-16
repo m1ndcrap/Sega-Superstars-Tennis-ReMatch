@@ -22,6 +22,8 @@
 
 #include <windows.h>
 
+#include <psapi.h> // K32EnumProcessModules (kernel32, no psapi.lib needed)
+
 REXCVAR_DEFINE_BOOL(sst_hitch_profiler, false, "SST",
                     "Debug: sample the game thread ~1000x/s and log where slow game frames (and "
                     "the game thread in general) spend their time");
@@ -37,7 +39,7 @@ namespace sst::native::hitch
   {
     constexpr size_t kStackCopy = 8192;
     constexpr uint32_t kRing = 16384; // ~16 s of samples
-    constexpr uint32_t kFrames = 12;  // addresses kept per sample
+    constexpr uint32_t kFrames = 16;  // addresses kept per sample
 
     struct Sample
     {
@@ -53,6 +55,21 @@ namespace sst::native::hitch
       uint64_t frame;
     };
 
+    // A loaded DLL: code sections and (lazily) its exports, for naming frames outside the exe
+    struct Module
+    {
+      uintptr_t base = 0, end = 0;
+      std::string name;
+      bool exports_loaded = false;
+      std::vector<std::pair<uint32_t, std::string>> exports; // rva -> name, sorted
+    };
+
+    struct CodeRange
+    {
+      uintptr_t begin, end;
+      uint32_t module;
+    };
+
     struct Profiler
     {
       HANDLE thread = nullptr; // the game thread
@@ -62,6 +79,11 @@ namespace sst::native::hitch
       // Executable code range and guest function starts (host address -> guest)
       uintptr_t exe_begin = 0, exe_end = 0;
       std::vector<std::pair<uintptr_t, uint32_t>> funcs;
+
+      // Other modules (sampler thread only)
+      std::vector<Module> modules;
+      std::vector<CodeRange> code; // executable sections of `modules`, sorted
+      int64_t modules_refreshed = 0;
 
       // Sample ring (written by the sampler only)
       std::vector<Sample> ring = std::vector<Sample>(kRing);
@@ -96,11 +118,29 @@ namespace sst::native::hitch
       return t.QuadPart;
     }
 
-    // Guest function containing host address `pc`, or 0
-    uint32_t GuestFunction(const Profiler &p, uintptr_t pc)
+    // Guest function containing host address `pc`, or 0. Uses the exe's unwind table for the exact function start, so host code
+    // linked into the exe (hooks, SDK) is not taken for the guest function laid out before it
+    uint32_t GuestFunction(const Profiler &p, uintptr_t pc, uintptr_t *host_start = nullptr)
     {
       if (pc < p.exe_begin || pc >= p.exe_end || p.funcs.empty())
         return 0;
+
+      DWORD64 image = 0;
+
+      if (const RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(DWORD64(pc), &image, nullptr))
+      {
+        const uintptr_t start = uintptr_t(image) + rf->BeginAddress;
+        auto it = std::lower_bound(p.funcs.begin(), p.funcs.end(), start, [](const auto &f, uintptr_t v)
+                                   { return f.first < v; });
+
+        if (it != p.funcs.end() && it->first == start)
+          return it->second;
+
+        if (host_start)
+          *host_start = start;
+
+        return 0;
+      }
 
       auto it = std::upper_bound(p.funcs.begin(), p.funcs.end(), pc, [](uintptr_t v, const auto &f)
                                  { return v < f.first; });
@@ -134,11 +174,157 @@ namespace sst::native::hitch
       return std::string(w.begin(), w.end());
     }
 
+    // Re-reads the loaded module list (new DLLs only), at most every 2 s
+    void RefreshModules(Profiler &p, int64_t now, int64_t qpc_2s)
+    {
+      if (p.modules_refreshed && now - p.modules_refreshed < qpc_2s)
+        return;
+
+      p.modules_refreshed = now;
+      HMODULE handles[1024];
+      DWORD needed = 0;
+
+      if (!K32EnumProcessModules(GetCurrentProcess(), handles, sizeof(handles), &needed))
+        return;
+
+      const size_t count = std::min<size_t>(needed / sizeof(HMODULE), std::size(handles));
+      bool added = false;
+
+      for (size_t i = 0; i < count; ++i)
+      {
+        const uintptr_t base = uintptr_t(handles[i]);
+
+        if (base == p.exe_begin || std::any_of(p.modules.begin(), p.modules.end(), [&](const Module &m)
+                                               { return m.base == base; }))
+          continue;
+
+        const auto *b = reinterpret_cast<const uint8_t *>(base);
+        const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(b);
+
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+          continue;
+
+        const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(b + dos->e_lfanew);
+
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+          continue;
+
+        Module m;
+        m.base = base;
+        m.end = base + nt->OptionalHeader.SizeOfImage;
+        m.name = ModuleName(base);
+        const uint32_t index = uint32_t(p.modules.size());
+        const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+
+        for (WORD k = 0; k < nt->FileHeader.NumberOfSections; ++k)
+        {
+          if (sec[k].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            p.code.push_back({base + sec[k].VirtualAddress, base + sec[k].VirtualAddress + std::max(sec[k].Misc.VirtualSize, sec[k].SizeOfRawData), index});
+        }
+
+        p.modules.push_back(std::move(m));
+        added = true;
+      }
+
+      if (added)
+        std::sort(p.code.begin(), p.code.end(), [](const CodeRange &a, const CodeRange &c)
+                  { return a.begin < c.begin; });
+    }
+
+    // Module index if `v` points into the code of a known DLL, else -1
+    int CodeModule(const Profiler &p, uintptr_t v)
+    {
+      auto it = std::upper_bound(p.code.begin(), p.code.end(), v, [](uintptr_t x, const CodeRange &r)
+                                 { return x < r.begin; });
+
+      if (it == p.code.begin())
+        return -1;
+
+      --it;
+      return v < it->end ? int(it->module) : -1;
+    }
+
+    void LoadExports(Module &m)
+    {
+      m.exports_loaded = true;
+      const auto *b = reinterpret_cast<const uint8_t *>(m.base);
+      const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(b + reinterpret_cast<const IMAGE_DOS_HEADER *>(b)->e_lfanew);
+      const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+
+      if (!dir.VirtualAddress || !dir.Size)
+        return;
+
+      const auto *ex = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(b + dir.VirtualAddress);
+      const auto *functions = reinterpret_cast<const DWORD *>(b + ex->AddressOfFunctions);
+      const auto *names = reinterpret_cast<const DWORD *>(b + ex->AddressOfNames);
+      const auto *ordinals = reinterpret_cast<const WORD *>(b + ex->AddressOfNameOrdinals);
+
+      for (DWORD i = 0; i < ex->NumberOfNames; ++i)
+      {
+        if (ordinals[i] >= ex->NumberOfFunctions)
+          continue;
+
+        const DWORD rva = functions[ordinals[i]];
+
+        if (rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size)
+          continue; // forwarder
+
+        m.exports.emplace_back(rva, reinterpret_cast<const char *>(b + names[i]));
+      }
+
+      std::sort(m.exports.begin(), m.exports.end());
+    }
+
+    // "sub_XXXXXXXX" (guest), "exe+0xRVA" (host function in the exe; look it up in sst_rematch.map) or "module!NearestExport"
+    std::string Label(Profiler &p, uintptr_t pc, std::unordered_map<uintptr_t, std::string> &cache)
+    {
+      if (auto it = cache.find(pc); it != cache.end())
+        return it->second;
+
+      std::string out;
+      uintptr_t host = 0;
+
+      if (const uint32_t g = GuestFunction(p, pc, &host))
+      {
+        out = fmt::format("sub_{:08X}", g);
+      }
+      else if (pc >= p.exe_begin && pc < p.exe_end)
+      {
+        out = host ? fmt::format("exe+0x{:X}", host - p.exe_begin) : fmt::format("exe@0x{:X}", pc - p.exe_begin);
+      }
+      else if (const int mi = CodeModule(p, pc); mi >= 0)
+      {
+        Module &m = p.modules[mi];
+
+        if (!m.exports_loaded)
+          LoadExports(m);
+
+        const uint32_t rva = uint32_t(pc - m.base);
+        auto it = std::upper_bound(m.exports.begin(), m.exports.end(), rva, [](uint32_t v, const auto &e)
+                                   { return v < e.first; });
+
+        if (it == m.exports.begin())
+          out = m.name;
+        else
+          out = m.name + "!" + std::prev(it)->second;
+      }
+      else
+      {
+        out = ModuleName(pc);
+      }
+
+      cache.emplace(pc, out);
+      return out;
+    }
+
     // Aggregates the samples in [begin, end) into "where (from)" shares
-    std::string Describe(Profiler &p, int64_t begin, int64_t end, uint32_t top, uint32_t *total)
+    // detail: only samples whose leaf is outside guest code, labelled with the host call chain (leaf <- callers, up to the first
+    // guest function), to see what the system / runtime calls are doing and who makes them
+    std::string Describe(Profiler &p, int64_t begin, int64_t end, uint32_t top, uint32_t *total, bool detail = false)
     {
       std::unordered_map<std::string, uint32_t> counts;
       std::unordered_map<uintptr_t, std::string> module_cache;
+      std::unordered_map<uintptr_t, std::string> labels;
       uint32_t n = 0;
       const uint64_t w = p.written.load(std::memory_order_acquire);
       const uint64_t first = w > kRing ? w - kRing : 0;
@@ -150,9 +336,39 @@ namespace sst::native::hitch
         if (s.qpc < begin || s.qpc >= end || !s.count)
           continue;
 
+        const uint32_t leaf = GuestFunction(p, s.pc[0]);
+
+        if (detail)
+        {
+          if (leaf)
+            continue;
+
+          ++n;
+          std::string chain = Label(p, uintptr_t(s.pc[0]), labels);
+          std::string last = chain;
+          uint32_t links = 0;
+
+          for (uint32_t k = 1; k < s.count && links < 4; ++k)
+          {
+            const std::string l = Label(p, uintptr_t(s.pc[k]), labels);
+
+            if (l == last)
+              continue;
+
+            chain += " <- " + l;
+            last = l;
+            ++links;
+
+            if (l.starts_with("sub_"))
+              break;
+          }
+
+          ++counts[chain];
+          continue;
+        }
+
         ++n;
         std::string where;
-        const uint32_t leaf = GuestFunction(p, s.pc[0]);
 
         if (leaf)
         {
@@ -207,6 +423,9 @@ namespace sst::native::hitch
         timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
 
       std::vector<uint8_t> stack(kStackCopy);
+      LARGE_INTEGER freq;
+      QueryPerformanceFrequency(&freq);
+      const int64_t qpc_2s = freq.QuadPart * 2;
 
       while (!p->quit.load(std::memory_order_acquire))
       {
@@ -246,6 +465,9 @@ namespace sst::native::hitch
 
         ResumeThread(p->thread);
 
+        // After the resume: this allocates and takes the loader lock, which the suspended thread may have held
+        RefreshModules(*p, Qpc(), qpc_2s);
+
         if (!ok)
           continue;
 
@@ -260,7 +482,7 @@ namespace sst::native::hitch
           uint64_t v;
           std::memcpy(&v, stack.data() + off, 8);
 
-          if (v >= p->exe_begin && v < p->exe_end)
+          if ((v >= p->exe_begin && v < p->exe_end) || CodeModule(*p, uintptr_t(v)) >= 0)
             s.pc[s.count++] = v;
         }
 
@@ -282,6 +504,15 @@ namespace sst::native::hitch
           const std::string what = Describe(*p, w.begin, w.end, 6, &n);
           REXLOG_INFO("[sst-hitch] slow game frame {} ({:.1f} ms, {} samples): {}", w.frame, w.ms, n,
                       what);
+
+          if (w.ms > 100.0)
+          {
+            uint32_t hn = 0;
+            const std::string host = Describe(*p, w.begin, w.end, 6, &hn, true);
+
+            if (hn)
+              REXLOG_INFO("[sst-hitch]   outside guest code: {}", host);
+          }
         }
 
         for (const Profiler::Period &period : periods)
@@ -290,6 +521,11 @@ namespace sst::native::hitch
           const std::string what = Describe(*p, period.begin, period.end, 10, &n);
           REXLOG_INFO("[sst-hitch] game thread over the last {} frames ({} samples): {}",
                       period.frames, n, what);
+          uint32_t hn = 0;
+          const std::string host = Describe(*p, period.begin, period.end, 12, &hn, true);
+
+          if (hn)
+            REXLOG_INFO("[sst-hitch] outside guest code ({} samples, {}% of the thread): {}", hn, (hn * 100 + n / 2) / std::max(1u, n), host);
         }
       }
 

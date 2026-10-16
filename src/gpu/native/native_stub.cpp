@@ -2,6 +2,11 @@
 
 #include "gpu/native/native.h"
 
+#include <rex/cvar.h>
+
+// The VIDEO page's SHADER QUALITY row sets it
+REXCVAR_DEFINE_BOOL(sst_fast_shaders, false, "SST", "SHADER PRECISION: FAST (native renderer only)");
+
 namespace sst::native
 {
     void Initialize(rex::Runtime *) {}

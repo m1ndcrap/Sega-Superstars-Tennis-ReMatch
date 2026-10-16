@@ -30,6 +30,7 @@ namespace sst::native
       uint32_t base_addr = 0, base_size = 0; // physical
       uint32_t mip_addr = 0, mip_size = 0;
       bool changing = false;
+      bool external = false; // a render-target resolve destination: the renderer samples its own copy, never guest memory
     };
 
     struct Set
@@ -40,10 +41,19 @@ namespace sst::native
 
     void KnownTexture(uint32_t base_page, const TextureRange &range);    // render thread: texture created
     void TextureChanged(uint32_t base_page, uint64_t frame);             // render thread: its data changed
+    void ExternalTexture(uint32_t base_page, bool external);             // render thread: became / stopped being a resolve destination
     void VerticesChanged(uint32_t phys, uint32_t bytes, uint64_t frame); // render thread: vertex data changed between frames
     void Prune(uint64_t frame);
     uint64_t Version(); // changes whenever the set does
     void Copy(Set &out);
+
+    // Float constant bytes a shader's draws use (the renderer uploads that many: Renderer::ConstantBytes; memory-export shaders all
+    // 4096), keyed by shader object and microcode pointer (ShaderKey). The game thread compares only those constant chunks of the device
+    // block per draw. Only ever grows per key.
+    inline uint64_t ShaderKey(uint32_t object, uint32_t ucode) { return (uint64_t(object) << 32) | ucode; }
+    void ConstantUse(uint64_t key, uint32_t bytes); // render thread
+    uint64_t ConstantUseVersion();
+    void CopyConstantUse(std::unordered_map<uint64_t, uint32_t> &out);
   }
 
   class TextureCache
@@ -88,7 +98,13 @@ namespace sst::native
     // Copies of guest texture data the game thread made when it captured this frame's draws (physical [begin, end)); valid until
     // ClearSnapshots at the end of the frame
     void AddSnapshot(uint32_t begin, uint32_t end, const uint8_t *data);
-    void ClearSnapshots() { snapshots_.clear(); }
+    // The game thread hashed this texture (base page) at draw time instead of copying it: unchanged since its last copy
+    void AddUnchanged(uint32_t base_page, uint64_t hash) { unchanged_.push_back({base_page, hash}); }
+    void ClearSnapshots()
+    {
+      snapshots_.clear();
+      unchanged_.clear();
+    }
 
   private:
     struct Snapshot
@@ -98,6 +114,7 @@ namespace sst::native
     };
 
     std::vector<Snapshot> snapshots_;
+    std::vector<std::pair<uint32_t, uint64_t>> unchanged_; // (base page, content hash) this frame
     // Where to read guest physical [addr, addr + size): `result + addr` is a frame snapshot covering it, else guest memory
     const uint8_t *Source(uint32_t addr, uint32_t size) const;
 
@@ -170,6 +187,7 @@ namespace sst::native
       uint64_t unsupported = 0, bad = 0, dimension_mismatch = 0, evicted = 0, srv_full = 0, sampler_full = 0, failed = 0;
       uint64_t lookups = 0, deferred_loads = 0, checks_skipped = 0, external_hits = 0, external_mismatch = 0;
       uint64_t from_snapshots = 0;
+      uint64_t unchanged_hits = 0, unchanged_misses = 0; // game-thread "unchanged" hashes matching / not matching the resident texture
       uint32_t logged = 0;
     } stats_;
 

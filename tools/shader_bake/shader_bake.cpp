@@ -100,6 +100,7 @@ namespace
     fs::path out, dxc, work;
     std::vector<fs::path> game, dump;
     bool no_compress = false;
+    bool fast = false; // SHADER PRECISION: FAST pack (-DSST_FAST_MATH)
   };
 
   bool ParseArgs(int argc, char **argv, Options &o)
@@ -111,6 +112,12 @@ namespace
       if (a == "--no-compress")
       {
         o.no_compress = true;
+        continue;
+      }
+
+      if (a == "--fast")
+      {
+        o.fast = true;
         continue;
       }
 
@@ -143,7 +150,7 @@ int main(int argc, char **argv)
 
   if (!ParseArgs(argc, argv, opt))
   {
-    std::fprintf(stderr, "usage: sst_shader_bake --out <pack> --dxc <dir> [--work <dir>] [--game <dir>]... [--dump <dir>]...\n");
+    std::fprintf(stderr, "usage: sst_shader_bake --out <pack> --dxc <dir> [--fast] [--work <dir>] [--game <dir>]... [--dump <dir>]...\n");
     return 2;
   }
 
@@ -274,6 +281,9 @@ int main(int argc, char **argv)
           for (const wchar_t *a : pack::kDxcArgs)
             source_hash = XXH3_64bits_withSeed(a, std::wcslen(a) * sizeof(wchar_t), source_hash);
 
+          if (opt.fast)
+            source_hash = XXH3_64bits_withSeed(pack::kFastMathArg, std::wcslen(pack::kFastMathArg) * sizeof(wchar_t), source_hash);
+
           char name[48];
           std::snprintf(name, sizeof(name), "%016llX_%u.dxil", (unsigned long long)s.hash, spec);
           const fs::path cached = opt.work.empty() ? fs::path() : opt.work / name;
@@ -300,6 +310,9 @@ int main(int argc, char **argv)
           {
             std::vector<const wchar_t *> args = {L"-T", profile};
             args.insert(args.end(), std::begin(pack::kDxcArgs), std::end(pack::kDxcArgs));
+
+            if (opt.fast)
+              args.push_back(pack::kFastMathArg);
             DxcBuffer buffer = {source.data(), source.size(), DXC_CP_UTF8};
             ComPtr<IDxcResult> result;
             HRESULT status = E_FAIL;
@@ -405,7 +418,7 @@ int main(int argc, char **argv)
   // The pack in memory, then compressed for the exe (DXIL shrinks a lot; the runtime unpacks it once at startup)
   std::vector<uint8_t> raw(offset, 0);
   {
-    const pack::Header h = {pack::kMagic, pack::kFormat, pack::kCacheVersion, uint32_t(results.size())};
+    const pack::Header h = {pack::kMagic, pack::kFormat, pack::CacheVersion(opt.fast), uint32_t(results.size())};
     std::memcpy(raw.data(), &h, sizeof(h));
     size_t pos = sizeof(h);
 

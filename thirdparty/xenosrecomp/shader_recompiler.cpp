@@ -1206,8 +1206,14 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
 
 #ifdef SST_RECOMP
     // Xenos multiplies follow Direct3D 9: 0 * anything = 0, including infinity and NaN (IEEE gives NaN). Skinning relies on it: unused bone slots have weight 0 but may index constants holding inf / NaN, which would turn the whole vertex into NaN (spikes) on a PC GPU
+    // SST_FAST_MATH (build option SST_FAST_SHADERS, passed to DXC by shader_pack.h): plain IEEE multiplies, cheaper on weak GPUs; may show spikes where the game relies on the rule
+    out += "#ifdef SST_FAST_MATH\n";
+    out += "template<typename T> T sstMul(T a, T b) { return a * b; }\n";
+    out += "template<typename T> float sstDot(T a, T b) { return dot(a, b); }\n";
+    out += "#else\n";
     out += "template<typename T> T sstMul(T a, T b) { return select(or(a == 0, b == 0), (T)0, a * b); }\n";
-    out += "template<typename T> float sstDot(T a, T b) { return dot(sstMul(a, b), (T)1); }\n\n";
+    out += "template<typename T> float sstDot(T a, T b) { return dot(sstMul(a, b), (T)1); }\n";
+    out += "#endif\n\n";
 #endif
     out += "#ifdef __spirv__\n\n";
 

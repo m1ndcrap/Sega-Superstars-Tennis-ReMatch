@@ -9,6 +9,8 @@
 #include "gpu/native/renderer.h"
 #include "gpu/native/shader_cache.h"
 #include "gpu/native/texture_cache.h"
+
+#include <xxhash.h>
 #include "gpu/native/guest_memory.h"
 
 #include <fmt/format.h>
@@ -22,6 +24,17 @@
 
 #include <dxgi1_4.h>
 #include <wrl/client.h>
+
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#endif
+#if defined(_M_X64) || defined(__x86_64__)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#endif
 
 #include <algorithm>
 #include <exception>
@@ -47,6 +60,10 @@ REXCVAR_DEFINE_BOOL(sst_native_game_thread_priority, true, "SST",
                     "Native renderer: raise the game's rendering thread (the one calling Swap) to "
                     "above-normal priority, so background work (morphs, shader / pipeline "
                     "compiles) never delays its frame");
+
+REXCVAR_DEFINE_BOOL(sst_native_write_watch, true, "SST",
+                    "Native renderer: watch the game's writes to vertex buffers that many 3D draws read, so an unchanged buffer's "
+                    "copy is reused without comparing it (false = compare every time)");
 
 REXCVAR_DEFINE_BOOL(sst_native_draw_copies, true, "SST",
                     "Native renderer: copy the textures / vertex data of UI draws when the game issues them, for the render "
@@ -81,6 +98,93 @@ namespace sst::native
     constexpr uint32_t kDevChunks = (kDevSnapSize + kDevChunk - 1) / kDevChunk; // 46
     static_assert(kDevChunks <= 64);
     constexpr uint32_t ChunkSize(uint32_t i) { return std::min(kDevChunk, kDevSnapSize - i * kDevChunk); }
+
+    // Whether two device-block chunks differ (sizes are multiples of 32 bytes), inline SSE: called ~40 times per draw call, where a
+    // library memcmp's call and setup overhead counts
+    inline bool ChunkDiffers(const uint8_t *a, const uint8_t *b, uint32_t size)
+    {
+#if !defined(__SSE4_1__)
+      return std::memcmp(a, b, size) != 0;
+#else
+      __m128i acc = _mm_setzero_si128();
+
+      for (uint32_t k = 0; k < size; k += 32)
+      {
+        const __m128i x0 = _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(a + k)), _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + k)));
+        const __m128i x1 = _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(a + k + 16)), _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + k + 16)));
+        acc = _mm_or_si128(acc, _mm_or_si128(x0, x1));
+      }
+
+      return !_mm_testz_si128(acc, acc);
+#endif
+    }
+
+    static_assert(kDevChunk % 32 == 0 && kDevSnapSize % 32 == 0);
+
+    // Guest writes to watched vertex buffers, from the SDK's physical-memory write watches (the page fault handler calls Written on the
+    // writing thread, before the write goes ahead). A 3D draw re-reading a buffer copied earlier this frame reuses the copy without
+    // comparing it when none of its pages were written since (hundreds of draws read the same few small buffers). UI draws still
+    // compare: the game rewrites sprite buffers between draws, and a fault per sprite would cost more than the compare.
+    // Writes that bypass the guest's views (host code writing physical memory directly) aren't seen, so each buffer is still copied
+    // fresh on its first use in every frame.
+    namespace write_watch
+    {
+      constexpr uint32_t kPages = 0x20000; // 512 MB of physical memory, 4 KB pages
+      std::atomic<uint32_t> g_writes[kPages];
+      std::atomic<uint32_t> g_bulk{0}; // ranges too big to count per page (memory released): every buffer counts as written
+      rex::memory::Memory *g_memory = nullptr;
+      std::atomic<uint64_t> g_faults{0};
+
+      std::pair<uint32_t, uint32_t> Written(void *, uint32_t start, uint32_t length, bool)
+      {
+        g_faults.fetch_add(1, std::memory_order_relaxed);
+
+        if (length > (16u << 20))
+        {
+          g_bulk.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+        {
+          const uint32_t first = start >> 12;
+          const uint32_t last = uint32_t(std::min<uint64_t>((uint64_t(start) + std::max(length, 1u) - 1) >> 12, kPages - 1));
+
+          for (uint32_t p = first; p <= last && p < kPages; ++p)
+            g_writes[p].fetch_add(1, std::memory_order_relaxed);
+        }
+
+        return {start, length}; // unwatch only what was written: neighbouring watched pages must keep reporting
+      }
+
+      // Changes whenever any page of [phys, phys + size) is written
+      uint32_t Stamp(uint32_t phys, uint32_t size)
+      {
+        uint32_t sum = g_bulk.load(std::memory_order_relaxed) * 0x9E3779B1u;
+        const uint32_t last = std::min((phys + std::max(size, 1u) - 1) >> 12, kPages - 1);
+
+        for (uint32_t p = phys >> 12; p <= last; ++p)
+          sum += g_writes[p].load(std::memory_order_relaxed);
+
+        return sum;
+      }
+
+      // Watch [phys, phys + size) for writes (pages already watched cost a flag check)
+      void Arm(uint32_t phys, uint32_t size)
+      {
+        if (g_memory)
+          g_memory->EnablePhysicalMemoryAccessCallbacks(phys, size, true, false);
+      }
+    }
+
+    // Cheap timestamps for the capture timing (a dozen per draw call): the CPU's time-stamp counter, converted to ms when the perf
+    // lines are logged (calibrated against steady_clock over the period). QueryPerformanceCounter was a visible share of the capture.
+    inline uint64_t Ticks()
+    {
+#if defined(_M_X64) || defined(__x86_64__)
+      return __rdtsc();
+#else
+      return uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+    }
     constexpr size_t kBatchCommands = 128;
 
     // Bump allocator for one frame's snapshots (chunks are kept between frames)
@@ -138,7 +242,8 @@ namespace sst::native
     struct TextureSnap
     {
       uint32_t begin, end; // physical
-      const uint8_t *data;
+      const uint8_t *data; // nullptr: not copied, unchanged since the last copy; `hash` is its content hash (TextureCache::HashGuest)
+      uint64_t hash = 0;
     };
 
     struct Command
@@ -215,16 +320,74 @@ namespace sst::native
       // Volatile textures (texture_cache.h): the set as last copied, and the base pages already copied this frame
       uint64_t watch_version = UINT64_MAX;
       guest_watch::Set watch;
+      // Constant bytes per shader (object, microcode) as the renderer uses them (guest_watch::ConstantUse)
+      uint64_t constant_use_version = UINT64_MAX;
+      std::unordered_map<uint64_t, uint32_t> constant_use;
+      uint64_t dev_chunks_skipped = 0;
+      // Vertex copies per buffer this logging period (perf line: where the copied bytes go)
+      struct VertexCopyStat
+      {
+        uint64_t draws = 0, bytes = 0, ui_draws = 0;
+        uint32_t watched = 0, largest = 0;
+      };
+      std::unordered_map<uint32_t, VertexCopyStat> vertex_copy_stats;
+      struct TextureCopyStat
+      {
+        uint64_t copies = 0, bytes = 0;
+        bool changing = false;
+      };
+      std::unordered_map<uint32_t, TextureCopyStat> texture_copy_stats; // by base page
       uint64_t frame_texture_bytes = 0;
       std::unordered_set<uint32_t> textures_copied;
+      // UI textures not seen changing: content hash of the last copy, so an unchanged one isn't copied again (hashing reads it once;
+      // a copy reads it, writes it, and the renderer hashes the copy). The draw carries the hash instead, and the renderer keeps the
+      // texture it uploaded from that copy without reading guest memory (the game may already be rewriting it for a later frame).
+      struct TextureCheck
+      {
+        uint64_t hash = 0;
+        bool known = false;
+      };
+      std::unordered_map<uint32_t, TextureCheck> texture_checks; // page -> content hash at its last copy
+      XXH3_state_t *texture_hash_state = nullptr;
+      uint64_t texture_checks_unchanged = 0, texture_checks_hashed = 0;
+      // Watched vertex buffers as a sorted list (cheap per-slot test) and this frame's last copy of each buffer (reused while the
+      // guest data still matches: some small buffers are read by hundreds of draws a frame without changing)
+      std::vector<std::pair<uint32_t, uint32_t>> watched_vertices; // phys, bytes
+      struct WatchHealth;
+      struct LastCopy
+      {
+        const uint8_t *data;
+        uint32_t size;
+        uint32_t stamp = 0;  // write_watch::Stamp of [phys, phys + size) when it was copied / last compared
+        bool armed = false;  // stamp is valid (watched since)
+        WatchHealth *health = nullptr; // watch_health entry (3D path; looked up once per frame)
+      };
+      std::unordered_map<uint32_t, LastCopy> vertex_copies_this_frame;
+      uint64_t vertex_copies_reused = 0, vertex_reuse_by_watch = 0, vertex_watch_arms = 0, vertex_watch_false = 0;
+      // Buffers whose watched pages keep getting written while the buffer's own bytes don't change (other data shares the page):
+      // each such write is a page fault, so they go back to comparing for a while
+      struct WatchHealth
+      {
+        uint64_t frame = 0;       // frame of `writes`
+        uint32_t writes = 0;      // re-checks this frame (the watch saw a write: real change or not)
+        uint64_t quiet_until = 0; // not watched before this frame
+      };
+      std::unordered_map<uint32_t, WatchHealth> watch_health;
+      uint32_t watch_noisy = 0; // buffers put back to comparing (session)
       uint64_t texture_bytes = 0, vertex_bytes = 0;
       // Device block as last captured (game thread) / as of the command being run (render thread)
       uint32_t dev_snap_addr = 0, rt_dev_addr = 0;
       std::unique_ptr<uint8_t[]> dev_snap{new uint8_t[kDevSnapSize]}, rt_dev{new uint8_t[kDevSnapSize]};
       uint64_t dev_chunks_copied = 0, dev_chunks_total = 0;
       // Game-thread cost, per logging period
-      double capture_ms = 0, wait_ms = 0;
-      double frame_capture_ms = 0, capture_max_ms = 0; // this frame's capture / worst per period
+      uint64_t capture_ticks = 0; // (Ticks)
+      double wait_ms = 0;
+      // Capture split (draws): device block delta, VS microcode, index scan, texture copies, vertex copies
+      uint64_t phase_ticks[5] = {};
+      uint64_t frame_capture_ticks = 0, capture_max_ticks = 0; // this frame's capture / worst per period
+      // Ticks -> ms over the logging period
+      uint64_t period_ticks0 = 0;
+      std::chrono::steady_clock::time_point period_t0{};
       uint64_t captured = 0, snapshot_bytes = 0, period_frames = 0, ucode_skipped = 0;
       // The game's own frame pacing (Swap to Swap)
       std::chrono::steady_clock::time_point last_swap{};
@@ -370,7 +533,10 @@ namespace sst::native
       {
       case Command::kDraw:
         for (uint32_t i = 0; i < c.tex_count; ++i)
-          s.renderer.AddTextureSnapshot(c.tex[i].begin, c.tex[i].end, c.tex[i].data);
+          if (c.tex[i].data)
+            s.renderer.AddTextureSnapshot(c.tex[i].begin, c.tex[i].end, c.tex[i].data);
+          else
+            s.renderer.AddTextureUnchanged(c.tex[i].begin >> 12, c.tex[i].hash);
 
         s.renderer.SetDrawVertexCopies(c.verts, c.vert_count);
         s.renderer.Draw(base, c.draw);
@@ -460,12 +626,12 @@ namespace sst::native
     class Capture
     {
     public:
-      explicit Capture(State &s) : s_(s), lock_(s.capture_mutex), start_(Clock::now()) {}
+      explicit Capture(State &s) : s_(s), lock_(s.capture_mutex), start_(Ticks()) {}
       ~Capture()
       {
-        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start_).count();
-        s_.capture_ms += ms;
-        s_.frame_capture_ms += ms;
+        const uint64_t t = Ticks() - start_;
+        s_.capture_ticks += t;
+        s_.frame_capture_ticks += t;
       }
 
       Command &New(Command::Kind kind)
@@ -493,13 +659,33 @@ namespace sst::native
         cmd_.overlays[cmd_.overlay_count++] = {addr, addr + size, data};
         s_.snapshot_bytes += size;
       }
+      // Times one part of a capture (perf line: "capture split")
+      struct Phase
+      {
+        uint64_t &ticks;
+        uint64_t t0 = Ticks();
+        ~Phase() { ticks += Ticks() - t0; }
+      };
+
+      Phase Time(int i) { return Phase{s_.phase_ticks[i]}; }
+
       // The device state block, plus the bound vertex shader's live microcode
       void Device(uint32_t dev)
       {
         if (!Plausible(dev))
           return;
 
-        DeviceDelta(dev);
+        {
+          auto t = Time(0);
+          DeviceDelta(dev, ConstantChunks(dev));
+        }
+
+        auto t = Time(1);
+
+        // PS microcode pointer: the renderer reads it for the constant-use key (ConstantChunks)
+        if (const uint32_t ps = Be32(dev + 0x3194); Plausible(ps))
+          Range(ps + 0x18, 4);
+
         const uint32_t vs = Be32(dev + 0x3198);
 
         if (!Plausible(vs))
@@ -536,6 +722,8 @@ namespace sst::native
         {
           guest_watch::Copy(s_.watch);
           s_.watch_version = v;
+          s_.watched_vertices.assign(s_.watch.vertices.begin(), s_.watch.vertices.end());
+          std::sort(s_.watched_vertices.begin(), s_.watched_vertices.end());
         }
       }
 
@@ -573,41 +761,58 @@ namespace sst::native
         uint32_t words[kMaxIndices + 2];
         const uint32_t nwords = std::min<uint32_t>((aligned_end - aligned_begin) / 4, uint32_t(std::size(words)));
 
-        for (uint32_t k = 0; k < nwords; ++k)
+        // (Separate loops per swap mode and index size, without branches inside: they vectorize. This runs for every UI draw and
+        // for 3D draws reading a watched buffer.)
+        std::memcpy(words, src, 4 * size_t(nwords));
+
+        switch (endian)
         {
-          uint32_t x;
-          std::memcpy(&x, src + 4 * k, 4);
-          words[k] = endian == 1 ? ((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu) : endian == 2 ? __builtin_bswap32(x)
-                                                                                     : endian == 3   ? (x << 16) | (x >> 16)
-                                                                                                     : x;
+        case 1:
+          for (uint32_t k = 0; k < nwords; ++k)
+            words[k] = ((words[k] & 0x00FF00FFu) << 8) | ((words[k] >> 8) & 0x00FF00FFu);
+
+          break;
+
+        case 2:
+          for (uint32_t k = 0; k < nwords; ++k)
+            words[k] = __builtin_bswap32(words[k]);
+
+          break;
+
+        case 3:
+          for (uint32_t k = 0; k < nwords; ++k)
+            words[k] = (words[k] << 16) | (words[k] >> 16);
+
+          break;
+
+        default:
+          break;
         }
 
         const uint8_t *idx = reinterpret_cast<const uint8_t *>(words) + (first_byte - aligned_begin);
         uint32_t max_index = 0;
 
-        for (uint32_t k = 0; k < call.count; ++k)
+        if (index32)
         {
-          uint32_t v;
-
-          if (index32)
+          for (uint32_t k = 0; k < call.count; ++k)
           {
+            uint32_t v;
             std::memcpy(&v, idx + 4 * k, 4);
-
-            if (v == 0xFFFFFFFFu)
-              continue; // strip restart
+            max_index = std::max(max_index, v == 0xFFFFFFFFu ? 0u : v); // strip restart
           }
-          else
+        }
+        else
+        {
+          uint16_t m = 0;
+
+          for (uint32_t k = 0; k < call.count; ++k)
           {
             uint16_t h;
             std::memcpy(&h, idx + 2 * k, 2);
-
-            if (h == 0xFFFFu)
-              continue;
-
-            v = h;
+            m = std::max<uint16_t>(m, h == 0xFFFFu ? uint16_t(0) : h);
           }
 
-          max_index = std::max(max_index, v);
+          max_index = m;
         }
 
         const uint64_t vertices = uint64_t(call.base_vertex) + max_index + 1;
@@ -667,14 +872,54 @@ namespace sst::native
 
           const guest_watch::TextureRange &r = it->second;
 
+          if (r.external)
+            continue; // the renderer draws this one itself
+
           if (!r.changing && (!ui || s_.frame_texture_bytes + r.base_size + r.mip_size > kFrameBudget))
             continue;
 
           if (!s_.textures_copied.insert(page).second)
             continue;
 
+          // Not seen changing (a UI-sized draw): copied only if its content differs from its last copy, else the draw carries the
+          // content hash. Same hash as the renderer's (TextureCache::HashGuest: base, then mips, one stream)
+          if (!r.changing)
+          {
+            if (!r.base_addr || !r.base_size || n >= 64 || !GuestPhysicalReadable(r.base_addr, r.base_size) || (r.mip_size && !GuestPhysicalReadable(r.mip_addr, r.mip_size)))
+              continue;
+
+            if (!s_.texture_hash_state)
+              s_.texture_hash_state = XXH3_createState();
+
+            XXH3_state_t *st = s_.texture_hash_state;
+            XXH3_64bits_reset(st);
+            XXH3_64bits_update(st, HostPtr(s_.base, r.base_addr | 0xA0000000u), r.base_size);
+
+            if (r.mip_addr && r.mip_size)
+              XXH3_64bits_update(st, HostPtr(s_.base, r.mip_addr | 0xA0000000u), r.mip_size);
+
+            const uint64_t h = XXH3_64bits_digest(st);
+            ++s_.texture_checks_hashed;
+            State::TextureCheck &tc = s_.texture_checks[page];
+
+            if (tc.known && h == tc.hash)
+            {
+              snaps[n++] = {r.base_addr, r.base_addr + r.base_size, nullptr, h};
+              ++s_.texture_checks_unchanged;
+              continue;
+            }
+
+            tc = {h, true};
+          }
+
           add(r.base_addr, r.base_size);
           add(r.mip_addr, r.mip_size);
+          {
+            auto &st = s_.texture_copy_stats[page];
+            ++st.copies;
+            st.bytes += uint64_t(r.base_size) + r.mip_size;
+            st.changing = r.changing;
+          }
         }
 
         if (!n)
@@ -688,7 +933,8 @@ namespace sst::native
 
       // Vertex data the draw reads that the game rewrites between draws (UI sprites and text: one buffer reused for the next sprite, or
       // data seen changing between frames): copied with every draw, as much as it reads. Static model data is read live.
-      void Vertices(uint32_t dev, uint32_t vertices, bool ui)
+      // `call`: for 3D draws reading a watched buffer, the range they use is worked out here (index scan), so only that part is copied.
+      void Vertices(uint32_t dev, uint32_t vertices, bool ui, const DrawCall *call = nullptr)
       {
         if (!Plausible(dev))
           return;
@@ -698,9 +944,13 @@ namespace sst::native
         Renderer::GuestCopy copies[16];
         uint32_t n = 0, total = 0;
 
+        // The 96 fetch constants (2 dwords each) in one read
+        uint32_t fc[192];
+        std::memcpy(fc, HostPtr(s_.base, dev + kDevFetchConstants), sizeof(fc));
+
         for (uint32_t slot = 0; slot < 96 && n < 16; ++slot)
         {
-          const uint32_t dw0 = Be32(dev + kDevFetchConstants + 8 * slot);
+          const uint32_t dw0 = __builtin_bswap32(fc[2 * slot]);
 
           if ((dw0 & 3) != 3)
             continue;
@@ -711,13 +961,113 @@ namespace sst::native
             continue;
 
           uint32_t want = 0;
+          const auto wv = std::lower_bound(s_.watched_vertices.begin(), s_.watched_vertices.end(), std::make_pair(phys, 0u));
+          const bool watched = wv != s_.watched_vertices.end() && wv->first == phys;
+          const uint32_t fetch_size = __builtin_bswap32(fc[2 * slot + 1]) & 0x03FFFFFCu;
 
-          if (auto it = s_.watch.vertices.find(phys); it != s_.watch.vertices.end())
-            want = std::max(it->second, vertices * kMaxStride);
+          // 3D draw reading a watched buffer, with the write watch: the whole watched range is copied once and reused while no guest
+          // write touches its pages. No index scan, no compare, no page-table check per draw (released memory also bumps the stamp).
+          if (watched && !ui && write_watch::g_memory)
+          {
+            const uint32_t full = std::min({wv->second, fetch_size, kMaxBuffer});
+            auto [last, fresh] = s_.vertex_copies_this_frame.try_emplace(phys, State::LastCopy{nullptr, 0});
+            State::LastCopy &e = last->second;
+
+            if (!e.health)
+              e.health = &s_.watch_health[phys];
+
+            State::WatchHealth &health = *e.health;
+
+            if (full && s_.frame >= health.quiet_until)
+            {
+              bool dup = false;
+
+              for (uint32_t i = 0; i < n && !dup; ++i)
+                dup = copies[i].begin == phys && copies[i].end - copies[i].begin >= full;
+
+              if (dup)
+                continue;
+
+              if (!fresh && e.armed && e.size >= full && write_watch::Stamp(phys, e.size) == e.stamp)
+              {
+                copies[n++] = {phys, phys + full, e.data};
+                ++s_.vertex_copies_reused;
+                ++s_.vertex_reuse_by_watch;
+                continue;
+              }
+
+              if (total + full > kMaxPerDraw || !GuestPhysicalReadable(phys, full))
+                continue;
+
+              // Written since (or first use this frame). Many re-checks in one frame: the buffer is streamed (or shares its pages
+              // with busy data), so it goes back to per-draw ranges and compares for a while
+              if (e.armed)
+              {
+                if (health.frame != s_.frame)
+                  health.frame = s_.frame, health.writes = 0;
+
+                if (++health.writes > 16)
+                {
+                  health.quiet_until = s_.frame + 600;
+                  ++s_.watch_noisy;
+                }
+              }
+
+              // Stamp, arm, then read: a write after the stamp is either in the data read or changes the stamp
+              const uint32_t stamp = write_watch::Stamp(phys, full);
+              write_watch::Arm(phys, full);
+              ++s_.vertex_watch_arms;
+              const uint8_t *live = HostPtr(s_.base, phys | 0xA0000000u);
+
+              if (!fresh && e.data && e.size >= full && std::memcmp(e.data, live, full) == 0)
+              {
+                ++s_.vertex_watch_false; // written, yet unchanged
+                e.stamp = stamp;
+                e.armed = true;
+                copies[n++] = {phys, phys + full, e.data};
+                ++s_.vertex_copies_reused;
+                continue;
+              }
+
+              uint8_t *copy = s_.arena->Alloc(full);
+              std::memcpy(copy, live, full);
+              e.data = copy;
+              e.size = full;
+              e.stamp = stamp;
+              e.armed = true;
+              copies[n++] = {phys, phys + full, copy};
+              total += full;
+              {
+                auto &st = s_.vertex_copy_stats[phys];
+                ++st.draws;
+                st.bytes += full;
+                st.largest = std::max(st.largest, full);
+                st.watched = wv->second;
+              }
+              continue;
+            }
+          }
+
+          if (watched)
+          {
+            const auto it = wv; // (it->second: bytes the renderer saw read)
+            if (ui)
+              want = std::max(it->second, vertices * kMaxStride);
+            else
+            {
+              // 3D draws (particles, trails) often draw slices of one big dynamic buffer: copying the whole watched size for every
+              // draw cost ~2 ms a frame on a laptop. Copy up to the last vertex this draw reads (at most the stride bound); a copy
+              // that turns out too short is simply not used (the renderer reads guest memory then).
+              if (!vertices && call)
+                vertices = DrawVertices(dev, *call);
+
+              want = vertices ? std::min(it->second, vertices * kMaxStride) : it->second;
+            }
+          }
           else if (ui && vertices && vertices <= kUiVertices)
             want = vertices * kMaxStride;
 
-          const uint32_t size = std::min({Be32(dev + kDevFetchConstants + 8 * slot + 4) & 0x03FFFFFCu, want, kMaxBuffer});
+          const uint32_t size = std::min({fetch_size, want, kMaxBuffer});
 
           if (!size || total + size > kMaxPerDraw)
             continue;
@@ -730,10 +1080,33 @@ namespace sst::native
           if (dup || !GuestPhysicalReadable(phys, size))
             continue;
 
+          // This frame's earlier copy of the buffer, if the guest data hasn't changed since (compare reads, copy reads and writes)
+          const uint8_t *live = HostPtr(s_.base, phys | 0xA0000000u);
+          auto [last, fresh] = s_.vertex_copies_this_frame.try_emplace(phys, State::LastCopy{nullptr, 0});
+
+          if (!fresh && last->second.size >= size && std::memcmp(last->second.data, live, size) == 0)
+          {
+            copies[n++] = {phys, phys + size, last->second.data};
+            ++s_.vertex_copies_reused;
+            continue;
+          }
+
           uint8_t *copy = s_.arena->Alloc(size);
-          std::memcpy(copy, HostPtr(s_.base, phys | 0xA0000000u), size);
+          std::memcpy(copy, live, size);
+          State::WatchHealth *health = last->second.health;
+          last->second = {copy, size, 0, false, health}; // not watched: the next 3D draw copies the whole range again
           copies[n++] = {phys, phys + size, copy};
           total += size;
+          {
+            auto &st = s_.vertex_copy_stats[phys];
+            ++st.draws;
+            st.ui_draws += ui;
+            st.bytes += size;
+            st.largest = std::max(st.largest, size);
+
+            if (auto it = s_.watch.vertices.find(phys); it != s_.watch.vertices.end())
+              st.watched = it->second;
+          }
         }
 
         s_.vertex_bytes += total;
@@ -748,7 +1121,46 @@ namespace sst::native
       }
 
       // The device block's chunks that changed since the last capture
-      void DeviceDelta(uint32_t dev)
+      // Device-block chunks worth comparing for this call: everything but the VS / PS float constants past what the bound shaders use
+      // (as the renderer reports it: guest_watch::ConstantUse). The compare is ~23 KB of reads per call - 2 ms a frame on a laptop -
+      // and 8 KB of it is constants, most of them unused by any one shader. Chunks not compared keep their old value in both the
+      // snapshot and the render thread's copy, so they stay in step and are sent as soon as a shader that reads them is drawn.
+      uint64_t ConstantChunks(uint32_t dev)
+      {
+        constexpr uint64_t kAll = kDevChunks == 64 ? ~uint64_t(0) : (uint64_t(1) << kDevChunks) - 1;
+        constexpr uint32_t kVsFirst = (0x780 - kDevSnapBegin) / kDevChunk, kPsFirst = (0x1780 - kDevSnapBegin) / kDevChunk; // 3, 19
+        static_assert((0x780 - kDevSnapBegin) % kDevChunk == 0 && (0x1780 - kDevSnapBegin) % kDevChunk == 0);
+
+        if (const uint64_t v = guest_watch::ConstantUseVersion(); v != s_.constant_use_version)
+        {
+          guest_watch::CopyConstantUse(s_.constant_use);
+          s_.constant_use_version = v;
+        }
+
+        auto bytes = [&](uint32_t object, uint32_t ucode_offset) -> uint32_t
+        {
+          if (!object || !Plausible(object))
+            return 4096;
+
+          auto it = s_.constant_use.find(guest_watch::ShaderKey(object, Be32(object + ucode_offset)));
+          return it != s_.constant_use.end() ? std::min(it->second, 4096u) : 4096u;
+        };
+
+        // VS object +0x20 / PS object +0x18: the microcode pointer (both snapshotted, so the renderer keys them alike)
+        const uint32_t vs_chunks = (bytes(Be32(dev + 0x3198), 0x20) + kDevChunk - 1) / kDevChunk;
+        const uint32_t ps_chunks = (bytes(Be32(dev + 0x3194), 0x18) + kDevChunk - 1) / kDevChunk;
+        uint64_t skip = 0;
+
+        for (uint32_t i = vs_chunks; i < 16; ++i)
+          skip |= uint64_t(1) << (kVsFirst + i);
+
+        for (uint32_t i = ps_chunks; i < 16; ++i)
+          skip |= uint64_t(1) << (kPsFirst + i);
+
+        return kAll & ~skip;
+      }
+
+      void DeviceDelta(uint32_t dev, uint64_t compare)
       {
         const uint8_t *host = HostPtr(s_.base, dev + kDevSnapBegin);
         uint8_t *snap = s_.dev_snap.get();
@@ -763,12 +1175,18 @@ namespace sst::native
         }
         else
         {
-          for (uint32_t i = 0; i < kDevChunks; ++i)
-            if (std::memcmp(snap + i * kDevChunk, host + i * kDevChunk, ChunkSize(i)) != 0)
+          for (uint64_t m = compare; m; m &= m - 1)
+          {
+            const uint32_t i = uint32_t(std::countr_zero(m));
+
+            if (ChunkDiffers(snap + i * kDevChunk, host + i * kDevChunk, ChunkSize(i)))
             {
               mask |= uint64_t(1) << i;
               bytes += ChunkSize(i);
             }
+          }
+
+          s_.dev_chunks_skipped += kDevChunks - uint32_t(std::popcount(compare));
         }
 
         cmd_.dev_addr = dev;
@@ -827,15 +1245,17 @@ namespace sst::native
       // Ends the frame: hands its arena over and waits until the render thread is at most one frame behind, with an arena free for the next frame
       void EndFrame()
       {
-        s_.capture_max_ms = std::max(s_.capture_max_ms, s_.frame_capture_ms);
-        s_.frame_capture_ms = 0;
+        s_.capture_max_ticks = std::max(s_.capture_max_ticks, s_.frame_capture_ticks);
+        s_.frame_capture_ticks = 0;
         s_.batch.arena = s_.arena;
         s_.batch.frame = ++s_.frame;
         Flush();
         s_.ucode_copies.clear();
         s_.textures_copied.clear();
+        s_.vertex_copies_this_frame.clear(); // (their memory is this frame's arena)
         s_.frame_texture_bytes = 0;
         const auto wait_start = Clock::now();
+        const uint64_t wait_ticks = Ticks();
         {
           std::unique_lock lock(s_.queue_mutex);
           s_.done_cv.wait(lock, [&]
@@ -853,7 +1273,7 @@ namespace sst::native
 
         const auto waited = Clock::now() - wait_start;
         s_.wait_ms += std::chrono::duration<double, std::milli>(waited).count();
-        start_ += waited; // not capture time
+        start_ += Ticks() - wait_ticks; // not capture time
         ++s_.period_frames;
       }
 
@@ -868,7 +1288,7 @@ namespace sst::native
 
       State &s_;
       std::lock_guard<std::mutex> lock_;
-      Clock::time_point start_;
+      uint64_t start_; // (Ticks)
       Command cmd_;
     };
 
@@ -985,6 +1405,14 @@ namespace sst::native
     // The game's frame: 1280x720, or 1280x1024 in its own 4:3 mode
     const uint32_t frame_h = sst::menu::NativeFourThree() ? 1024 : 720;
 
+    if (REXCVAR_GET(sst_native_write_watch) && runtime->memory())
+    {
+      static void *handle = runtime->memory()->RegisterPhysicalMemoryInvalidationCallback(write_watch::Written, nullptr);
+
+      if (handle)
+        write_watch::g_memory = runtime->memory();
+    }
+
     if (!state->renderer.Initialize(*provider, &state->shaders, runtime->memory()->physical_membase(), 1280, frame_h))
     {
       REXLOG_ERROR("[sst-native] renderer setup failed - native renderer disabled");
@@ -1085,15 +1513,29 @@ namespace sst::native
           [&](Capture &cap, Command &)
           {
             cap.Device(call.device);
-            const uint32_t vertices = call.up_data ? 0 : cap.DrawVertices(call.device, call);
             const bool ui = !cap.DepthTested(call.device);
 
             if (REXCVAR_GET(sst_native_draw_copies))
             {
-              cap.Textures(call.device, ui && (call.up_data ? call.count <= 256 : vertices && vertices <= 256));
+              // The index scan only matters for UI draws (it sizes their vertex copies); 3D draws copy only watched buffers, whole
+              uint32_t vertices = 0;
+
+              if (ui && !call.up_data)
+              {
+                auto t = cap.Time(2);
+                vertices = cap.DrawVertices(call.device, call);
+              }
+
+              {
+                auto t = cap.Time(3);
+                cap.Textures(call.device, ui && (call.up_data ? call.count <= 256 : vertices && vertices <= 256));
+              }
 
               if (!call.up_data)
-                cap.Vertices(call.device, vertices, ui);
+              {
+                auto t = cap.Time(4);
+                cap.Vertices(call.device, vertices, ui, &call);
+              }
             }
 
             if (call.up_data)
@@ -1357,24 +1799,87 @@ namespace sst::native
     // Game-thread cost of the hooks, every sst_native_log_every frames
     const int every = REXCVAR_GET(sst_native_log_every);
 
+    if (!s.period_ticks0)
+    {
+      s.period_ticks0 = Ticks();
+      s.period_t0 = std::chrono::steady_clock::now();
+    }
+
     if (every > 0 && s.period_frames >= uint64_t(every))
     {
       const double frames = double(s.period_frames);
+      // Ticks -> ms, from this period's length on both clocks
+      const uint64_t now_ticks = Ticks();
+      const auto now_t = std::chrono::steady_clock::now();
+      const double period_ms = std::chrono::duration<double, std::milli>(now_t - s.period_t0).count();
+      const double tick_ms = now_ticks > s.period_ticks0 ? period_ms / double(now_ticks - s.period_ticks0) : 0.0;
+      s.period_ticks0 = now_ticks;
+      s.period_t0 = now_t;
+      const double capture_ms = double(s.capture_ticks) * tick_ms;
+      double phase_ms[5];
+
+      for (int i = 0; i < 5; ++i)
+        phase_ms[i] = double(s.phase_ticks[i]) * tick_ms;
       REXLOG_INFO("[sst-native] perf: game thread per frame: {:.2f} ms capturing {} calls ({:.1f} MB "
                   "of snapshots), {:.2f} ms waiting for the render thread; game frames over 20 ms: "
                   "{} (longest {:.1f} ms); longest capture in one frame {:.2f} ms; device block chunks "
-                  "copied {:.1f}%; textures copied {:.2f} MB ({} known); vertex data copied {:.2f} MB ({} buffers watched){}",
-                  s.capture_ms / frames, uint64_t(double(s.captured) / frames + 0.5), double(s.snapshot_bytes) / frames / (1 << 20), s.wait_ms / frames, s.swaps_over_20, s.swap_max_ms, s.capture_max_ms,
+                  "copied {:.1f}% (not compared {:.1f}%); textures copied {:.2f} MB ({} known); vertex data copied {:.2f} MB ({} buffers watched){}",
+                  capture_ms / frames, uint64_t(double(s.captured) / frames + 0.5), double(s.snapshot_bytes) / frames / (1 << 20), s.wait_ms / frames, s.swaps_over_20, s.swap_max_ms, double(s.capture_max_ticks) * tick_ms,
                   s.dev_chunks_total ? 100.0 * double(s.dev_chunks_copied) / double(s.dev_chunks_total) : 0.0,
+                  s.dev_chunks_total ? 100.0 * double(s.dev_chunks_skipped) / double(s.dev_chunks_total) : 0.0,
                   double(s.texture_bytes) / frames / (1 << 20), s.watch.textures.size(), double(s.vertex_bytes) / frames / (1 << 20), s.watch.vertices.size(),
                   s.ucode_skipped ? fmt::format("; {} draws without a microcode snapshot", s.ucode_skipped) : std::string());
-      s.dev_chunks_copied = s.dev_chunks_total = 0;
-      s.capture_ms = s.wait_ms = 0;
+      REXLOG_INFO("[sst-native] perf: capture split per frame: device block {:.2f} ms, VS microcode {:.2f} ms, index scan {:.2f} ms, "
+                  "texture copies {:.2f} ms, vertex copies {:.2f} ms, other {:.2f} ms",
+                  phase_ms[0] / frames, phase_ms[1] / frames, phase_ms[2] / frames, phase_ms[3] / frames, phase_ms[4] / frames,
+                  (capture_ms - phase_ms[0] - phase_ms[1] - phase_ms[2] - phase_ms[3] - phase_ms[4]) / frames);
+      std::fill(std::begin(s.phase_ticks), std::end(s.phase_ticks), uint64_t(0));
+
+      if (!s.vertex_copy_stats.empty())
+      {
+        std::vector<std::pair<uint32_t, State::VertexCopyStat>> v(s.vertex_copy_stats.begin(), s.vertex_copy_stats.end());
+        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b)
+                  { return a.second.bytes > b.second.bytes; });
+        std::string text;
+
+        for (size_t i = 0; i < v.size() && i < 8; ++i)
+          text += fmt::format(" {:08X}: {:.2f} MB/frame, {:.1f} draws/frame ({:.1f} UI), largest {} KB, watched {} KB;", v[i].first, double(v[i].second.bytes) / frames / (1 << 20), double(v[i].second.draws) / frames, double(v[i].second.ui_draws) / frames, v[i].second.largest >> 10, v[i].second.watched >> 10);
+
+        REXLOG_INFO("[sst-native] perf: vertex copies by buffer:{} ({} buffers; {:.1f} copies a frame reused unchanged, {:.1f} of them without comparing (write watch); watch: {:.1f} arms/frame, {:.1f} write faults/frame, {:.1f} false alarms/frame, {} noisy buffers)", text, v.size(), double(s.vertex_copies_reused) / frames, double(s.vertex_reuse_by_watch) / frames, double(s.vertex_watch_arms) / frames, double(write_watch::g_faults.exchange(0)) / frames, double(s.vertex_watch_false) / frames, s.watch_noisy);
+        s.vertex_copies_reused = s.vertex_reuse_by_watch = s.vertex_watch_arms = s.vertex_watch_false = 0;
+        s.vertex_copy_stats.clear();
+      }
+
+      if (!s.texture_copy_stats.empty())
+      {
+        std::vector<std::pair<uint32_t, State::TextureCopyStat>> v(s.texture_copy_stats.begin(), s.texture_copy_stats.end());
+        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b)
+                  { return a.second.bytes > b.second.bytes; });
+        std::string text;
+        uint64_t changing_bytes = 0;
+
+        for (const auto &[page, st] : v)
+          changing_bytes += st.changing ? st.bytes : 0;
+
+        for (size_t i = 0; i < v.size() && i < 8; ++i)
+          text += fmt::format(" {:08X}: {:.2f} MB/frame ({:.1f} copies/frame{});", v[i].first << 12, double(v[i].second.bytes) / frames / (1 << 20), double(v[i].second.copies) / frames, v[i].second.changing ? ", seen changing" : "");
+
+        REXLOG_INFO("[sst-native] perf: texture copies by texture:{} ({} textures; seen changing {:.2f} MB/frame)", text, v.size(), double(changing_bytes) / frames / (1 << 20));
+        s.texture_copy_stats.clear();
+      }
+
+      if (s.texture_checks_hashed)
+        REXLOG_INFO("[sst-native] perf: UI textures checked by hash: {:.1f}/frame, {:.1f}/frame unchanged (not copied)", double(s.texture_checks_hashed) / frames, double(s.texture_checks_unchanged) / frames);
+
+      s.texture_checks_hashed = s.texture_checks_unchanged = 0;
+      s.dev_chunks_copied = s.dev_chunks_total = s.dev_chunks_skipped = 0;
+      s.capture_ticks = 0;
+      s.wait_ms = 0;
       s.captured = s.snapshot_bytes = s.period_frames = s.ucode_skipped = 0;
       s.texture_bytes = s.vertex_bytes = 0;
       s.swap_max_ms = 0;
       s.swaps_over_20 = 0;
-      s.capture_max_ms = 0;
+      s.capture_max_ticks = 0;
     }
   }
 }

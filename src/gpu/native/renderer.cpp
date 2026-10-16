@@ -91,6 +91,11 @@ REXCVAR_DEFINE_BOOL(sst_native_memexport_cache, true, "SST",
                     "Native renderer: skip a memory-export draw when its inputs and previous "
                     "output are unchanged");
 
+REXCVAR_DEFINE_STRING(sst_native_memexport_dump, "", "SST",
+                      "Native renderer debug: write the first few runs of each memory-export (morph) shader to this folder - "
+                      "microcode, constants, fetch constants, indices, input vertex data and the output - for offline "
+                      "benchmarking of the interpreter");
+
 REXCVAR_DEFINE_INT32(sst_native_memexport_threads, -1, "SST",
                      "Native renderer: extra threads for memory-export (morph) shaders; -1 = "
                      "automatic (half the CPU threads minus one, at most 6)");
@@ -589,10 +594,10 @@ namespace sst::native
   {
     using Job = PipelineJob;
 
-    PipelineWorkers(ID3D12Device *device, uint32_t threads, bool use_library) : device(device)
+    PipelineWorkers(ID3D12Device *device, uint32_t threads, bool use_library, bool fast_shaders) : device(device)
     {
       if (use_library)
-        OpenLibrary();
+        OpenLibrary(fast_shaders);
 
       for (uint32_t i = 0; i < threads; ++i)
         workers.emplace_back([this]
@@ -617,14 +622,15 @@ namespace sst::native
       Save();
     }
 
-    void OpenLibrary()
+    void OpenLibrary(bool fast_shaders)
     {
       ComPtr<ID3D12Device1> device1;
 
       if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1))))
         return;
 
-      path = rex::filesystem::GetExecutableFolder() / "cache" / "pipelines.bin";
+      // SHADER PRECISION: FAST pipelines hold other DXIL under the same names: a file of their own
+      path = rex::filesystem::GetExecutableFolder() / "cache" / (fast_shaders ? "pipelines_fast.bin" : "pipelines.bin");
       {
         std::ifstream in(path, std::ios::binary);
 
@@ -2503,6 +2509,37 @@ namespace sst::native
     if (!timestamps_ || !timestamp_pending_[slot])
       return;
 
+    // Per pass: the time from each mark to the next goes to the mark's target
+    if (pass_ts_ && pass_marks_[slot].size() >= 2)
+    {
+      const std::vector<PassMark> &marks = pass_marks_[slot];
+      const D3D12_RANGE prange = {8 * size_t(slot) * kPassMarks, 8 * (size_t(slot) * kPassMarks + marks.size())};
+      void *pm = nullptr;
+
+      if (SUCCEEDED(pass_readback_->Map(0, &prange, &pm)) && pm)
+      {
+        const uint64_t *t = reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(pm) + prange.Begin);
+
+        for (size_t i = 0; i + 1 < marks.size(); ++i)
+        {
+          if (t[i + 1] < t[i] || !timestamp_frequency_)
+            continue;
+
+          const PassMark &m = marks[i];
+          const uint64_t key = (uint64_t(m.rt) << 32) | (uint64_t(m.w) << 18) | (uint64_t(m.h) << 4) | m.kind;
+          PassCost &c = pass_costs_[key];
+          c.ms += double(t[i + 1] - t[i]) * 1000.0 / double(timestamp_frequency_);
+          ++c.passes;
+        }
+
+        ++pass_frames_;
+        const D3D12_RANGE none = {0, 0};
+        pass_readback_->Unmap(0, &none);
+      }
+    }
+
+    pass_marks_[slot].clear();
+
     timestamp_pending_[slot] = false;
     const D3D12_RANGE range = {16 * size_t(slot), 16 * size_t(slot) + 16};
     void *mapped = nullptr;
@@ -2548,6 +2585,27 @@ namespace sst::native
 
     if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&timestamp_readback_))))
       timestamps_.Reset();
+
+    // Per-pass timestamps
+    qd.Count = kPassMarks * kSlots;
+    bd.Width = 8 * uint64_t(kPassMarks) * kSlots;
+
+    if (FAILED(device_->CreateQueryHeap(&qd, IID_PPV_ARGS(&pass_ts_))) || FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pass_readback_))))
+    {
+      pass_ts_.Reset();
+      pass_readback_.Reset();
+    }
+  }
+
+  void Renderer::MarkPass(uint32_t rt, uint32_t w, uint32_t h, uint8_t kind)
+  {
+    std::vector<PassMark> &marks = pass_marks_[frame_res_];
+
+    if (!pass_ts_ || marks.size() >= kPassMarks - 1)
+      return;
+
+    list_->EndQuery(pass_ts_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_res_ * kPassMarks + uint32_t(marks.size()));
+    marks.push_back({rt, uint16_t(std::min(w, 65535u)), uint16_t(std::min(h, 65535u)), kind});
   }
 
   // Every sst_native_log_every frames: where the frame time went.
@@ -2577,6 +2635,26 @@ namespace sst::native
       REXLOG_INFO("[sst-native] perf: {:.1f} fps, frame {:.2f} ms avg / {:.1f} max ({:.0f}% over "
                   "1/60 s, {:.0f}% over 1/30 s); GPU {:.2f} ms avg / {:.1f} max",
                   1000.0 / frame, frame, p.frame_ms_max, 100.0 * p.over_60 / frames, 100.0 * p.over_30 / frames, p.gpu_frames ? p.gpu_ms_sum / p.gpu_frames : 0.0, p.gpu_ms_max);
+
+      if (pass_frames_ && !pass_costs_.empty())
+      {
+        std::vector<std::pair<uint64_t, PassCost>> v(pass_costs_.begin(), pass_costs_.end());
+        std::sort(v.begin(), v.end(), [](const auto &x, const auto &y)
+                  { return x.second.ms > y.second.ms; });
+        std::string text;
+        static constexpr const char *kKinds[5] = {"", " 3D scene", " shadow map", " frame start", " present / UI blits"};
+
+        for (size_t i = 0; i < v.size() && i < 10; ++i)
+        {
+          const uint64_t k = v[i].first;
+          const uint32_t kind = uint32_t(k & 15), w = uint32_t((k >> 18) & 0x3FFF), h = uint32_t((k >> 4) & 0x3FFF);
+          text += fmt::format(" {}{:.2f} ms ({:.1f}/frame);", kind >= 3 ? std::string(kKinds[kind] + 1) + " " : fmt::format("{:08X} {}x{}{} ", uint32_t(k >> 32), w, h, kKinds[kind]), v[i].second.ms / double(pass_frames_), double(v[i].second.passes) / double(pass_frames_));
+        }
+
+        REXLOG_INFO("[sst-native] perf: GPU by pass (per frame):{}", text);
+        pass_costs_.clear();
+        pass_frames_ = 0;
+      }
       REXLOG_INFO("[sst-native] perf: {} per frame: {:.2f} ms in the renderer, {:.2f} ms "
                   "{}; renderer: memexport {:.2f}, shaders {:.2f}, "
                   "inputs {:.2f}, indices {:.2f}, pipelines {:.2f}, vertices {:.2f}, constants "
@@ -2864,6 +2942,10 @@ namespace sst::native
     if (timestamps_)
       list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * frame_res_);
 
+    pass_marks_[frame_res_].clear();
+    pass_pair_ = 0;
+    MarkPass(0, 0, 0, 3);
+
     auto to_rt = Transition(outputs_[target_].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     list_->ResourceBarrier(1, &to_rt);
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(target_);
@@ -2930,6 +3012,12 @@ namespace sst::native
       textures_->AddSnapshot(begin, end, data);
   }
 
+  void Renderer::AddTextureUnchanged(uint32_t base_page, uint64_t hash)
+  {
+    if (textures_)
+      textures_->AddUnchanged(base_page, hash);
+  }
+
   void Renderer::EndFrame()
   {
     PhaseClock clk(prof_, kPhSubmit);
@@ -2965,6 +3053,8 @@ namespace sst::native
     stats_.late_checked += late_checks_.size();
     late_checks_.clear();
 
+    MarkPass(0, 0, 0, 4);
+
     if (RenderTargetsEnabled())
       PresentRenderTargets();
 
@@ -2987,6 +3077,14 @@ namespace sst::native
       list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * frame_res_ + 1);
       list_->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * frame_res_, 2, timestamp_readback_.Get(), 16 * frame_res_);
       timestamp_pending_[frame_res_] = true;
+
+      if (pass_ts_)
+      {
+        std::vector<PassMark> &marks = pass_marks_[frame_res_];
+        list_->EndQuery(pass_ts_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_res_ * kPassMarks + uint32_t(marks.size()));
+        marks.push_back({0, 0, 0, 4}); // end (closes the last segment; not counted itself)
+        list_->ResolveQueryData(pass_ts_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_res_ * kPassMarks, uint32_t(marks.size()), pass_readback_.Get(), 8 * uint64_t(frame_res_) * kPassMarks);
+      }
     }
 
     list_->Close();
@@ -3392,7 +3490,7 @@ namespace sst::native
     if (!pipeline_workers_)
     {
       const uint32_t threads = std::clamp(uint32_t(std::thread::hardware_concurrency()) / 4, 1u, 4u);
-      pipeline_workers_ = std::make_unique<PipelineWorkers>(device_, threads, REXCVAR_GET(sst_native_pipeline_library));
+      pipeline_workers_ = std::make_unique<PipelineWorkers>(device_, threads, REXCVAR_GET(sst_native_pipeline_library), shaders_ && shaders_->fast());
     }
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
@@ -4301,6 +4399,71 @@ namespace sst::native
       memexport_written_.push_back({streams[i].begin, streams[i].begin + streams[i].size});
     }
 
+    // --sst_native_memexport_dump: the first 3 runs of each shader, run here (synchronously) so the output can be saved with the inputs
+    if (const std::string dir = REXCVAR_GET(sst_native_memexport_dump); !dir.empty() && memexport_dumped_[vs_entry->hash] < 3)
+    {
+      const uint32_t n = memexport_dumped_[vs_entry->hash]++;
+      std::vector<uint8_t> file;
+      auto put = [&](const void *data, size_t size)
+      {
+        const uint8_t *p = static_cast<const uint8_t *>(data);
+        file.insert(file.end(), p, p + size);
+      };
+      auto put32 = [&](uint32_t v)
+      { put(&v, 4); };
+      // Format (little-endian): "SSTMX1\0\0", vs hash, dwords, ucode, 1024 floats, bools[8], loops[32], fetch[192], index count, indices,
+      // input range count, {phys, size, bytes}..., output range count, {phys, size, bytes after the run}...
+      put("SSTMX1\0\0", 8);
+      put(&vs_entry->hash, 8);
+      put32(uint32_t(job->ucode.size()));
+      put(job->ucode.data(), job->ucode.size() * 4);
+      put(job->constants.data(), 1024 * 4);
+      put(job->bools, sizeof(job->bools));
+      put(job->loops, sizeof(job->loops));
+      put(job->fetch, sizeof(job->fetch));
+      put32(uint32_t(job->indices.size()));
+      put(job->indices.data(), job->indices.size() * 4);
+      uint32_t slots[16];
+      const uint32_t nslots = VertexFetchSlots(job->ucode.data(), uint32_t(job->ucode.size()), slots, 16);
+      std::vector<std::pair<uint32_t, uint32_t>> inputs;
+
+      for (uint32_t i = 0; i < nslots; ++i)
+      {
+        const uint32_t phys = job->fetch[2 * slots[i]] & 0x1FFFFFFCu, size = job->fetch[2 * slots[i] + 1] & 0x03FFFFFCu;
+
+        if (size && uint64_t(phys) + size <= 0x20000000u && std::find(inputs.begin(), inputs.end(), std::make_pair(phys, size)) == inputs.end())
+          inputs.push_back({phys, size});
+      }
+
+      put32(uint32_t(inputs.size()));
+
+      for (const auto &[phys, size] : inputs)
+      {
+        put32(phys);
+        put32(size);
+        put(physical_membase_ + phys, size);
+      }
+
+      job->use_cache = false; // always run
+      memexport_->Execute(*job);
+      put32(stream_count);
+
+      for (uint32_t i = 0; i < stream_count; ++i)
+      {
+        const uint32_t size = uint64_t(streams[i].begin) + streams[i].size <= 0x20000000u ? streams[i].size : 0;
+        put32(streams[i].begin);
+        put32(size);
+        put(physical_membase_ + streams[i].begin, size);
+      }
+
+      std::error_code ec;
+      std::filesystem::create_directories(dir, ec);
+      std::ofstream(std::filesystem::path(dir) / fmt::format("{:016X}_{}.mx", vs_entry->hash, n), std::ios::binary).write(reinterpret_cast<const char *>(file.data()), std::streamsize(file.size()));
+      REXLOG_INFO("[sst-native] memexport dump: VS {:016X} run {} ({} vertices, {} KB) written to {}", vs_entry->hash, n, job->indices.size(), file.size() >> 10, dir);
+      FinishMemexport(pending);
+      return;
+    }
+
     if (REXCVAR_GET(sst_native_memexport_async))
     {
       // Runs on the background thread; draws reading the output wait for it.
@@ -4380,6 +4543,12 @@ namespace sst::native
     }
 
     stats_.memexport_ms += job.ms;
+    {
+      MemexportShaderCost &c = memexport_costs_[p.vs_hash];
+      c.ms += job.ms;
+      c.vertices += job.skipped ? 0 : job.indices.size();
+      ++(job.skipped ? c.cached : c.runs);
+    }
 
     if (job.skipped)
     {
@@ -4487,6 +4656,7 @@ namespace sst::native
 
     if (vs_entry && vs_entry->memexport)
     {
+      guest_watch::ConstantUse(guest_watch::ShaderKey(vs_obj, be32(base, vs_obj + 0x20)), 4096); // the stream constants are found by scanning c0-c255
       clk.Switch(kPhMemexport);
       RunMemexport(base, call, vs_obj, vs_entry);
       return;
@@ -5940,6 +6110,14 @@ namespace sst::native
     float cap_half_x = 0, cap_half_y = 0; // (F9 capture)
     clk.Switch(kPhConstants);
     // 11. Constants: device mirror (big-endian float4 x 256 per stage) + shared. Identical constant files (very common between draws) are uploaded once per frame. Only the registers the shaders read (most use a fraction of the 256)
+    // The game thread compares only these constant bytes of the device block for this shader object (native.cpp, DeviceDelta)
+    // (Keyed by object and microcode pointer, both read from the draw's snapshot; only for shaders resolved here.)
+    if (const uint32_t obj = be32(base, dev + kDevVS); obj && vs_entry)
+      guest_watch::ConstantUse(guest_watch::ShaderKey(obj, be32(base, obj + 0x20)), ConstantBytes(vs_entry));
+
+    if (const uint32_t obj = be32(base, dev + kDevPS); obj && ps_entry)
+      guest_watch::ConstantUse(guest_watch::ShaderKey(obj, be32(base, obj + 0x18)), ConstantBytes(ps_entry));
+
     const D3D12_GPU_VIRTUAL_ADDRESS vsc_gpu = UploadConstants(GuestPtr(base, dev + kDevVSConstants), ConstantBytes(vs_entry));
     const D3D12_GPU_VIRTUAL_ADDRESS psc_gpu = UploadConstants(GuestPtr(base, dev + kDevPSConstants), ps ? ConstantBytes(ps_entry) : 16);
     const Upload shared = Allocate(512);
@@ -6183,6 +6361,14 @@ namespace sst::native
         SetRTState(*depth_rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 
       const uint64_t pair = (uint64_t(color_rt->view + 1) << 32) | (depth_rt ? depth_rt->view + 1 : 0);
+
+      if (pair != pass_pair_)
+      {
+        const uint32_t rt0 = be32(base, dev + kDevRT0);
+        MarkPass(rt0, color_rt->width, color_rt->height, scene_surfaces_.count(rt0) ? 1 : shadow_surfaces_.count(rt0) ? 2
+                                                                                                                      : 0);
+        pass_pair_ = pair;
+      }
 
       if (pair != bound_targets_)
       {
@@ -6697,6 +6883,23 @@ namespace sst::native
                 "cached, {} not run; totals: {} vertices, {} elements, bad address {}, bad format "
                 "{}, out of range {}, fetch out of bounds {}, malformed {}, per-vertex {}",
                 s.memexport_draws, s.memexport_run, s.memexport_ms, s.memexport_ms / double(std::max<uint64_t>(1, frame - last_stats_frame_)), s.memexport_cached, s.memexport_failed, m.vertices, m.elements, m.bad_address, m.bad_format, m.out_of_range, m.fetch_oob, m.malformed, m.per_vertex_draws);
+
+    if (!memexport_costs_.empty())
+    {
+      std::vector<std::pair<uint64_t, MemexportShaderCost>> costs(memexport_costs_.begin(), memexport_costs_.end());
+      std::sort(costs.begin(), costs.end(), [](const auto &a, const auto &b)
+                { return a.second.ms > b.second.ms; });
+      std::string text;
+
+      for (size_t i = 0; i < costs.size() && i < 6; ++i)
+      {
+        const MemexportShaderCost &c = costs[i].second;
+        text += fmt::format(" {:016X}: {:.1f} ms, {} runs ({} cached), {:.0f} ns/vertex;", costs[i].first, c.ms, c.runs, c.cached, c.vertices ? 1e6 * c.ms / double(c.vertices) : 0.0);
+      }
+
+      REXLOG_INFO("[sst-native]   memexport by shader:{}", text);
+      memexport_costs_.clear();
+    }
 
     if (s.fetch_remapped)
       REXLOG_INFO("[sst-native]   draws whose inputs sat in other fetch slots (matched by "

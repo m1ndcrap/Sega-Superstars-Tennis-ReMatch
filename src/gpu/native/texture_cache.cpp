@@ -69,10 +69,23 @@ namespace sst::native
     {
       std::lock_guard lock(g_mutex);
       TextureEntry &e = g_textures[base_page];
-      const bool changing = e.range.changing;
+      const bool changing = e.range.changing, external = e.range.external;
       e.range = range;
       e.range.changing = changing;
+      e.range.external = external;
       Bump();
+    }
+
+    void ExternalTexture(uint32_t base_page, bool external)
+    {
+      std::lock_guard lock(g_mutex);
+      TextureEntry &e = g_textures[base_page]; // (also before the texture is ever loaded from guest memory)
+
+      if (e.range.external != external)
+      {
+        e.range.external = external;
+        Bump();
+      }
     }
 
     void TextureChanged(uint32_t base_page, uint64_t frame)
@@ -125,6 +138,33 @@ namespace sst::native
     }
 
     uint64_t Version() { return g_version.load(std::memory_order_acquire); }
+
+    namespace
+    {
+      std::mutex g_constant_mutex;
+      std::unordered_map<uint64_t, uint32_t> g_constant_use;
+      std::atomic<uint64_t> g_constant_version{0};
+    }
+
+    void ConstantUse(uint64_t key, uint32_t bytes)
+    {
+      std::lock_guard lock(g_constant_mutex);
+      uint32_t &b = g_constant_use[key];
+
+      if (bytes > b)
+      {
+        b = bytes;
+        g_constant_version.fetch_add(1, std::memory_order_release);
+      }
+    }
+
+    uint64_t ConstantUseVersion() { return g_constant_version.load(std::memory_order_acquire); }
+
+    void CopyConstantUse(std::unordered_map<uint64_t, uint32_t> &out)
+    {
+      std::lock_guard lock(g_constant_mutex);
+      out = g_constant_use;
+    }
 
     void Copy(Set &out)
     {
@@ -1039,6 +1079,30 @@ namespace sst::native
       ++stats_.checks_skipped;
     }
 
+    // The game thread hashed it at draw time (unchanged since its last copy): no need to read guest memory, which the game may already
+    // be rewriting for a later frame
+    if (t->checked_frame != frame_ && t->resident && !prompt_stale && !unchanged_.empty())
+    {
+      for (const auto &[page, h] : unchanged_)
+      {
+        if (page != t->key.base_page)
+          continue;
+
+        if (h == t->content_hash)
+        {
+          t->checked_frame = frame_;
+          ++t->stable_checks;
+          ++stats_.unchanged_hits;
+        }
+        else
+        {
+          ++stats_.unchanged_misses;
+        }
+
+        break;
+      }
+    }
+
     if (t->checked_frame != frame_)
     {
       t->checked_frame = frame_;
@@ -1131,6 +1195,7 @@ namespace sst::native
   {
     RemoveExternal(base_page);
     externals_[base_page].info = e;
+    guest_watch::ExternalTexture(base_page, true); // the game thread stops copying its guest memory for UI draws (3.6 MB a frame for the 1280x720 one)
   }
 
   void TextureCache::RemoveExternal(uint32_t base_page)
@@ -1139,6 +1204,8 @@ namespace sst::native
 
     if (it == externals_.end())
       return;
+
+    guest_watch::ExternalTexture(base_page, false);
 
     Deferred d;
     d.fence = frame_fence_;
@@ -1286,7 +1353,7 @@ namespace sst::native
   {
     return fmt::format("textures: {} live ({} MB), {} lookups, created {}, uploads {} (re-uploads {}) {:.1f} MB "
                        "in {:.1f} ms, hashed {:.1f} MB in {:.1f} ms, unsupported {}, bad {}, dimension "
-                       "mismatches {}, failed {}, evicted {}, loads deferred {}, checks skipped (stable) {}, loads from draw-time copies {}, resolved-texture reads {} (size mismatches {}), samplers {}{}{}",
-                       textures_.size(), total_bytes_ >> 20, stats_.lookups, stats_.created, stats_.uploads, stats_.reuploads, double(stats_.upload_bytes) / (1 << 20), stats_.upload_ms, double(stats_.hashed_bytes) / (1 << 20), stats_.hash_ms, stats_.unsupported, stats_.bad, stats_.dimension_mismatch, stats_.failed, stats_.evicted, stats_.deferred_loads, stats_.checks_skipped, stats_.from_snapshots, stats_.external_hits, stats_.external_mismatch, samplers_.size(), stats_.srv_full ? fmt::format(", SRV heap full x{}", stats_.srv_full) : std::string(), stats_.sampler_full ? fmt::format(", sampler heap full x{}", stats_.sampler_full) : std::string());
+                       "mismatches {}, failed {}, evicted {}, loads deferred {}, checks skipped (stable) {}, loads from draw-time copies {}, unchanged per the game thread {} (not matching {}), resolved-texture reads {} (size mismatches {}), samplers {}{}{}",
+                       textures_.size(), total_bytes_ >> 20, stats_.lookups, stats_.created, stats_.uploads, stats_.reuploads, double(stats_.upload_bytes) / (1 << 20), stats_.upload_ms, double(stats_.hashed_bytes) / (1 << 20), stats_.hash_ms, stats_.unsupported, stats_.bad, stats_.dimension_mismatch, stats_.failed, stats_.evicted, stats_.deferred_loads, stats_.checks_skipped, stats_.from_snapshots, stats_.unchanged_hits, stats_.unchanged_misses, stats_.external_hits, stats_.external_mismatch, samplers_.size(), stats_.srv_full ? fmt::format(", SRV heap full x{}", stats_.srv_full) : std::string(), stats_.sampler_full ? fmt::format(", sampler heap full x{}", stats_.sampler_full) : std::string());
   }
 }

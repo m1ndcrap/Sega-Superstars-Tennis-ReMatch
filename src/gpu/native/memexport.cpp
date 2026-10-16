@@ -73,6 +73,29 @@ namespace sst::native
 
     float Saturate(float v) { return std::min(1.0f, std::max(0.0f, v)); }
 
+    // Every write into a temp register goes through here: the values are stored with denormals flushed, which is what every read of
+    // them wants (FlushDenormal on read, as D3D9 / the Xenos ALU does), so unmodified operands can be read in place.
+    inline void StoreTemp(float *__restrict dst, const float *__restrict src, uint32_t n)
+    {
+      for (uint32_t l = 0; l < n; ++l)
+      {
+        const uint32_t bits = AsUint(src[l]);
+        const uint32_t keep = (bits & 0x7F800000u) ? 0xFFFFFFFFu : 0x80000000u;
+        dst[l] = AsFloat(bits & keep);
+      }
+    }
+
+    // Xbox 360 half (no inf / NaN: exponent 31 is an ordinary exponent) -> float bits; the same values as vertex_format's HalfToFloat
+    // table, computed (a 256 KB table costs a cache miss per lookup)
+    inline uint32_t HalfToFloatBits(uint32_t h)
+    {
+      const uint32_t sign = (h & 0x8000u) << 16, a = h & 0x7FFFu;
+      const uint32_t normal = (a << 13) + (112u << 23);
+      const uint32_t subnormal = AsUint(float(int32_t(a)) * 5.9604644775390625e-8f); // a * 2^-24, exact (also 0)
+      const uint32_t is_normal = 0u - uint32_t(a >= 0x400u);                           // mask, not a branch (zero halves are common)
+      return sign | (normal & is_normal) | (subnormal & ~is_normal);
+    }
+
     // Float -> IEEE half (round to nearest even), as Xenia's memexport does (standard half, not the Xbox extended range).
     uint16_t FloatToHalf(float value)
     {
@@ -109,6 +132,19 @@ namespace sst::native
         ++h;
 
       return uint16_t(sign | h);
+    }
+
+    template <uint32_t kEndian>
+    inline uint32_t Swap32T(uint32_t v)
+    {
+      if constexpr (kEndian == 1)
+        return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+      else if constexpr (kEndian == 2)
+        return __builtin_bswap32(v);
+      else if constexpr (kEndian == 3)
+        return (v << 16) | (v >> 16);
+      else
+        return v;
     }
 
     uint32_t Swap32(uint32_t v, uint32_t endian)
@@ -340,12 +376,17 @@ namespace sst::native
     }
 
     // Interpreter: executes a vertex shader for up to kLanes vertices at once ("lanes"): every instruction is decoded once and applied to all lanes. Control flow is shared by the lanes, which is exact when it doesn't depend on per-vertex state (the predicate, or a0-relative constants). Shaders that do are run with one lane per batch (see NeedsPerVertexFlow).
-    constexpr uint32_t kLanes = 64;
+    constexpr uint32_t kLanes = 128;
 
     using V = ucode::AluVectorOpcode;
     using S = ucode::AluScalarOpcode;
 
-    inline float Mul(float a, float b) { return (a && b) ? a * b : 0.0f; } // D3D9: 0 * x = +0
+    // D3D9: 0 * x = +0. Branch-free (the operands are zero often and unpredictably).
+    inline float Mul(float a, float b)
+    {
+      const uint32_t keep = 0u - uint32_t((a != 0.0f) & (b != 0.0f));
+      return AsFloat(AsUint(a * b) & keep);
+    }
 
     // One lane of a vector operation. Returns true if the result is replicated from x.
     inline bool VectorOp(V op, const float (&o)[3][4], float r[4], bool &pred, int32_t &a0)
@@ -844,7 +885,9 @@ namespace sst::native
 
               use(f.dest(), f.is_dest_relative());
               const auto &v = *reinterpret_cast<const ucode::VertexFetchInstruction *>(ins);
-              use(v.src(), v.is_src_relative());
+
+              if (!v.is_mini_fetch()) // a mini fetch's src field is unused (it reuses the full fetch's address)
+                use(v.src(), v.is_src_relative());
             }
             else
             {
@@ -855,17 +898,29 @@ namespace sst::native
 
               // (a0-relative constants are fine: operands are gathered per lane.)
               // (Exports write export registers, not temps - also the scalar result: counting e62 here made every batch clear 64 registers.)
+              // Only registers actually written (non-zero write mask) or read (operands the opcodes use) count: unused fields hold
+              // arbitrary register numbers (a retain_prev scalar dest of r63 made every batch clear all 64 registers).
+              const ucode::AluVectorOpcodeInfo &vinfo = ucode::GetAluVectorOpcodeInfo(a.vector_opcode());
+              const ucode::AluScalarOpcodeInfo &sinfo = ucode::GetAluScalarOpcodeInfo(a.scalar_opcode());
+
               if (!a.is_export())
               {
-                use(a.vector_dest(), a.is_vector_dest_relative());
-                use(a.scalar_dest(), a.is_scalar_dest_relative());
+                if (a.GetVectorOpResultWriteMask())
+                  use(a.vector_dest(), a.is_vector_dest_relative());
+
+                if (a.GetScalarOpResultWriteMask())
+                  use(a.scalar_dest(), a.is_scalar_dest_relative());
               }
 
-              for (uint32_t s = 1; s <= 3; ++s)
-                if (a.src_is_temp(s))
+              for (uint32_t s = 1; s <= 2; ++s)
+                if (vinfo.operand_components_used[s - 1] && a.src_is_temp(s))
                   use(ucode::AluInstruction::src_temp_reg(a.src_reg(s)), ucode::AluInstruction::is_src_temp_relative(a.src_reg(s)));
 
-              if (ucode::GetAluScalarOpcodeInfo(a.scalar_opcode()).operand_count == 2)
+              // src3: the vector op's third operand, or the scalar op's operand
+              if ((vinfo.operand_components_used[2] || (a.scalar_opcode() != S::kRetainPrev && sinfo.operand_count == 1)) && a.src_is_temp(3))
+                use(ucode::AluInstruction::src_temp_reg(a.src_reg(3)), ucode::AluInstruction::is_src_temp_relative(a.src_reg(3)));
+
+              if (sinfo.operand_count == 2)
                 use(a.scalar_const_reg_op_src_temp_reg(), false);
             }
           }
@@ -1194,8 +1249,15 @@ namespace sst::native
       float sr[kLanes];
 
       // Gathers source operand `src` (1-3) of every lane into out[comp][lane], components in the order given by `comps` (already swizzled by the caller when it needs a subset).
-      auto gather = [&](uint32_t src, bool scalar_const_op, float (*out)[kLanes], const uint32_t *comps, uint32_t ncomps, uint32_t need = 0xF)
+      // With `ptrs`: ptrs[comp] points at the values - straight at the temp register when the operand has no modifiers (temps are stored
+      // with denormals already flushed, see StoreTemp), else at out[comp].
+      auto gather = [&](uint32_t src, bool scalar_const_op, float (*out)[kLanes], const uint32_t *comps, uint32_t ncomps, uint32_t need = 0xF, const float **ptrs = nullptr)
       {
+        if (ptrs)
+          for (uint32_t j = 0; j < ncomps; ++j)
+            ptrs[j] = out[j];
+
+        const uint32_t L = lanes_; // (a local here: through the capture the compiler can't rule out aliasing, which blocks vectorizing)
         const uint32_t reg = instr.src_reg(src);
         const uint32_t neg = uint32_t(instr.src_negate(src)) << 31;
 
@@ -1213,8 +1275,17 @@ namespace sst::native
 
             const float *p = T(t, comps[j]);
 
+            if (ptrs && !absolute && !neg)
+            {
+              ptrs[j] = p;
+              continue;
+            }
+
+            float *o = out[j];
+
+            // Abs and negate (the stored value is already denormal-flushed), branch-free (vectorizes)
             for (uint32_t l = 0; l < L; ++l)
-              out[j][l] = AsFloat((AsUint(FlushDenormal(p[l])) & abs_mask) ^ neg);
+              o[l] = AsFloat((AsUint(p[l]) & abs_mask) ^ neg);
           }
 
           return;
@@ -1257,6 +1328,7 @@ namespace sst::native
         const bool componentwise = !vinfo.changed_state && (vop == V::kAdd || vop == V::kMul || vop == V::kMad || vop == V::kMax || vop == V::kMin);
         const uint32_t need = componentwise ? vmask : 0xF;
         float ops[3][4][kLanes];
+        const float *in[3][4] = {};
 
         for (uint32_t i = 0; i < 3; ++i)
         {
@@ -1269,7 +1341,7 @@ namespace sst::native
           for (uint32_t j = 0; j < 4; ++j)
             comps[j] = ucode::AluInstruction::GetSwizzledComponentIndex(swz, j);
 
-          gather(1 + i, false, ops[i], comps, 4, need);
+          gather(1 + i, false, ops[i], comps, 4, need, componentwise ? in[i] : nullptr);
         }
 
         if (componentwise)
@@ -1279,7 +1351,7 @@ namespace sst::native
             if (!((vmask >> j) & 1))
               continue;
 
-            const float *a = ops[0][j], *b = ops[1][j], *c = ops[2][j];
+            const float *a = in[0][j], *b = in[1][j], *c = in[2][j];
             float *r = vr[j];
 
             switch (vop)
@@ -1374,15 +1446,23 @@ namespace sst::native
         }
       }
 
-      for (uint32_t l = 0; l < L; ++l)
-        sr[l] = instr.scalar_clamp() ? Saturate(ps_[l]) : ps_[l];
+      const uint32_t smask = instr.GetScalarOpResultWriteMask();
+
+      // (The scalar result is only read when written somewhere.)
+      if (smask)
+      {
+        if (instr.scalar_clamp())
+          for (uint32_t l = 0; l < L; ++l)
+            sr[l] = Saturate(ps_[l]);
+        else
+          std::memcpy(sr, ps_, L * sizeof(float));
+      }
 
       if (instr.vector_clamp())
         for (uint32_t j = 0; j < 4; ++j)
-          for (uint32_t l = 0; l < L; ++l)
-            vr[j][l] = Saturate(vr[j][l]);
-
-      const uint32_t smask = instr.GetScalarOpResultWriteMask();
+          if ((vmask >> j) & 1)
+            for (uint32_t l = 0; l < L; ++l)
+              vr[j][l] = Saturate(vr[j][l]);
 
       if (instr.is_export())
       {
@@ -1451,7 +1531,7 @@ namespace sst::native
 
         for (uint32_t j = 0; j < 4; ++j)
           if (vmask & (1u << j))
-            std::memcpy(T(t, j), vr[j], L * sizeof(float));
+            StoreTemp(T(t, j), vr[j], L);
       }
 
       if (smask)
@@ -1460,7 +1540,7 @@ namespace sst::native
 
         for (uint32_t j = 0; j < 4; ++j)
           if (smask & (1u << j))
-            std::memcpy(T(t, j), sr, L * sizeof(float));
+            StoreTemp(T(t, j), sr, L);
       }
     }
 
@@ -1474,7 +1554,7 @@ namespace sst::native
         const uint32_t s = (swizzle >> (3 * j)) & 7;
 
         if (s <= 3)
-          std::memcpy(d, value[s], lanes_ * sizeof(float));
+          StoreTemp(d, value[s], lanes_);
         else if (s == 5)
           std::fill(d, d + lanes_, 1.0f);
         else if (s != 7) // 7 = keep; 4 (and the invalid 6) = 0
@@ -1532,8 +1612,8 @@ namespace sst::native
       e.out = FetchElement::Out::kFloat;
       const uint32_t bytes = DeclFormatSize(e.format);
 
-      // 32-bit float formats: plain swapped dwords (the common case here).
-      uint32_t float_words = 0;
+      // 32-bit float formats: plain swapped dwords (the common case here). Half-float formats: halves through DecodeElement's table.
+      uint32_t float_words = 0, half_words = 0;
 
       if (!e.exp_adjust)
       {
@@ -1555,13 +1635,119 @@ namespace sst::native
           float_words = 4;
           break;
 
+        case 31: // k_16_16_FLOAT
+          half_words = 1;
+          break;
+
+        case 32: // k_16_16_16_16_FLOAT
+          half_words = 2;
+          break;
+
         default:
           break;
         }
       }
 
+
+
       const bool valid = bytes && (override || (fc0 & 3) == 3);
       float result[4][kLanes];
+
+      // Float / half-float formats: one tight loop per endian mode
+      if (valid && (float_words || half_words))
+      {
+        const uint32_t rows = float_words ? float_words : 2 * half_words;
+        const int32_t offset = instr.offset();
+
+        for (uint32_t j = rows; j < 4; ++j)
+          std::memset(result[j], 0, L * sizeof(float));
+
+        // Per lane: the element's address, or (out of bounds) a zero element - no branches in the loop
+        static const uint8_t kZeroElement[16] = {};
+        const uint64_t limit = override ? buffer_end : std::min<uint64_t>(buffer_end, kGuestPhysicalSize);
+        uint64_t oob = 0;
+
+        // Two passes: the (scattered) loads per lane, then the swap and conversion over whole rows, which vectorizes
+        auto run = [&]<uint32_t kEndian, uint32_t kWords, bool kHalf>()
+        {
+          alignas(16) uint32_t raw[kWords][kLanes];
+
+          for (uint32_t l = 0; l < L; ++l)
+          {
+            const uint64_t first = uint64_t(uint32_t(int32_t(vfetch_address_[l]) + offset)) * 4;
+            const bool ok = first >= buffer_begin && first + bytes <= limit;
+            oob += !ok;
+            const uint8_t *p = ok ? source + first : kZeroElement;
+
+            for (uint32_t k = 0; k < kWords; ++k)
+              std::memcpy(&raw[k][l], p + 4 * k, 4);
+          }
+
+          for (uint32_t k = 0; k < kWords; ++k)
+          {
+            const uint32_t *in = raw[k];
+
+            if constexpr (kHalf)
+            {
+              float *lo = result[2 * k], *hi = result[2 * k + 1];
+
+              for (uint32_t l = 0; l < L; ++l)
+              {
+                const uint32_t v = Swap32T<kEndian>(in[l]);
+                lo[l] = AsFloat(HalfToFloatBits(v & 0xFFFF));
+                hi[l] = AsFloat(HalfToFloatBits(v >> 16));
+              }
+            }
+            else
+            {
+              float *out = result[k];
+
+              for (uint32_t l = 0; l < L; ++l)
+                out[l] = AsFloat(Swap32T<kEndian>(in[l]));
+            }
+          }
+        };
+
+        auto by_format = [&]<uint32_t kEndian>()
+        {
+          if (half_words == 1)
+            run.template operator()<kEndian, 1, true>();
+          else if (half_words == 2)
+            run.template operator()<kEndian, 2, true>();
+          else if (float_words == 1)
+            run.template operator()<kEndian, 1, false>();
+          else if (float_words == 2)
+            run.template operator()<kEndian, 2, false>();
+          else if (float_words == 3)
+            run.template operator()<kEndian, 3, false>();
+          else
+            run.template operator()<kEndian, 4, false>();
+        };
+
+        switch (endian)
+        {
+        case 0:
+          by_format.template operator()<0>();
+          break;
+
+        case 1:
+          by_format.template operator()<1>();
+          break;
+
+        case 2:
+          by_format.template operator()<2>();
+          break;
+
+        default:
+          by_format.template operator()<3>();
+          break;
+        }
+
+        stats_->fetch_oob += oob;
+
+        StoreFetch(instr.dest(), instr.is_dest_relative(), instr.dest_swizzle(), result);
+        return;
+      }
 
       for (uint32_t l = 0; l < L; ++l)
       {
@@ -1579,6 +1765,17 @@ namespace sst::native
               uint32_t v;
               std::memcpy(&v, p + 4 * w, 4);
               out[w] = Swap32(v, endian);
+            }
+          }
+          else if (half_words)
+          {
+            for (uint32_t w = 0; w < half_words; ++w)
+            {
+              uint32_t v;
+              std::memcpy(&v, p + 4 * w, 4);
+              v = Swap32(v, endian);
+              out[2 * w] = HalfToFloatBits(v & 0xFFFF);
+              out[2 * w + 1] = HalfToFloatBits(v >> 16);
             }
           }
           else
@@ -1612,6 +1809,106 @@ namespace sst::native
         return;
       }
 
+      uint64_t elements = 0, bad_address = 0, out_of_range = 0, bad_format = 0;
+      uint32_t last_format = stats_->last_format, last_base = stats_->last_base, last_count = stats_->last_count;
+
+      // Fast path, the usual case: eA = stream constant + index * (0, 1, 0, 0), the same stream in every lane, a 32-bit float format.
+      // Then only the index differs per lane; the results are the same as the general loop below.
+      {
+        const uint32_t L = lanes_;
+        const uint32_t a0 = address_[0][0], a2 = address_[2][0], a3 = address_[3][0];
+        uint32_t differ = 0;
+
+        for (uint32_t l = 1; l < L; ++l)
+          differ |= (address_[0][l] ^ a0) | (address_[2][l] ^ a2) | (address_[3][l] ^ a3);
+
+        const uint32_t format = (a2 >> 8) & 0x3F, endian = a2 & 7;
+
+        if (!differ && (a0 >> 30) == 1 && (a2 >> 23) == 0x96 && (a3 >> 23) == 0x96 && (format == 36 || format == 37 || format == 38) && endian <= 3 && !((a2 >> 19) & 1))
+        {
+          const uint32_t n = format == 36 ? 1 : format == 37 ? 2 : 4;
+          const uint32_t count = a3 & 0x7FFFFF, base = a0 << 2;
+
+          auto write = [&]<uint32_t kEndian, uint32_t kN>()
+          {
+            for (uint32_t l = 0; l < L; ++l)
+            {
+              const uint32_t a1 = address_[1][l];
+
+              if ((a1 >> 23) != 0x96)
+              {
+                ++bad_address;
+                continue;
+              }
+
+              const uint32_t index = a1 & 0x7FFFFF;
+              last_format = format;
+              last_base = base;
+              last_count = count;
+
+              for (uint32_t k = 0; k < 5; ++k)
+              {
+                if (!((written >> k) & 1) || index + k >= count)
+                  continue;
+
+                const uint64_t address = uint64_t(base) + uint64_t(index + k) * 4 * kN;
+
+                if (address + 4 * kN > kGuestPhysicalSize)
+                {
+                  ++out_of_range;
+                  continue;
+                }
+
+                uint32_t v[kN];
+
+                for (uint32_t j = 0; j < kN; ++j)
+                  v[j] = Swap32T<kEndian>(AsUint(data_[k][j][l]));
+
+                std::memcpy(membase_ + address, v, 4 * kN);
+                ++elements;
+              }
+            }
+          };
+
+          auto by_n = [&]<uint32_t kEndian>()
+          {
+            if (n == 1)
+              write.template operator()<kEndian, 1>();
+            else if (n == 2)
+              write.template operator()<kEndian, 2>();
+            else
+              write.template operator()<kEndian, 4>();
+          };
+
+          switch (endian)
+          {
+          case 0:
+            by_n.template operator()<0>();
+            break;
+
+          case 1:
+            by_n.template operator()<1>();
+            break;
+
+          case 2:
+            by_n.template operator()<2>();
+            break;
+
+          default:
+            by_n.template operator()<3>();
+            break;
+          }
+
+          stats_->elements += elements;
+          stats_->bad_address += bad_address;
+          stats_->out_of_range += out_of_range;
+          stats_->last_format = last_format;
+          stats_->last_base = last_base;
+          stats_->last_count = last_count;
+          return;
+        }
+      }
+
       for (uint32_t l = 0; l < lanes_; ++l)
       {
         const uint32_t eA[4] = {address_[0][l], address_[1][l], address_[2][l], address_[3][l]};
@@ -1619,7 +1916,7 @@ namespace sst::native
         // eA = stream constant + index * (0, 1, 0, 0): marker bits as Xenia checks.
         if ((eA[0] >> 30) != 1 || (eA[1] >> 23) != 0x96 || (eA[2] >> 23) != 0x96 || (eA[3] >> 23) != 0x96)
         {
-          ++stats_->bad_address;
+          ++bad_address;
           continue;
         }
 
@@ -1628,9 +1925,9 @@ namespace sst::native
         const uint32_t count = eA[3] & 0x7FFFFF;
         const uint32_t base = eA[0] << 2; // dwords -> bytes, drops the marker bits
         const uint32_t endian = format_info & 7;
-        stats_->last_format = (format_info >> 8) & 0x3F;
-        stats_->last_base = base;
-        stats_->last_count = count;
+        last_format = (format_info >> 8) & 0x3F;
+        last_base = base;
+        last_count = count;
         const uint32_t format = (format_info >> 8) & 0x3F;
         const bool swap_rb = (format_info >> 19) & 1;
 
@@ -1649,7 +1946,7 @@ namespace sst::native
 
             if (address + 4 * n > kGuestPhysicalSize)
             {
-              ++stats_->out_of_range;
+              ++out_of_range;
               continue;
             }
 
@@ -1661,7 +1958,7 @@ namespace sst::native
               std::memcpy(dst + 4 * j, &v, 4);
             }
 
-            ++stats_->elements;
+            ++elements;
           }
 
           continue;
@@ -1678,7 +1975,7 @@ namespace sst::native
 
           if (!size)
           {
-            ++stats_->bad_format;
+            ++bad_format;
             continue;
           }
 
@@ -1686,7 +1983,7 @@ namespace sst::native
 
           if (address + size > kGuestPhysicalSize)
           {
-            ++stats_->out_of_range;
+            ++out_of_range;
             continue;
           }
 
@@ -1694,9 +1991,17 @@ namespace sst::native
 
           // Little-endian dwords = guest byte order; 8 / 16-bit elements take the low bytes of the swapped dword (as Xenia replaces bytes in place).
           std::memcpy(membase_ + address, packed, size);
-          ++stats_->elements;
+          ++elements;
         }
       }
+
+      stats_->elements += elements;
+      stats_->bad_address += bad_address;
+      stats_->out_of_range += out_of_range;
+      stats_->bad_format += bad_format;
+      stats_->last_format = last_format;
+      stats_->last_base = last_base;
+      stats_->last_count = last_count;
     }
 
   }

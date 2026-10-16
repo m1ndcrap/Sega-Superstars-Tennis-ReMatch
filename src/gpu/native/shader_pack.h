@@ -23,6 +23,9 @@ namespace sst::native::pack
   // (not the cause of the Intel hangs after all); 14: cube map directions in two named fields, not a dynamically indexed array (scratch
   // memory, which hung Intel GPUs in the loop-form character lighting shaders)
   inline constexpr uint32_t kCacheVersion = 14;
+  // SHADER PRECISION: FAST (plain multiplies, see SST_FAST_MATH in shader_recompiler.cpp) has its own pack and version, so the two never mix
+  inline constexpr uint32_t kCacheVersionFast = kCacheVersion + 1000;
+  inline constexpr uint32_t CacheVersion(bool fast) { return fast ? kCacheVersionFast : kCacheVersion; }
 
   // DXC arguments for every translated shader (after "-T <profile>")
   inline constexpr const wchar_t *kDxcArgs[] = {
@@ -33,6 +36,11 @@ namespace sst::native::pack
       L"-Qstrip_reflect",
       L"-Qstrip_debug",
   };
+  // Added after kDxcArgs for SHADER PRECISION: FAST
+  inline constexpr const wchar_t *kFastMathArg = L"-DSST_FAST_MATH";
+  // Embedded resource names (RCDATA)
+  inline constexpr const wchar_t *kResourceName = L"SST_SHADER_PACK";
+  inline constexpr const wchar_t *kResourceNameFast = L"SST_SHADER_PACK_FAST";
 
   // Spec-constant bits the renderer can request at draw time (renderer.cpp, Draw: vs_spec is always 0, ps_spec may set kSpecAlphaTest).
   // The baker compiles every subset of (shader's spec mask & these bits). Keep in sync with the renderer.
@@ -87,8 +95,8 @@ namespace sst::native::pack
   class View
   {
   public:
-    // Returns false (and stays empty) if the data isn't a valid pack for this build's cache version
-    bool Open(const void *data, size_t size)
+    // Returns false (and stays empty) if the data isn't a valid pack with cache version `version`
+    bool Open(const void *data, size_t size, uint32_t version = kCacheVersion)
     {
       data_ = nullptr;
       count_ = 0;
@@ -99,7 +107,7 @@ namespace sst::native::pack
       Header h;
       std::memcpy(&h, data, sizeof(h));
 
-      if (h.magic != kMagic || h.format != kFormat || h.cache_version != kCacheVersion || size < sizeof(Header) + size_t(h.count) * sizeof(Entry))
+      if (h.magic != kMagic || h.format != kFormat || h.cache_version != version || size < sizeof(Header) + size_t(h.count) * sizeof(Entry))
         return false;
 
       const auto *entries = reinterpret_cast<const Entry *>(static_cast<const uint8_t *>(data) + sizeof(Header));

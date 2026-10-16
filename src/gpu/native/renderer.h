@@ -98,6 +98,8 @@ namespace sst::native
     void EndFrame(); // Swap
     // Game-thread copies of volatile texture data for this frame (native.cpp): physical [begin, end). Dropped at EndFrame
     void AddTextureSnapshot(uint32_t begin, uint32_t end, const uint8_t *data);
+    // This draw's texture at physical page `base_page` wasn't copied: the game thread found its content unchanged since its last copy (hash)
+    void AddTextureUnchanged(uint32_t base_page, uint64_t hash);
     // Game-thread copies of the next draw's small vertex buffers (native.cpp): physical [begin, end), whole buffers. The game rewrites
     // small UI vertex buffers between draws; read live a frame later they hold another sprite's quad. Set before Draw, cleared by it
     struct GuestCopy
@@ -214,6 +216,26 @@ namespace sst::native
     const GuestCopy *draw_vertex_copies_ = nullptr;
     uint32_t draw_vertex_copy_count_ = 0;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamps_;
+    // GPU time per render-target pass (perf line "GPU by pass"): a timestamp at each target switch, labelled with the target
+    static constexpr uint32_t kPassMarks = 512;
+    struct PassMark
+    {
+      uint32_t rt;         // guest surface object (0: frame start / present)
+      uint16_t w, h;       // host size
+      uint8_t kind;        // 0 other, 1 3D scene, 2 shadow map, 3 frame start, 4 present
+    };
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> pass_ts_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> pass_readback_;
+    std::array<std::vector<PassMark>, kSlots> pass_marks_;
+    uint64_t pass_pair_ = 0;
+    struct PassCost
+    {
+      double ms = 0;
+      uint64_t passes = 0;
+    };
+    std::unordered_map<uint64_t, PassCost> pass_costs_;
+    uint64_t pass_frames_ = 0;
+    void MarkPass(uint32_t rt, uint32_t w, uint32_t h, uint8_t kind);
     Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback_;
     uint64_t timestamp_frequency_ = 0;
     std::array<bool, kSlots> timestamp_pending_{};
@@ -478,6 +500,13 @@ namespace sst::native
     };
 
     std::unordered_map<uint64_t, MemexportCacheEntry> memexport_cache_;
+    std::unordered_map<uint64_t, uint32_t> memexport_dumped_; // --sst_native_memexport_dump: runs written per shader
+    struct MemexportShaderCost
+    {
+      uint64_t runs = 0, cached = 0, vertices = 0;
+      double ms = 0;
+    };
+    std::unordered_map<uint64_t, MemexportShaderCost> memexport_costs_; // per shader, this logging period
     std::vector<uint32_t> memexport_ucode_, memexport_indices_;
     std::vector<float> memexport_constants_;
 
