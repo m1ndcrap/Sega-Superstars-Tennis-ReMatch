@@ -2,7 +2,7 @@
 
 Source: https://github.com/hedge-dev/XenosRecomp at 990d03b28a27b50277ee5d8d942e1c5f873869d1 (MIT, see LICENSE.md).
 
-Only the Xenos microcode -> HLSL translator is used (`shader_recompiler.*`, `shader*.h`, `constant_table.h`, `shader_common.h`). The tool's `main.cpp`, DXC wrapper and cache writer are not used: sst_rematch translates and compiles at runtime (src/gpu/native/shader_cache.cpp), with DXC loaded from `dxcompiler.dll`.
+Only the Xenos microcode -> HLSL translator is used (`shader_recompiler.*`, `shader*.h`, `constant_table.h`, `shader_common.h`). The tool's `main.cpp`, DXC wrapper and cache writer are not used. sst_rematch translates and compiles the game's shaders at build time (`tools/shader_bake`, embedded in the exe as a pack) and any others at runtime (src/gpu/native/shader_cache.cpp), with DXC loaded from `dxcompiler.dll` in both cases.
 
 Local changes (built with `SST_RECOMP`, same as `xenosrecomp-sst.patch` in the repo root):
 
@@ -12,6 +12,7 @@ Local changes (built with `SST_RECOMP`, same as `xenosrecomp-sst.patch` in the r
 - `shader_common.h`: `getTexture3DDimensions` / `getWeights3D` for 3D-texture fetches.
 - `shader_recompiler.cpp` / `shader_common.h`: 3D fetches keep their texel offsets (`tfetch3D(..., float3 offset)`, `getWeights3D(..., float3 offset)`). Upstream only passed offsets for 2D fetches; the game's shadow lookups take four taps at ±0.5 texel on a stacked 3D shadow map (soft edges), which all landed on the same texel without them.
 - `shader_recompiler.cpp` / `shader_common.h`: the pixel shader screen position (`vPos` parameter) is divided by the internal resolution scale (`g_InvRenderScale`, shared constants c17.z), so screen-space shaders see guest pixels at any resolution.
+- `shader_recompiler.cpp`: shaders with backward or unconditional jumps (the `while (true)` form) use an if-chain (`if (pc <= N)`) instead of a `switch` with fall-through cases, and their alpha test runs once after the loop instead of at each exit inside it. Intel GPUs drew these shaders (mostly the character materials the game generates at runtime) wrong.
 - `sst_prefix.h`: replaces upstream `pch.h` (standard library + fmt + `byteSwap` / `be<T>` only).
 
 `shader_common.h` is also the HLSL prelude for every translated shader; CMake embeds it into the exe.

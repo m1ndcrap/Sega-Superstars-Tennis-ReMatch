@@ -1,6 +1,8 @@
 // sst_rematch - native renderer: D3D12 frame recording and draws
 
 #include "gpu/native/renderer.h"
+#include "gpu/native/guest_memory.h"
+#include "gpu/d3d12_setup.h"
 
 #include "gpu/native/shader_cache.h"
 #include "gpu/native/texture_cache.h"
@@ -28,6 +30,7 @@
 #include <cfloat>
 #include <chrono>
 #include <thread>
+#include <unordered_set>
 #include <cmath>
 #include <cstring>
 
@@ -99,6 +102,25 @@ REXCVAR_DEFINE_BOOL(sst_native_check_vs, false, "SST",
 REXCVAR_DEFINE_BOOL(sst_native_check_vs_all, false, "SST",
                     "Native renderer debug: like sst_native_check_vs for every draw (slow)");
 
+REXCVAR_DEFINE_BOOL(sst_native_depth_flip_vs, true, "SST",
+                    "Native renderer: flip the game's reversed depth in the vertex shader (z = w - z) instead of with an "
+                    "inverted viewport depth range, which loses small depth gaps on Intel GPUs (eyes, moustaches, decals)");
+
+REXCVAR_DEFINE_STRING(sst_native_trace_vs, "", "SST",
+                      "Native renderer debug: log the state of draws with this vertex shader hash (16 hex digits): vertex "
+                      "streams, decoded vertices, textures (first 40)");
+
+REXCVAR_DEFINE_STRING(sst_native_skip_vs, "", "SST",
+                      "Native renderer debug: skip draws with this vertex shader hash (16 hex digits)");
+
+REXCVAR_DEFINE_BOOL(sst_native_debug_markers, false, "SST",
+                    "Native renderer debug: label every draw for RenderDoc / PIX (shader hashes, depth / colour state)");
+
+REXCVAR_DEFINE_BOOL(sst_native_debug_bisect, false, "SST",
+                    "Native renderer debug: find the pixel shader that draws something wrong. Home = start (takes "
+                    "the pixel shaders drawn since the last stop; half of them are hidden), Page Up = the problem is still "
+                    "visible, Page Down = the problem is gone, End = stop. Each step is logged");
+
 REXCVAR_DEFINE_BOOL(sst_native_skip_blended, false, "SST",
                     "Native renderer debug: skip alpha-blended draws (effects, glows, light "
                     "beams), which look like solid white shapes until textures are emulated");
@@ -143,6 +165,77 @@ REXCVAR_DEFINE_STRING(sst_native_rt, "auto", "SST",
 
 namespace sst::native
 {
+  namespace
+  {
+    // --sst_native_debug_bisect (render thread only): halves the candidate pixel shaders on each key press
+    struct ShaderBisect
+    {
+      std::unordered_set<uint64_t> recent; // pixel shaders drawn since the last start
+      std::vector<uint64_t> candidates;    // sorted; the first `hidden` are skipped
+      size_t hidden = 0;
+      bool active = false;
+
+      bool Hidden(uint64_t ps) const
+      {
+        return active && std::binary_search(candidates.begin(), candidates.begin() + ptrdiff_t(hidden), ps);
+      }
+
+      void Log(const char *what) const
+      {
+        std::string list;
+
+        for (size_t i = 0; i < candidates.size() && i < 64; ++i)
+          list += fmt::format(" {:016X}{}", candidates[i], i < hidden ? "*" : "");
+
+        REXLOG_INFO("[sst-bisect] {}: {} candidate pixel shaders, {} hidden (*):{}", what, candidates.size(), hidden, list);
+
+        if (candidates.size() == 1)
+          REXLOG_INFO("[sst-bisect] FOUND: pixel shader {:016X}", candidates[0]);
+      }
+
+      void Split() { hidden = candidates.size() > 1 ? candidates.size() / 2 : candidates.size(); }
+
+      void Poll()
+      {
+        if (!REXCVAR_GET(sst_native_debug_bisect))
+          return;
+
+        if (GetAsyncKeyState(VK_HOME) & 1)
+        {
+          candidates.assign(recent.begin(), recent.end());
+          std::sort(candidates.begin(), candidates.end());
+          active = !candidates.empty();
+          Split();
+          Log("start");
+        }
+        else if (active && (GetAsyncKeyState(VK_PRIOR) & 1))
+        { // still visible: the culprit is among the shown ones
+          candidates.erase(candidates.begin(), candidates.begin() + ptrdiff_t(hidden));
+          Split();
+          Log("still visible");
+        }
+        else if (active && (GetAsyncKeyState(VK_NEXT) & 1))
+        { // gone: the culprit is among the hidden ones
+          candidates.resize(hidden);
+          Split();
+          Log("gone");
+        }
+        else if (GetAsyncKeyState(VK_END) & 1)
+        {
+          active = false;
+          recent.clear();
+          REXLOG_INFO("[sst-bisect] stopped");
+        }
+      }
+    };
+
+    ShaderBisect &Bisect()
+    {
+      static ShaderBisect b;
+      return b;
+    }
+  }
+
   using Microsoft::WRL::ComPtr;
   using rex::ui::d3d12::D3D12Presenter;
   using rex::ui::d3d12::D3D12Provider;
@@ -733,6 +826,12 @@ namespace sst::native
     }
 
     device_ = provider.GetDevice();
+    {
+      static Renderer *diagnostics = nullptr;
+      diagnostics = this;
+      sst::gpu::SetDiagnosticsDevice(device_, [](uint64_t frame, uint32_t draw)
+                                     { return diagnostics ? diagnostics->DrawLabel(frame, draw) : std::string(); });
+    }
     shaders_ = shaders;
     width_ = width;
     height_ = height;
@@ -1170,6 +1269,8 @@ namespace sst::native
         return {};
       }
 
+      p.resource->SetName(L"sst upload page");
+
       p.resource->Map(0, nullptr, reinterpret_cast<void **>(&p.cpu));
       p.gpu = p.resource->GetGPUVirtualAddress();
       f.pages.push_back(std::move(p));
@@ -1359,6 +1460,11 @@ namespace sst::native
 
       return nullptr;
     }
+
+    {
+      const std::string name = fmt::format("sst {} target {:08X} {}x{}", depth ? "depth" : "colour", surface, rt.width, rt.height);
+      rt.resource->SetName(std::wstring(name.begin(), name.end()).c_str());
+    }
     // Views: reuse the slots of the target being replaced
     if (it != map.end())
     {
@@ -1462,6 +1568,11 @@ namespace sst::native
 
       resolved_.erase(page);
       return nullptr;
+    }
+
+    {
+      const std::string name = fmt::format("sst resolve texture {:08X} {}x{}x{}", page << 12, width, height, slices);
+      t->resource->SetName(std::wstring(name.begin(), name.end()).c_str());
     }
     // Views: one RTV per slice, an identity SRV (presenting). Reuse slots
     if (it != resolved_.end())
@@ -1767,6 +1878,7 @@ namespace sst::native
     list_->RSSetViewports(1, &vp);
     list_->RSSetScissorRects(1, &dst);
     list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    NoteDraw(0, 1);
     list_->DrawInstanced(3, 1, 0, 0);
     RestoreDrawState();
   }
@@ -1871,6 +1983,7 @@ namespace sst::native
     list_->RSSetViewports(1, &vp);
     list_->RSSetScissorRects(1, &box);
     list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    NoteDraw(0, 1);
     list_->DrawInstanced(3, 1, 0, 0);
     RestoreDrawState();
   }
@@ -2261,6 +2374,8 @@ namespace sst::native
         REXLOG_WARN("[sst-native] geometry cache: could not allocate {} MB", geo_pool_size_ >> 20);
         return false;
       }
+
+      geo_pool_->SetName(L"sst geometry cache");
 
       geo_state_ = D3D12_RESOURCE_STATE_COMMON;
       REXLOG_INFO("[sst-native] geometry cache: {} MB of video memory", geo_pool_size_ >> 20);
@@ -2738,6 +2853,13 @@ namespace sst::native
     f.page = 0;
     f.offset = 0;
     list_->Reset(f.allocator.Get(), nullptr);
+    {
+      DrawLabels &labels = draw_labels_[(submitted_ + 1) % std::size(draw_labels_)];
+      labels.frame = submitted_ + 1;
+      labels.draws.clear();
+      const std::wstring name = L"sst frame " + std::to_wstring(labels.frame);
+      list_->SetName(name.c_str());
+    }
 
     if (timestamps_)
       list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * frame_res_);
@@ -2778,6 +2900,34 @@ namespace sst::native
     const D3D12_RECT scissor = Scaled({0, 0, LONG(width_), LONG(height_)}, output_scale_[target_]);
     list_->RSSetScissorRects(1, &scissor);
     recording_ = true;
+  }
+
+  void Renderer::NoteDraw(uint64_t vs, uint64_t ps)
+  {
+    draw_labels_[(submitted_ + 1) % std::size(draw_labels_)].draws.emplace_back(vs, ps);
+  }
+
+  std::string Renderer::DrawLabel(uint64_t frame, uint32_t draw) const
+  {
+    for (const DrawLabels &l : draw_labels_)
+    {
+      if (l.frame != frame)
+        continue;
+
+      if (draw >= l.draws.size())
+        return fmt::format("draw {} of frame {} (not recorded)", draw, frame);
+
+      const auto &[vs, ps] = l.draws[draw];
+      return vs ? fmt::format("draw {}: vs {:016X} ps {:016X}", draw, vs, ps) : fmt::format("draw {}: renderer's own pass {}", draw, ps);
+    }
+
+    return fmt::format("draw {} of frame {} (labels gone)", draw, frame);
+  }
+
+  void Renderer::AddTextureSnapshot(uint32_t begin, uint32_t end, const uint8_t *data)
+  {
+    if (textures_)
+      textures_->AddSnapshot(begin, end, data);
   }
 
   void Renderer::EndFrame()
@@ -2845,6 +2995,9 @@ namespace sst::native
     queue->ExecuteCommandLists(1, lists);
     queue->Signal(fence_.Get(), ++fence_value_);
     frames_[frame_res_].fence_value = fence_value_;
+
+    if (sst::gpu::DumpDeviceRemoved())
+      REXLOG_ERROR("[sst-native] the graphics device was lost at frame {} (see the [sst-gpu] lines above)", submitted_ + 1);
     ++submitted_;
     recording_ = false;
     memexport_ranges_.clear();
@@ -2855,6 +3008,7 @@ namespace sst::native
       FinishCapture();
       captured_.clear();
     }
+    Bisect().Poll();
     // F9 (or --sst_native_capture_frame) captures the next frame
     capture_quiet_ = REXCVAR_GET(sst_native_capture_frame) == -1;
 
@@ -2923,6 +3077,9 @@ namespace sst::native
     }
 
     prof_.last_frame = now;
+
+    if (textures_)
+      textures_->ClearSnapshots(); // their memory (the frame's arena) is recycled after this
   }
 
   ID3D12Resource *Renderer::Acquire(uint32_t *slot, uint32_t *width, uint32_t *height)
@@ -3193,7 +3350,10 @@ namespace sst::native
     }
   }
 
-  ID3D12PipelineState *Renderer::GetPipeline(const PipelineKey &key, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const ShaderVariant *vs, const ShaderVariant *ps)
+  // urgent: a UI-like draw (no depth test, few vertices). Skipping it while its pipeline compiles makes menus and HUD blink out, and on slow
+  // CPUs (one background compile thread) a pipeline can wait behind a court's worth of others for seconds. These pipelines are simple:
+  // they are built (or waited for) right away instead.
+  ID3D12PipelineState *Renderer::GetPipeline(const PipelineKey &key, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const ShaderVariant *vs, const ShaderVariant *ps, bool urgent)
   {
     const uint64_t hash = XXH3_64bits(&key, sizeof(key));
 
@@ -3205,6 +3365,18 @@ namespace sst::native
 
     if (auto it = pending_pipelines_.find(hash); it != pending_pipelines_.end())
     {
+      if (urgent && it->second->state.load(std::memory_order_acquire) == 0)
+      {
+        // Already queued for an earlier, non-urgent draw: wait for it (bounded)
+        const auto t0 = std::chrono::steady_clock::now();
+
+        while (it->second->state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2))
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+        ++stats_.pipelines_urgent;
+        stats_.pipeline_urgent_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      }
+
       if (it->second->state.load(std::memory_order_acquire) == 0)
       {
         ++stats_.skip_pipeline_pending;
@@ -3280,7 +3452,7 @@ namespace sst::native
       job->name.assign(name.begin(), name.end());
     }
 
-    if (REXCVAR_GET(sst_native_pipeline_async))
+    if (REXCVAR_GET(sst_native_pipeline_async) && !urgent)
     {
       if (pipeline_workers_->TryLoad(*job))
       {
@@ -3296,6 +3468,13 @@ namespace sst::native
     }
 
     pipeline_workers_->Build(*job);
+
+    if (urgent)
+    {
+      ++stats_.pipelines_urgent;
+      stats_.pipeline_urgent_ms += job->ms;
+    }
+
     FinishPipeline(hash, *job, key);
     auto done = pipelines_.find(hash);
     return done != pipelines_.end() ? done->second.Get() : nullptr;
@@ -4002,7 +4181,7 @@ namespace sst::native
     {
       const uint32_t ib = be32(base, dev + kDevIndices);
 
-      if (!ib)
+      if (!ib || !GuestReadable(ib, 0x1C))
         return fail("no index buffer");
 
       const uint32_t common = be32(base, ib);
@@ -4017,6 +4196,9 @@ namespace sst::native
       const uint32_t first_byte = call.start * isz;
       const uint32_t aligned_begin = first_byte & ~3u;
       const uint32_t aligned_end = (first_byte + call.count * isz + 3) & ~3u;
+
+      if (!GuestReadable(ib_addr + aligned_begin, aligned_end - aligned_begin))
+        return fail("index buffer memory gone");
       std::vector<uint8_t> raw(aligned_end - aligned_begin);
       SwapVertexData(index_endian, GuestPtr(base, ib_addr + aligned_begin), raw.data(), raw.size());
       const uint8_t *src = raw.data() + (first_byte - aligned_begin);
@@ -4420,6 +4602,36 @@ namespace sst::native
       return;
     }
 
+    // Debug: --sst_native_trace_vs / --sst_native_skip_vs
+    {
+      auto parse = [](const std::string &text) -> uint64_t
+      {
+        return text.empty() ? 0 : std::strtoull(text.c_str(), nullptr, 16);
+      };
+      static std::string trace_text, skip_text;
+      static uint64_t trace_hash = 0, skip_hash = 0;
+
+      if (const std::string t = REXCVAR_GET(sst_native_trace_vs); t != trace_text)
+        trace_text = t, trace_hash = parse(t);
+
+      if (const std::string t = REXCVAR_GET(sst_native_skip_vs); t != skip_text)
+        skip_text = t, skip_hash = parse(t);
+
+      if (skip_hash && vs_entry->hash == skip_hash)
+      {
+        ++stats_.skip_cull;
+        return;
+      }
+
+      trace_draw_ = trace_hash && vs_entry->hash == trace_hash && traced_draws_ < 40;
+
+      if (trace_draw_)
+      {
+        ++traced_draws_;
+        draw_textures_.clear();
+      }
+    }
+
     clk.Switch(kPhInputs);
 
     // Vertex inputs, from the vertex shader's *live* fetch instructions: the Xbox D3D patches format / offset / stride / fetch constant / swizzle into the microcode when it binds the declaration (draw-time flush), so this is exactly what the GPU would fetch. Each input is decoded on the CPU (DecodeElement) into 4 x 32 bits; swizzle changes the patch made relative to the original instruction become the component order.
@@ -4815,15 +5027,29 @@ namespace sst::native
       return;
     }
 
-    // Shader variants (compiled on worker threads; skip until ready)
-    const ShaderVariant *vs = shaders_->GetVariant(vs_entry, vs_spec);
-    const ShaderVariant *ps = ps_entry ? shaders_->GetVariant(ps_entry, ps_spec) : nullptr;
+    // Shader variants (from the exe's shader pack, or compiled on worker threads; skip until ready). urgent: a draw waits for them, so
+    // they jump the compile queue.
+    const ShaderVariant *vs = shaders_->GetVariant(vs_entry, vs_spec, true);
+    const ShaderVariant *ps = ps_entry ? shaders_->GetVariant(ps_entry, ps_spec, true) : nullptr;
     const bool debug_shading = REXCVAR_GET(sst_native_debug_shading) && debug_ps_;
 
     if (!vs || (ps_entry && !ps))
     {
       ++stats_.skip_pending;
       return;
+    }
+
+    // Bisect: a hidden draw still runs in full, it just writes no colour (so nothing else changes)
+    bool bisect_hide = false;
+
+    if (ps_entry && REXCVAR_GET(sst_native_debug_bisect))
+    {
+      ShaderBisect &bisect = Bisect();
+
+      if (!bisect.active && bisect.recent.size() < 4096)
+        bisect.recent.insert(ps_entry->hash);
+
+      bisect_hide = bisect.Hidden(ps_entry->hash);
     }
 
     // Pipeline
@@ -4844,7 +5070,7 @@ namespace sst::native
       return;
     }
 
-    key.color_mask = ps ? uint8_t(Reg(base, dev, RB_COLOR_MASK) & 0xF) : 0;
+    key.color_mask = ps && !bisect_hide ? uint8_t(Reg(base, dev, RB_COLOR_MASK) & 0xF) : 0;
 
     if (LogOnce(0xD000000000000000ull | (uint64_t(key.color_mask) << 32) | key.blend))
       REXLOG_INFO("[sst-native] new state: colour mask {:X} blend {:08X} depth {:08X} colour "
@@ -4908,7 +5134,7 @@ namespace sst::native
     {
       const uint32_t ib = be32(base, dev + kDevIndices);
 
-      if (!ib || call.count > kMaxDrawIndices)
+      if (!ib || call.count > kMaxDrawIndices || !GuestReadable(ib, 0x1C))
       {
         ++stats_.skip_data;
         return;
@@ -4932,6 +5158,17 @@ namespace sst::native
       const uint32_t first_byte = call.start * isz;
       const uint32_t aligned_begin = first_byte & ~3u;
       const uint32_t aligned_end = (first_byte + call.count * isz + 3) & ~3u;
+      // Freed by the game while this draw waited (a model loading): skip it
+      if (!GuestReadable(ib_addr + aligned_begin, aligned_end - aligned_begin))
+      {
+        ++stats_.skip_data;
+
+        if (LogOnce(0xC200000000000000ull))
+          REXLOG_WARN("[sst-native] index data at {:08X} is no longer mapped (freed while the draw was queued): draws like this are skipped", ib_addr + aligned_begin);
+
+        return;
+      }
+
       ib_src = GuestPtr(base, ib_addr + aligned_begin);
       ib_src_bytes = aligned_end - aligned_begin;
       const uint32_t restart = index32 ? 0xFFFFFFFFu : 0xFFFFu;
@@ -5032,7 +5269,8 @@ namespace sst::native
     }
 
     clk.Switch(kPhPipeline);
-    ID3D12PipelineState *pso = GetPipeline(key, layout, vs, ps);
+    const bool ui_like = (!key.depth_enable || key.depth_func == 7) && vmax >= vmin && vmax - vmin < 256; // no depth test (or ALWAYS)
+    ID3D12PipelineState *pso = GetPipeline(key, layout, vs, ps, ui_like);
 
     if (!pso)
     {
@@ -5055,7 +5293,8 @@ namespace sst::native
     {
       const uint8_t *src;
       uint32_t endian;
-      uint32_t size; // bytes
+      uint32_t size;     // bytes
+      uint32_t phys = 0; // guest physical address (vertex buffers)
     };
 
     ResolvedStream resolved[kMaxStreams] = {};
@@ -5069,7 +5308,7 @@ namespace sst::native
       if (call.up_data && fs.slot == 95)
       {
         // DrawVerticesUP: stream 0 data comes from the caller's buffer
-        if (!PlausibleAddress(call.up_data))
+        if (!PlausibleAddress(call.up_data) || !GuestReadable(call.up_data, call.up_stride * (call.start + call.count)))
         {
           ++stats_.skip_data;
           return;
@@ -5091,6 +5330,16 @@ namespace sst::native
 
           if (LogOnce(0xF000000000000000ull | fs.slot))
             REXLOG_WARN("[sst-native] fetch constant {} is not a vertex buffer: {:08X} {:08X}", fs.slot, dw0, dw1);
+
+          return;
+        }
+
+        if (!GuestPhysicalReadable(phys, size))
+        {
+          ++stats_.skip_data;
+
+          if (LogOnce(0xC300000000000000ull))
+            REXLOG_WARN("[sst-native] vertex data at {:08X} is no longer mapped (freed while the draw was queued): draws like this are skipped", phys);
 
           return;
         }
@@ -5152,7 +5401,7 @@ namespace sst::native
           }
         }
 
-        resolved[i] = {physical_membase_ + phys, dw1 & 3, 0};
+        resolved[i] = {physical_membase_ + phys, dw1 & 3, 0, phys};
 
         if (LogOnce(0xC200000000000000ull | (dw1 & 3)))
           REXLOG_INFO("[sst-native] vertex buffer swap mode {} (fetch {:08X} {:08X})", dw1 & 3, dw0, dw1);
@@ -5171,7 +5420,33 @@ namespace sst::native
                       fs.slot, size, first_vertex, vertex_count, fs.stride);
         return;
       }
+
+      // The game thread's copy of the start of this buffer from when the draw was issued (UI sprites: the game rewrites their vertices
+      // between draws, and read live a frame later they hold another sprite's). Used when it covers every vertex this draw reads.
+      // (not for morph output: the renderer writes that itself, after the game thread copied the buffer)
+      if (resolved[i].phys && !computed_fetch && !reads_morph)
+      {
+        for (uint32_t c = 0; c < draw_vertex_copy_count_; ++c)
+        {
+          const GuestCopy &g = draw_vertex_copies_[c];
+
+          if (g.begin == resolved[i].phys && uint64_t(g.end) - g.begin >= end)
+          {
+            resolved[i].src = g.data;
+            resolved[i].size = std::min(size, g.end - g.begin);
+            ++stats_.vertex_copies_used;
+            break;
+          }
+        }
+      }
     }
+
+    auto mark_vertices_changed = [&]
+    {
+      for (uint32_t i = 0; i < fetch_stream_count; ++i)
+        if (resolved[i].phys)
+          guest_watch::VerticesChanged(resolved[i].phys, uint32_t(std::min<uint64_t>((uint64_t(first_vertex) + vertex_count) * fetch_streams[i].stride, 1u << 20)), submitted_ + 1);
+    };
 
     if (!host_elements.empty())
     {
@@ -5202,7 +5477,7 @@ namespace sst::native
 
         for (uint32_t i = 0; i < fetch_stream_count; ++i)
         {
-          const uint64_t phys = uint64_t(resolved[i].src - physical_membase_);
+          const uint64_t phys = resolved[i].phys;
 
           if (n + 2 <= std::size(words))
           {
@@ -5218,6 +5493,7 @@ namespace sst::native
         {
           ventry = nullptr;
           ++stats_.geo_dynamic;
+          mark_vertices_changed();
         }
         else if (GeoTrusted(*ventry))
         {
@@ -5241,14 +5517,20 @@ namespace sst::native
             vhit = true;
             GeoChecked(*ventry, true);
           }
-          else if (ventry->hash && ventry->hash != vhash && ++ventry->changes >= 2)
-          {
-            ventry->dynamic = true; // keeps changing: stop caching it
-            ventry = nullptr;
-          }
           else
           {
-            GeoChecked(*ventry, false);
+            if (ventry->hash && ventry->hash != vhash)
+              mark_vertices_changed(); // the game rewrites this data: the game thread copies it with the draws from now on
+
+            if (ventry->hash && ventry->hash != vhash && ++ventry->changes >= 2)
+            {
+              ventry->dynamic = true; // keeps changing: stop caching it
+              ventry = nullptr;
+            }
+            else
+            {
+              GeoChecked(*ventry, false);
+            }
           }
         }
       }
@@ -5412,6 +5694,77 @@ namespace sst::native
                       "[{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} "
                       "{:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}]",
                       vs_entry->hash, call.prim, call.base_vertex, call.start, call.count, vmin, vmax, idx, verts, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
+        }
+
+        if (trace_draw_)
+        {
+          const float *f = reinterpret_cast<const float *>(up.cpu);
+          std::string streams, verts;
+
+          for (uint32_t i = 0; i < fetch_stream_count; ++i)
+            streams += fmt::format(" [slot {} phys {:08X} stride {} size {}{}]", fetch_streams[i].slot, resolved[i].phys, fetch_streams[i].stride, resolved[i].size, resolved[i].phys && resolved[i].src != physical_membase_ + resolved[i].phys ? " copy" : "");
+
+          for (uint32_t v = 0; v < std::min<uint32_t>(3, vertex_count); ++v)
+          {
+            verts += " {";
+
+            for (size_t e = 0; e < std::min<size_t>(host_elements.size(), 8); ++e)
+            {
+              const float *p = f + (size_t(v) * host_elements.size() + e) * 4;
+              verts += fmt::format(" ({:.4g} {:.4g} {:.4g} {:.4g})", p[0], p[1], p[2], p[3]);
+            }
+
+            verts += " }";
+          }
+
+          // The vertex shader run on the CPU: where the vertices end up (clip space)
+          std::string clip = " (CPU run failed)";
+          {
+            uint32_t bools[8], fetch[192], loops[32];
+            check_constants_.resize(1024);
+
+            if (!LoadVsState(base, call.device, vs_obj, vs_entry, check_ucode_, check_constants_.data(), bools, fetch, loops, nullptr) && vertex_count <= 65536)
+            {
+              check_indices_.resize(vertex_count);
+
+              for (uint32_t v = 0; v < vertex_count; ++v)
+                check_indices_[v] = first_vertex + v;
+
+              check_positions_.resize(size_t(vertex_count) * 4);
+              VsConstants vc;
+              vc.float_constants = check_constants_.data();
+              vc.bool_constants = bools;
+              vc.loop_constants = loops;
+              vc.fetch_constants = fetch;
+              MemexportStats ignored;
+
+              if (memexport_->RunPositions(check_ucode_.data(), uint32_t(check_ucode_.size()), vc, check_indices_.data(), vertex_count, check_positions_.data(), &ignored))
+              {
+                float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, w0 = 1e30f, w1 = -1e30f;
+                uint32_t bad = 0;
+
+                for (uint32_t v = 0; v < vertex_count; ++v)
+                {
+                  const float *p = &check_positions_[4 * size_t(v)];
+
+                  if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[3]) || p[3] <= 1e-6f)
+                  {
+                    ++bad;
+                    continue;
+                  }
+
+                  x0 = std::min(x0, p[0] / p[3]), x1 = std::max(x1, p[0] / p[3]);
+                  y0 = std::min(y0, p[1] / p[3]), y1 = std::max(y1, p[1] / p[3]);
+                  w0 = std::min(w0, p[3]), w1 = std::max(w1, p[3]);
+                }
+
+                const float *p = check_positions_.data();
+                clip = fmt::format(" screen x {:.3g}..{:.3g} y {:.3g}..{:.3g} w {:.3g}..{:.3g}, {} vertices non-finite or behind; vertex 0 clip ({:.4g} {:.4g} {:.4g} {:.4g}); bone constants c35 ({:.4g} {:.4g} {:.4g} {:.4g})", x0, x1, y0, y1, w0, w1, bad, p[0], p[1], p[2], p[3], check_constants_[35 * 4], check_constants_[35 * 4 + 1], check_constants_[35 * 4 + 2], check_constants_[35 * 4 + 3]);
+              }
+            }
+          }
+
+          REXLOG_INFO("[sst-native] trace VS {:016X} PS {:016X}: frame {} prim {} indexed {} start {} count {} base {} vertices {}+{} (index range {}-{}); streams{}; textures{}; first vertices{}; CPU-run{}", vs_entry->hash, ps_entry ? ps_entry->hash : 0, submitted_ + 1, call.prim, call.indexed, call.start, call.count, call.base_vertex, first_vertex, vertex_count, vmin, vmax, streams, draw_textures_, verts, clip);
         }
 
         capture_host_ = capture_active_ ? reinterpret_cast<const float *>(up.cpu) : nullptr;
@@ -5595,7 +5948,7 @@ namespace sst::native
       return;
 
     {
-      uint32_t sc[76] = {};
+      uint32_t sc[80] = {}; // [76] (c19.x): g_SstDepthFlip
 
       for (int i = 0; i < 16; ++i)
       {
@@ -5709,6 +6062,15 @@ namespace sst::native
         vp.Height = 2 * std::fabs(ys);
         vp.MinDepth = std::clamp(zo, 0.0f, 1.0f);
         vp.MaxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
+
+        // A negative z scale (the game's reversed depth) gives an inverted depth range (MinDepth > MaxDepth), which Intel GPUs
+        // evaluate too coarsely: eyes and moustaches drawn just in front of the face fail the depth test. Instead the vertex shader
+        // outputs w - z (g_SstDepthFlip, XenosRecomp under SST_RECOMP) and the range is the normal way round: same window depth
+        if (zs < 0 && REXCVAR_GET(sst_native_depth_flip_vs))
+        {
+          std::swap(vp.MinDepth, vp.MaxDepth);
+          sc[76] = 1;
+        }
 
         if (ys > 0 && LogOnce(0xC000000000000001ull))
           REXLOG_WARN("[sst-native] positive viewport y scale ({}): image may be flipped", ys);
@@ -5840,6 +6202,16 @@ namespace sst::native
     list_->SetGraphicsRootConstantBufferView(kRootPSConstantsRaw, psc_gpu);
     list_->SetGraphicsRootConstantBufferView(kRootShared, shared.gpu);
     list_->IASetPrimitiveTopology(topology);
+
+    // RenderDoc / PIX: name the draw by its shaders and state (Event Browser)
+    if (REXCVAR_GET(sst_native_debug_markers))
+    {
+      const std::string label = fmt::format("vs {:016X} ps {:016X} depth {:08X} colour {:08X} blend {:08X} bias {}", vs_entry ? vs_entry->hash : 0, ps_entry ? ps_entry->hash : 0, depthcontrol, colorcontrol, key.blend, key.depth_bias);
+      const std::wstring wide(label.begin(), label.end());
+      list_->SetMarker(0, wide.c_str(), UINT((wide.size() + 1) * sizeof(wchar_t)));
+    }
+
+    NoteDraw(vs_entry ? vs_entry->hash : 0, ps_entry ? ps_entry->hash : 0);
 
     if (draw_indexed)
       list_->DrawIndexedInstanced(draw_count, 1, 0, convert || rect_list ? 0 : -int32_t(vmin), 0);
@@ -6015,6 +6387,7 @@ namespace sst::native
     list_->SOSetTargets(0, 1, &view);
     list_->SetPipelineState(pso);
     list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    NoteDraw(0, 2);
     list_->DrawInstanced(vertex_count, 1, 0, 0);
     list_->SOSetTargets(0, 0, nullptr);
     so_used_ += size_t(vertex_count) * 16;
@@ -6234,8 +6607,8 @@ namespace sst::native
         if (!composite_pages_.empty() && composite_pages_.count((fetch[1] >> 12) & 0x1FFFF))
           draw_composite_ = true;
 
-        if (capture_active_)
-          draw_textures_ += fmt::format(" t{}={:08X}:{}x{}{}", i, fetch[1] & ~0xFFFu, (fetch[2] & 0x1FFF) + 1, ((fetch[2] >> 13) & 0x1FFF) + 1, composite_pages_.count((fetch[1] >> 12) & 0x1FFFF) ? "c" : "");
+        if (capture_active_ || trace_draw_)
+          draw_textures_ += fmt::format(" t{}={:08X}:{}x{} fmt {} dim {} fetchdim {}{}", i, fetch[1] & ~0xFFFu, (fetch[2] & 0x1FFF) + 1, ((fetch[2] >> 13) & 0x1FFF) + 1, fetch[1] & 0x3F, (fetch[5] >> 9) & 3, dimension, composite_pages_.count((fetch[1] >> 12) & 0x1FFFF) ? "c" : "");
 
         const uint32_t slot = textures_->GetTexture(list_.Get(), allocate, fetch, dimension);
 
@@ -6283,8 +6656,8 @@ namespace sst::native
     {
       REXLOG_INFO("[sst-native]   pipelines: {} ready ({} from the pipeline cache), {} compiling, "
                   "{:.1f} ms of background work this period, draws skipped while compiling {}, "
-                  "cache file {} KB",
-                  s.pipelines_created, s.pipelines_from_cache, pending_pipelines_.size(), s.pipeline_ms, s.skip_pipeline_pending, pipeline_workers_->saved_bytes >> 10);
+                  "UI-like pipelines built at once {} ({:.1f} ms), cache file {} KB",
+                  s.pipelines_created, s.pipelines_from_cache, pending_pipelines_.size(), s.pipeline_ms, s.skip_pipeline_pending, s.pipelines_urgent, s.pipeline_urgent_ms, pipeline_workers_->saved_bytes >> 10);
       pipeline_workers_->SaveInBackground();
     }
 
@@ -6294,8 +6667,8 @@ namespace sst::native
                   textures_->StatusLine(), s.textured_draws, s.texture_placeholders, s.shadow_placeholders, s.scissored_draws);
     REXLOG_INFO("[sst-native] frame {}: {} draws, {} drawn ({} depth-only); skipped: shader {} "
                 "pending {} fetch {} prim {} rt {} pipeline {} data {} cull {} memexport-target {}; {} clears; "
-                "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB; resolves {}",
-                frame, s.draws, s.drawn, s.depth_only, s.skip_shader, s.skip_pending, s.skip_decl, s.skip_prim, s.skip_rt, s.skip_pipeline, s.skip_data, s.skip_cull, s.skip_memexport, s.clears, s.pipelines_created, s.pipelines_failed, s.shaders_from_objects, double(s.upload_bytes) / (1 << 20), s.resolves);
+                "pipelines {} ({} failed); shaders rebuilt from objects {}; upload {:.1f} MB; resolves {}; vertex buffers from draw-time copies {}",
+                frame, s.draws, s.drawn, s.depth_only, s.skip_shader, s.skip_pending, s.skip_decl, s.skip_prim, s.skip_rt, s.skip_pipeline, s.skip_data, s.skip_cull, s.skip_memexport, s.clears, s.pipelines_created, s.pipelines_failed, s.shaders_from_objects, double(s.upload_bytes) / (1 << 20), s.resolves, s.vertex_copies_used);
     if (s.measured_draws)
       REXLOG_INFO("[sst-native] ui fit: {} draws measured on the CPU ({} 3D, stopped after the probe; {} big batches sampled)", s.measured_draws, s.measured_3d_early, s.measured_sampled);
     std::string prims;

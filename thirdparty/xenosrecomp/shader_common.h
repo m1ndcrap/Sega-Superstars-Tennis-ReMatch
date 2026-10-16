@@ -1,13 +1,13 @@
 #ifndef SHADER_COMMON_H_INCLUDED
 #define SHADER_COMMON_H_INCLUDED
 
-#define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
-#define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
+#define SPEC_CONSTANT_R11G11B10_NORMAL (1 << 0)
+#define SPEC_CONSTANT_ALPHA_TEST (1 << 1)
 
 #ifdef UNLEASHED_RECOMP
-    #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
-    #define SPEC_CONSTANT_ALPHA_TO_COVERAGE (1 << 3)
-    #define SPEC_CONSTANT_REVERSE_Z         (1 << 4)
+#define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+#define SPEC_CONSTANT_ALPHA_TO_COVERAGE (1 << 3)
+#define SPEC_CONSTANT_REVERSE_Z (1 << 4)
 #endif
 
 #if !defined(__cplusplus) || defined(__INTELLISENSE__)
@@ -26,13 +26,14 @@ struct PushConstants
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
 
-#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
-#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
-#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
-#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
-#define g_VertexIndexBase          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276)
-#define g_InvRenderScale           vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 280)
-#define g_ClipTransform            vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 288)
+#define g_Booleans vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+#define g_SwappedTexcoords vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+#define g_HalfPixelOffset vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+#define g_AlphaThreshold vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
+#define g_VertexIndexBase vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276)
+#define g_InvRenderScale vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 280)
+#define g_ClipTransform vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 288)
+#define g_SstDepthFlip vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 304)
 
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
@@ -40,14 +41,15 @@ struct PushConstants
 
 #else
 
-#define DEFINE_SHARED_CONSTANTS() \
-    uint g_Booleans : packoffset(c16.x); \
-    uint g_SwappedTexcoords : packoffset(c16.y); \
+#define DEFINE_SHARED_CONSTANTS()                 \
+    uint g_Booleans : packoffset(c16.x);          \
+    uint g_SwappedTexcoords : packoffset(c16.y);  \
     float2 g_HalfPixelOffset : packoffset(c16.z); \
-    float g_AlphaThreshold : packoffset(c17.x); \
-    uint g_VertexIndexBase : packoffset(c17.y); \
-    float2 g_InvRenderScale : packoffset(c17.z); \
-    float4 g_ClipTransform : packoffset(c18);
+    float g_AlphaThreshold : packoffset(c17.x);   \
+    uint g_VertexIndexBase : packoffset(c17.y);   \
+    float2 g_InvRenderScale : packoffset(c17.z);  \
+    float4 g_ClipTransform : packoffset(c18);     \
+    uint g_SstDepthFlip : packoffset(c19.x);
 
 uint g_SpecConstants();
 
@@ -135,7 +137,7 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     SamplerState samplerState = g_SamplerDescriptorHeap[samplerDescriptorIndex];
     uint2 dimensions = getTexture2DDimensions(texture);
-    
+
     float x = texCoord.x * dimensions.x + offset.x;
     float y = texCoord.y * dimensions.y + offset.y;
 
@@ -155,9 +157,9 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
 
     float4 r =
         g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
+                  g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
         g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+                  g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
 
     return r;
 }
@@ -168,15 +170,19 @@ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
     return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture3DDimensions(texture));
 }
 
+// Two named directions instead of a 2-element array: a dynamically indexed local array becomes scratch memory, and
+// Intel's driver hung the GPU (TDR + page fault) on shaders using it inside the loop form (character lighting)
 struct CubeMapData
 {
-    float3 cubeMapDirections[2];
+    float3 cubeMapDirection0;
+    float3 cubeMapDirection1;
     uint cubeMapIndex;
 };
 
 float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
 {
-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+    float3 direction = texCoord.z >= 0.5 ? cubeMapData.cubeMapDirection1 : cubeMapData.cubeMapDirection0;
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], direction);
 }
 
 float4 tfetchR11G11B10(uint4 value)
@@ -202,10 +208,13 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
 
 float4 cube(float4 value, inout CubeMapData cubeMapData)
 {
-    uint index = cubeMapData.cubeMapIndex;
-    cubeMapData.cubeMapDirections[index] = value.xyz;
-    ++cubeMapData.cubeMapIndex;
-    
+    uint index = min(cubeMapData.cubeMapIndex, 1u);
+    if (index == 0)
+        cubeMapData.cubeMapDirection0 = value.xyz;
+    else
+        cubeMapData.cubeMapDirection1 = value.xyz;
+    cubeMapData.cubeMapIndex = index + 1;
+
     return float4(0.0, 0.0, 0.0, index);
 }
 
