@@ -170,15 +170,19 @@ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
     return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture3DDimensions(texture));
 }
 
+// Two named directions instead of a 2-element array: a dynamically indexed local array becomes scratch memory, and
+// Intel's driver hung the GPU (TDR + page fault) on shaders using it inside the loop form (character lighting)
 struct CubeMapData
 {
-    float3 cubeMapDirections[2];
+    float3 cubeMapDirection0;
+    float3 cubeMapDirection1;
     uint cubeMapIndex;
 };
 
 float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
 {
-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+    float3 direction = texCoord.z >= 0.5 ? cubeMapData.cubeMapDirection1 : cubeMapData.cubeMapDirection0;
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], direction);
 }
 
 float4 tfetchR11G11B10(uint4 value)
@@ -204,9 +208,12 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
 
 float4 cube(float4 value, inout CubeMapData cubeMapData)
 {
-    uint index = cubeMapData.cubeMapIndex;
-    cubeMapData.cubeMapDirections[index] = value.xyz;
-    ++cubeMapData.cubeMapIndex;
+    uint index = min(cubeMapData.cubeMapIndex, 1u);
+    if (index == 0)
+        cubeMapData.cubeMapDirection0 = value.xyz;
+    else
+        cubeMapData.cubeMapDirection1 = value.xyz;
+    cubeMapData.cubeMapIndex = index + 1;
 
     return float4(0.0, 0.0, 0.0, index);
 }

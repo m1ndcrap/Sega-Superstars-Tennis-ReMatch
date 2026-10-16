@@ -96,6 +96,21 @@ namespace sst::native
     void Clear(const uint8_t *base, uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil);
     void Draw(const uint8_t *base, const DrawCall &call);
     void EndFrame(); // Swap
+    // Game-thread copies of volatile texture data for this frame (native.cpp): physical [begin, end). Dropped at EndFrame
+    void AddTextureSnapshot(uint32_t begin, uint32_t end, const uint8_t *data);
+    // Game-thread copies of the next draw's small vertex buffers (native.cpp): physical [begin, end), whole buffers. The game rewrites
+    // small UI vertex buffers between draws; read live a frame later they hold another sprite's quad. Set before Draw, cleared by it
+    struct GuestCopy
+    {
+      uint32_t begin, end;
+      const uint8_t *data;
+    };
+
+    void SetDrawVertexCopies(const GuestCopy *copies, uint32_t count)
+    {
+      draw_vertex_copies_ = copies;
+      draw_vertex_copy_count_ = count;
+    }
     void Resolve(const uint8_t *base, const ResolveCall &call);
     // Render-target trace (--sst_native_rt_trace / F10): one frame's sequence of passes, clears, resolves and other events, logged at the frame's end
     void TraceEvent(const uint8_t *base, uint32_t device, const std::string &what);
@@ -185,6 +200,19 @@ namespace sst::native
   private:
     Profile prof_;
     bool threaded_ = false;
+    // Device-removed diagnostics: what each draw op of the last frames was (frame number, labels in draw-op order), per frame slot
+    struct DrawLabels
+    {
+      uint64_t frame = 0;
+      std::vector<std::pair<uint64_t, uint64_t>> draws; // vs, ps hash (0, n: internal draw n)
+    };
+    DrawLabels draw_labels_[8]; // by frame number (more than the frames in flight: the dump runs a few frames later)
+    void NoteDraw(uint64_t vs, uint64_t ps);
+    public:
+    std::string DrawLabel(uint64_t frame, uint32_t draw) const;
+    private:
+    const GuestCopy *draw_vertex_copies_ = nullptr;
+    uint32_t draw_vertex_copy_count_ = 0;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamps_;
     Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback_;
     uint64_t timestamp_frequency_ = 0;
@@ -369,7 +397,7 @@ namespace sst::native
     std::unique_ptr<TextureCache> textures_;
     std::unordered_map<const ShaderEntry *, TextureUsage> texture_usage_;
 
-    ID3D12PipelineState *GetPipeline(const struct PipelineKey &key, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const ShaderVariant *vs, const ShaderVariant *ps);
+    ID3D12PipelineState *GetPipeline(const struct PipelineKey &key, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const ShaderVariant *vs, const ShaderVariant *ps, bool urgent = false);
 
     const rex::ui::d3d12::D3D12Provider *provider_ = nullptr;
     ID3D12Device *device_ = nullptr;
@@ -395,6 +423,8 @@ namespace sst::native
     std::unordered_set<uint32_t> composite_pages_; // resolve textures holding full-screen images
     bool draw_composite_ = false;                  // this draw samples one of them
     std::string draw_textures_;                    // F9 capture: textures this draw samples
+    bool trace_draw_ = false;                      // --sst_native_trace_vs matched this draw
+    uint32_t traced_draws_ = 0;
     std::array<Scale2, kOutputs> output_scale_{};
     Scale2 depth_scale_;
     uint64_t fps30_acquires_ = 0;
@@ -565,7 +595,7 @@ namespace sst::native
     struct Stats
     {
       uint64_t draws = 0, drawn = 0;
-      uint64_t skip_shader = 0, skip_pending = 0, skip_decl = 0, skip_prim = 0, skip_rt = 0, skip_pipeline = 0, skip_data = 0, skip_cull = 0, skip_memexport = 0;
+      uint64_t skip_shader = 0, skip_pending = 0, skip_decl = 0, skip_prim = 0, skip_rt = 0, skip_pipeline = 0, skip_data = 0, skip_cull = 0, skip_memexport = 0, vertex_copies_used = 0;
       uint64_t memexport_draws = 0, memexport_run = 0, memexport_cached = 0, memexport_failed = 0;
       uint64_t memexport_async = 0, memexport_waits = 0;
       double memexport_wait_ms = 0;
@@ -589,6 +619,8 @@ namespace sst::native
       uint64_t scissored_draws = 0, scissor_logged = 0;
       uint64_t pipelines_created = 0, pipelines_failed = 0, pipelines_from_cache = 0, skip_pipeline_pending = 0;
       double pipeline_ms = 0;
+      uint64_t pipelines_urgent = 0; // built at once for a UI-like draw instead of in the background
+      double pipeline_urgent_ms = 0;
       std::unordered_map<uint32_t, uint64_t> prims;          // xenos prim -> draws
       std::unordered_map<uint32_t, uint64_t> clear_flags;    // flags -> count
       std::unordered_map<uint64_t, uint64_t> render_targets; // (rt0 object<<32 | size word)

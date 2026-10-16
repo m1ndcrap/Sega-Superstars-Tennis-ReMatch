@@ -18,8 +18,11 @@ namespace sst::native::pack
   // with another version is ignored.
   // 2: D3D9 multiply rule; 3: vertex index in r0.x; 4: 3D fetch offsets; 5: screen position / render scale; 6: clip transform (c18);
   // 7: render scale per axis (c17.zw); 8: loop-form shaders as an if-chain, alpha test after the loop;
-  // 9: reversed depth flipped in the vertex shader (g_SstDepthFlip, c19.x)
-  inline constexpr uint32_t kCacheVersion = 9;
+  // 9: reversed depth flipped in the vertex shader (g_SstDepthFlip, c19.x); 10: loop-form shaders stop after 4096 jumps;
+  // 11: ... after 256 jumps; 12: vertices with non-finite / absurd positions are clipped; 13: loop form back to switch
+  // (not the cause of the Intel hangs after all); 14: cube map directions in two named fields, not a dynamically indexed array (scratch
+  // memory, which hung Intel GPUs in the loop-form character lighting shaders)
+  inline constexpr uint32_t kCacheVersion = 14;
 
   // DXC arguments for every translated shader (after "-T <profile>")
   inline constexpr const wchar_t *kDxcArgs[] = {

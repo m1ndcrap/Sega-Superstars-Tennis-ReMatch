@@ -3,6 +3,9 @@
 #include "gpu/native/texture_cache.h"
 #include "gpu/native/guest_memory.h"
 
+#include <atomic>
+#include <mutex>
+
 #include "gpu/native/prompts.h"
 
 #include <rex/cvar.h>
@@ -36,6 +39,122 @@ REXCVAR_DEFINE_BOOL(sst_native_texture_srgb, false, "SST",
 
 namespace sst::native
 {
+  namespace guest_watch
+  {
+    namespace
+    {
+      constexpr uint64_t kForgetFrames = 3600; // a minute without changes
+
+      struct TextureEntry
+      {
+        TextureRange range;
+        uint64_t last_change = 0;
+      };
+
+      struct VertexEntry
+      {
+        uint32_t bytes = 0;
+        uint64_t last_change = 0;
+      };
+
+      std::mutex g_mutex;
+      std::unordered_map<uint32_t, TextureEntry> g_textures;
+      std::unordered_map<uint32_t, VertexEntry> g_vertices;
+      std::atomic<uint64_t> g_version{0};
+
+      void Bump() { g_version.fetch_add(1, std::memory_order_release); }
+    }
+
+    void KnownTexture(uint32_t base_page, const TextureRange &range)
+    {
+      std::lock_guard lock(g_mutex);
+      TextureEntry &e = g_textures[base_page];
+      const bool changing = e.range.changing;
+      e.range = range;
+      e.range.changing = changing;
+      Bump();
+    }
+
+    void TextureChanged(uint32_t base_page, uint64_t frame)
+    {
+      std::lock_guard lock(g_mutex);
+      auto it = g_textures.find(base_page);
+
+      if (it == g_textures.end())
+        return;
+
+      it->second.last_change = frame;
+
+      if (!it->second.range.changing)
+      {
+        it->second.range.changing = true;
+        Bump();
+      }
+    }
+
+    void VerticesChanged(uint32_t phys, uint32_t bytes, uint64_t frame)
+    {
+      std::lock_guard lock(g_mutex);
+      VertexEntry &e = g_vertices[phys];
+      e.last_change = frame;
+
+      if (bytes > e.bytes)
+      {
+        e.bytes = bytes;
+        Bump();
+      }
+    }
+
+    void Prune(uint64_t frame)
+    {
+      std::lock_guard lock(g_mutex);
+      bool changed = false;
+
+      for (auto &[page, e] : g_textures)
+        if (e.range.changing && frame > e.last_change + kForgetFrames)
+        {
+          e.range.changing = false;
+          changed = true;
+        }
+
+      changed |= std::erase_if(g_vertices, [&](const auto &e)
+                               { return frame > e.second.last_change + kForgetFrames; }) > 0;
+
+      if (changed)
+        Bump();
+    }
+
+    uint64_t Version() { return g_version.load(std::memory_order_acquire); }
+
+    void Copy(Set &out)
+    {
+      std::lock_guard lock(g_mutex);
+      out.textures.clear();
+      out.vertices.clear();
+
+      for (const auto &[page, e] : g_textures)
+        out.textures.emplace(page, e.range);
+
+      for (const auto &[phys, e] : g_vertices)
+        out.vertices.emplace(phys, e.bytes);
+    }
+  }
+
+  void TextureCache::AddSnapshot(uint32_t begin, uint32_t end, const uint8_t *data)
+  {
+    if (data && end > begin)
+      snapshots_.push_back({begin, end, data});
+  }
+
+  const uint8_t *TextureCache::Source(uint32_t addr, uint32_t size) const
+  {
+    for (const Snapshot &s : snapshots_)
+      if (addr >= s.begin && uint64_t(addr) + size <= s.end)
+        return s.data - s.begin;
+
+    return membase_;
+  }
+
   using Microsoft::WRL::ComPtr;
   namespace xenos = rex::graphics::xenos;
   namespace texture_util = rex::graphics::texture_util;
@@ -399,6 +518,9 @@ namespace sst::native
     frame_fence_ = frame_fence;
     frame_upload_bytes_ = 0;
 
+    if ((frame & 63) == 0)
+      guest_watch::Prune(frame);
+
     for (size_t i = 0; i < deferred_.size();)
     {
       if (deferred_[i].fence <= completed_fence)
@@ -507,12 +629,20 @@ namespace sst::native
       return nullptr;
     }
 
+    {
+      const std::string name = fmt::format("sst texture {:08X} {}x{} {}", k.base_page << 12, k.width, k.height, FormatName(k.format));
+      t->resource->SetName(std::wstring(name.begin(), name.end()).c_str());
+    }
+
     t->bytes = device_->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
     total_bytes_ += t->bytes;
 
     const texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(dim, k.pitch, k.width, k.height, k.depth_or_array, k.tiled != 0, xenos::TextureFormat(k.format), k.packed != 0, k.base_page != 0, k.mip_max);
     t->base_size = k.base_page ? layout.base.level_data_extent_bytes : 0;
     t->mip_size = k.mip_page ? layout.mips_total_extent_bytes : 0;
+
+    if (t->base_size <= (16u << 20) && t->mip_size <= (16u << 20))
+      guest_watch::KnownTexture(k.base_page, {k.base_page << 12, t->base_size, k.mip_page << 12, t->mip_size, false});
 
     ++stats_.created;
 
@@ -547,7 +677,7 @@ namespace sst::native
         return;
 
       size = std::min(size, kGuestPhysicalSize - addr);
-      XXH3_64bits_update(st, membase_ + addr, size);
+      XXH3_64bits_update(st, Source(addr, size) + addr, size);
     };
 
     add(t.key.base_page, t.base_size);
@@ -614,6 +744,14 @@ namespace sst::native
       const uint32_t stored = std::min(level, layout.packed_level);
       const texture_util::TextureGuestLayout::Level &lay = is_base ? layout.base : layout.mips[stored];
       const uint32_t level_addr = is_base ? (k.base_page << 12) : (k.mip_page << 12) + layout.mip_offsets_bytes[stored];
+      // This frame's copy of the data (volatile textures), else guest memory
+      const uint32_t region_begin = is_base ? (k.base_page << 12) : (k.mip_page << 12);
+      const uint32_t region_size = is_base ? t.base_size : t.mip_size;
+      const uint8_t *src_mem = Source(region_begin, region_size);
+      const uint64_t region_end = uint64_t(region_begin) + region_size;
+
+      if (src_mem != membase_)
+        ++stats_.from_snapshots;
       uint32_t ox = 0, oy = 0, oz = 0;
 
       if (level >= layout.packed_level)
@@ -665,7 +803,7 @@ namespace sst::native
                 continue;
               }
 
-              std::memcpy(block, membase_ + addr, bpb);
+              std::memcpy(block, (src_mem != membase_ && addr >= region_begin && addr + bpb <= region_end ? src_mem : membase_) + addr, bpb);
               SwapEndian(block, bpb, k.endian);
               Convert(hf.load, block, bpb, dst);
 
@@ -917,6 +1055,10 @@ namespace sst::native
       {
         t->stable_checks = 0;
 
+        // Resident and changed: the game rewrites this texture's memory, so from now on the game thread copies it with every draw
+        if (t->resident && !prompt_stale)
+          guest_watch::TextureChanged(t->key.base_page, frame_);
+
         if (Upload(list, allocate, *t))
         {
           t->resident = true;
@@ -1144,7 +1286,7 @@ namespace sst::native
   {
     return fmt::format("textures: {} live ({} MB), {} lookups, created {}, uploads {} (re-uploads {}) {:.1f} MB "
                        "in {:.1f} ms, hashed {:.1f} MB in {:.1f} ms, unsupported {}, bad {}, dimension "
-                       "mismatches {}, failed {}, evicted {}, loads deferred {}, checks skipped (stable) {}, resolved-texture reads {} (size mismatches {}), samplers {}{}{}",
-                       textures_.size(), total_bytes_ >> 20, stats_.lookups, stats_.created, stats_.uploads, stats_.reuploads, double(stats_.upload_bytes) / (1 << 20), stats_.upload_ms, double(stats_.hashed_bytes) / (1 << 20), stats_.hash_ms, stats_.unsupported, stats_.bad, stats_.dimension_mismatch, stats_.failed, stats_.evicted, stats_.deferred_loads, stats_.checks_skipped, stats_.external_hits, stats_.external_mismatch, samplers_.size(), stats_.srv_full ? fmt::format(", SRV heap full x{}", stats_.srv_full) : std::string(), stats_.sampler_full ? fmt::format(", sampler heap full x{}", stats_.sampler_full) : std::string());
+                       "mismatches {}, failed {}, evicted {}, loads deferred {}, checks skipped (stable) {}, loads from draw-time copies {}, resolved-texture reads {} (size mismatches {}), samplers {}{}{}",
+                       textures_.size(), total_bytes_ >> 20, stats_.lookups, stats_.created, stats_.uploads, stats_.reuploads, double(stats_.upload_bytes) / (1 << 20), stats_.upload_ms, double(stats_.hashed_bytes) / (1 << 20), stats_.hash_ms, stats_.unsupported, stats_.bad, stats_.dimension_mismatch, stats_.failed, stats_.evicted, stats_.deferred_loads, stats_.checks_skipped, stats_.from_snapshots, stats_.external_hits, stats_.external_mismatch, samplers_.size(), stats_.srv_full ? fmt::format(", SRV heap full x{}", stats_.srv_full) : std::string(), stats_.sampler_full ? fmt::format(", sampler heap full x{}", stats_.sampler_full) : std::string());
   }
 }

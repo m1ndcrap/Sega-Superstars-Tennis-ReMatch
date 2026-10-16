@@ -118,6 +118,10 @@ if(WIN32 AND REXSDK_DIR AND TARGET rexgpu-xenos)
     # Same rule as rexgpu-xenos: link rexruntime only, never the OBJECT libs.
     target_link_libraries(rexgpu-sst PRIVATE rex::runtime xxHash::xxhash d3d12 dxgi dxguid)
     rexglue_apply_target_settings(rexgpu-sst)
+    # Linker map next to the DLL (crash reports name rexgpu-sst.dll+0x... frames)
+    if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+        target_link_options(rexgpu-sst PRIVATE "LINKER:/MAP:$<TARGET_FILE_DIR:rexgpu-sst>/rexgpu-sst.map")
+    endif()
     list(APPEND SST_GPU_PLUGINS sst)
 endif()
 

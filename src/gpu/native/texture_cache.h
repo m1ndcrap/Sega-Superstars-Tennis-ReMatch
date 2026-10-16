@@ -16,6 +16,36 @@
 
 namespace sst::native
 {
+  // Guest data the game rewrites while the game runs. With the render thread a frame behind, the game may already have written the
+  // next frame's data when the renderer reads it, so the game thread copies it when it captures a draw (native.cpp) and the renderer
+  // reads the copies. The render thread records what it has seen; the game thread reads a copy of the set when it changes.
+  //  - textures: every texture the renderer knows gets flagged `changing` once its data changed (unflagged a minute later).
+  //    The game thread copies changing textures for every draw, and all known textures for UI-sized draws (where a one-frame
+  //    mismatch is most visible: portraits, court previews, text pages reloaded as screens change).
+  //  - vertex buffers: start addresses whose data changed between frames, with the bytes draws read from them.
+  namespace guest_watch
+  {
+    struct TextureRange
+    {
+      uint32_t base_addr = 0, base_size = 0; // physical
+      uint32_t mip_addr = 0, mip_size = 0;
+      bool changing = false;
+    };
+
+    struct Set
+    {
+      std::unordered_map<uint32_t, TextureRange> textures; // by base page (physical address >> 12)
+      std::unordered_map<uint32_t, uint32_t> vertices;     // physical start -> bytes read
+    };
+
+    void KnownTexture(uint32_t base_page, const TextureRange &range);    // render thread: texture created
+    void TextureChanged(uint32_t base_page, uint64_t frame);             // render thread: its data changed
+    void VerticesChanged(uint32_t phys, uint32_t bytes, uint64_t frame); // render thread: vertex data changed between frames
+    void Prune(uint64_t frame);
+    uint64_t Version(); // changes whenever the set does
+    void Copy(Set &out);
+  }
+
   class TextureCache
   {
   public:
@@ -55,7 +85,22 @@ namespace sst::native
 
     std::string StatusLine() const;
 
+    // Copies of guest texture data the game thread made when it captured this frame's draws (physical [begin, end)); valid until
+    // ClearSnapshots at the end of the frame
+    void AddSnapshot(uint32_t begin, uint32_t end, const uint8_t *data);
+    void ClearSnapshots() { snapshots_.clear(); }
+
   private:
+    struct Snapshot
+    {
+      uint32_t begin, end;
+      const uint8_t *data;
+    };
+
+    std::vector<Snapshot> snapshots_;
+    // Where to read guest physical [addr, addr + size): `result + addr` is a frame snapshot covering it, else guest memory
+    const uint8_t *Source(uint32_t addr, uint32_t size) const;
+
     struct Key
     {
       uint32_t base_page, mip_page;
@@ -124,6 +169,7 @@ namespace sst::native
       double upload_ms = 0, hash_ms = 0;
       uint64_t unsupported = 0, bad = 0, dimension_mismatch = 0, evicted = 0, srv_full = 0, sampler_full = 0, failed = 0;
       uint64_t lookups = 0, deferred_loads = 0, checks_skipped = 0, external_hits = 0, external_mismatch = 0;
+      uint64_t from_snapshots = 0;
       uint32_t logged = 0;
     } stats_;
 

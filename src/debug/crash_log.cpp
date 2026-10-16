@@ -1,6 +1,7 @@
 // sst_rematch - crash report
 
 #include "debug/crash_log.h"
+#include "gpu/d3d12_setup.h"
 
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
@@ -9,6 +10,9 @@
 #include <rex/system/thread_state.h>
 
 #include <algorithm>
+#include <csignal>
+#include <cstdlib>
+#include <exception>
 #include <cstring>
 #include <fmt/format.h>
 #include <cstdio>
@@ -67,7 +71,6 @@ namespace sst::debug
 
       return fmt::format("0x{:X}", addr);
     }
-
 
     // Reads a big-endian guest word; false when the page is not readable
     bool ReadGuest(uint8_t *base, uint32_t addr, uint32_t &out)
@@ -130,49 +133,113 @@ namespace sst::debug
       return out;
     }
 
+    // Host call stack from a context (unwind tables; leaf functions via [rsp])
+    std::string Stack(CONTEXT ctx)
+    {
+      std::string out;
+#if defined(_M_X64) || defined(__x86_64__)
+      for (int frame = 0; frame < 32 && ctx.Rip; ++frame)
+      {
+        out += fmt::format("[sst-crash]   #{:02} {}\n", frame, Describe(uintptr_t(ctx.Rip)));
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+
+        if (!fn)
+        {
+          ctx.Rip = *reinterpret_cast<DWORD64 *>(ctx.Rsp);
+          ctx.Rsp += 8;
+          continue;
+        }
+
+        void *handler_data = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+      }
+#endif
+      return out;
+    }
+
+    volatile LONG g_reported = 0;
+
+    void WriteReport(const std::string &report)
+    {
+      REXLOG_ERROR("{}", report);
+
+      if (FILE *f = std::fopen((rex::filesystem::GetExecutableFolder() / "sst_crash.txt").string().c_str(), "w"))
+      {
+        std::fputs(report.c_str(), f);
+        std::fclose(f);
+      }
+    }
+
+    // abort() / std::terminate / CRT invalid parameter end the process with a fast fail (0xC0000409), which skips the unhandled
+    // exception filter: report the stack of the thread that is about to end it
+    void ReportHere(const char *why)
+    {
+      if (InterlockedExchange(&g_reported, 1) != 0)
+        return;
+
+      sst::gpu::DumpDeviceRemoved(); // a lost graphics device ends the process through abort(): log why first
+
+      CONTEXT ctx{};
+      RtlCaptureContext(&ctx);
+      std::string report = fmt::format("[sst-crash] {} on host thread {}\n", why, GetCurrentThreadId());
+      report += Stack(ctx);
+      report += DescribeGuest();
+      WriteReport(report);
+    }
+
+    void OnTerminate()
+    {
+      std::string why = "std::terminate";
+
+      if (std::exception_ptr e = std::current_exception())
+      {
+        try
+        {
+          std::rethrow_exception(e);
+        }
+        catch (const std::exception &x)
+        {
+          why = fmt::format("std::terminate: uncaught exception: {}", x.what());
+        }
+        catch (...)
+        {
+          why = "std::terminate: uncaught non-standard exception";
+        }
+      }
+
+      ReportHere(why.c_str());
+      std::abort();
+    }
+
+    void OnAbortSignal(int)
+    {
+      ReportHere("abort()");
+    }
+
+    void OnInvalidParameter(const wchar_t *, const wchar_t *, const wchar_t *, unsigned int, uintptr_t)
+    {
+      ReportHere("CRT invalid parameter");
+      std::abort();
+    }
+
     LONG WINAPI Filter(EXCEPTION_POINTERS *info)
     {
-      static volatile LONG once = 0;
-
-      if (InterlockedExchange(&once, 1) == 0 && info && info->ExceptionRecord && info->ContextRecord)
+      if (info && info->ExceptionRecord && info->ContextRecord && InterlockedExchange(&g_reported, 1) == 0)
       {
         const EXCEPTION_RECORD &rec = *info->ExceptionRecord;
         std::string report = fmt::format("[sst-crash] exception 0x{:08X} at {}", uint32_t(rec.ExceptionCode), Describe(reinterpret_cast<uintptr_t>(rec.ExceptionAddress)));
 
         if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec.NumberParameters >= 2)
-          report += fmt::format(" ({} 0x{:X})", rec.ExceptionInformation[0] == 1 ? "write" : rec.ExceptionInformation[0] == 8 ? "execute" : "read", rec.ExceptionInformation[1]);
+          report += fmt::format(" ({} 0x{:X})", rec.ExceptionInformation[0] == 1 ? "write" : rec.ExceptionInformation[0] == 8 ? "execute"
+                                                                                                                              : "read",
+                                rec.ExceptionInformation[1]);
 
-        report += "\n";
-#if defined(_M_X64) || defined(__x86_64__)
-        CONTEXT ctx = *info->ContextRecord;
-
-        for (int frame = 0; frame < 32 && ctx.Rip; ++frame)
-        {
-          report += fmt::format("[sst-crash]   #{:02} {}\n", frame, Describe(uintptr_t(ctx.Rip)));
-          DWORD64 image_base = 0;
-          PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
-
-          if (!fn)
-          {
-            // Leaf function: the return address is at [rsp]
-            ctx.Rip = *reinterpret_cast<DWORD64 *>(ctx.Rsp);
-            ctx.Rsp += 8;
-            continue;
-          }
-
-          void *handler_data = nullptr;
-          DWORD64 establisher = 0;
-          RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
-        }
-#endif
+        report += fmt::format(" on host thread {}\n", GetCurrentThreadId());
+        report += Stack(*info->ContextRecord);
         report += DescribeGuest();
-        REXLOG_ERROR("{}", report);
-
-        if (FILE *f = std::fopen((rex::filesystem::GetExecutableFolder() / "sst_crash.txt").string().c_str(), "w"))
-        {
-          std::fputs(report.c_str(), f);
-          std::fclose(f);
-        }
+        WriteReport(report);
       }
 
       return g_previous ? g_previous(info) : EXCEPTION_CONTINUE_SEARCH;
@@ -190,7 +257,25 @@ namespace sst::debug
                 { return a.host < b.host; });
     }
 
+    // A windowed app's stderr goes nowhere: send it to a file, so failed assert() messages (SDK code, plugins) are kept
+    {
+      const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+
+      if (!err || err == INVALID_HANDLE_VALUE)
+      {
+        FILE *f = nullptr;
+        _wfreopen_s(&f, (rex::filesystem::GetExecutableFolder() / "sst_stderr.txt").wstring().c_str(), L"w", stderr);
+
+        if (f)
+          setvbuf(stderr, nullptr, _IONBF, 0);
+      }
+    }
+
     g_previous = SetUnhandledExceptionFilter(Filter);
+    std::set_terminate(OnTerminate);
+    std::signal(SIGABRT, OnAbortSignal);
+    _set_invalid_parameter_handler(OnInvalidParameter);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG); // no message box
     REXLOG_INFO("[sst-crash] crash report on ({} recompiled functions)", g_funcs.size());
   }
 #else

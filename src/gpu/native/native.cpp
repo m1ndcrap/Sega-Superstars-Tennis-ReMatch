@@ -8,6 +8,8 @@
 #include "menu/graphics_menu.h"
 #include "gpu/native/renderer.h"
 #include "gpu/native/shader_cache.h"
+#include "gpu/native/texture_cache.h"
+#include "gpu/native/guest_memory.h"
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
@@ -22,6 +24,8 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <exception>
+#include <unordered_set>
 #include <bit>
 #include <atomic>
 #include <chrono>
@@ -44,6 +48,10 @@ REXCVAR_DEFINE_BOOL(sst_native_game_thread_priority, true, "SST",
                     "above-normal priority, so background work (morphs, shader / pipeline "
                     "compiles) never delays its frame");
 
+REXCVAR_DEFINE_BOOL(sst_native_draw_copies, true, "SST",
+                    "Native renderer: copy the textures / vertex data of UI draws when the game issues them, for the render "
+                    "thread (false = the render thread reads guest memory as it is when it gets to the draw; for testing)");
+
 REXCVAR_DEFINE_BOOL(sst_native_render_thread, true, "SST",
                     "Native renderer: record and submit the game's draws on a separate render "
                     "thread (the game thread only snapshots each call's state). false = do all "
@@ -64,6 +72,9 @@ namespace sst::native
 
     // render thread
     constexpr uint32_t kDevSnapBegin = 0x480, kDevSnapEnd = 0x31A0;
+    constexpr uint32_t kDevFetchConstants = 0x480; // 32 texture fetch constants of 6 dwords (renderer.cpp)
+    constexpr uint32_t kDevIndices = 0x3094;       // index buffer object (renderer.cpp)
+    constexpr uint32_t kDevDepthControl = 0x2934;  // RB_DEPTHCONTROL in the register mirror (renderer.cpp, Reg)
     constexpr uint32_t kDevSnapSize = kDevSnapEnd - kDevSnapBegin;
     // The device block is captured as a delta: 256-byte chunks that changed since the previous call's capture (a draw typically changes a few constants and pointers, not all 11.5 KB). The render thread keeps the block up to date and overlays its own copy
     constexpr uint32_t kDevChunk = 256;
@@ -124,6 +135,12 @@ namespace sst::native
       size_t current_ = 0, used_ = 0, bytes_ = 0;
     };
 
+    struct TextureSnap
+    {
+      uint32_t begin, end; // physical
+      const uint8_t *data;
+    };
+
     struct Command
     {
       enum Kind : uint8_t
@@ -145,6 +162,12 @@ namespace sst::native
       float z = 0;
       const uint8_t *data = nullptr; // event text / shader container (arena)
       uint32_t size = 0, object = 0;
+      // Draw-time copies of volatile textures (arena), handed to the renderer before the draw runs
+      const TextureSnap *tex = nullptr;
+      uint32_t tex_count = 0;
+      // Draw-time copies of the draw's small vertex buffers (arena)
+      const Renderer::GuestCopy *verts = nullptr;
+      uint32_t vert_count = 0;
       // Device block delta (threaded): chunks set in dev_mask, packed in dev_delta (arena)
       uint32_t dev_addr = 0;
       uint64_t dev_mask = 0;
@@ -189,6 +212,12 @@ namespace sst::native
       };
 
       std::unordered_map<uint32_t, UcodeCopy> ucode_copies; // live address -> this frame's copy
+      // Volatile textures (texture_cache.h): the set as last copied, and the base pages already copied this frame
+      uint64_t watch_version = UINT64_MAX;
+      guest_watch::Set watch;
+      uint64_t frame_texture_bytes = 0;
+      std::unordered_set<uint32_t> textures_copied;
+      uint64_t texture_bytes = 0, vertex_bytes = 0;
       // Device block as last captured (game thread) / as of the command being run (render thread)
       uint32_t dev_snap_addr = 0, rt_dev_addr = 0;
       std::unique_ptr<uint8_t[]> dev_snap{new uint8_t[kDevSnapSize]}, rt_dev{new uint8_t[kDevSnapSize]};
@@ -296,7 +325,34 @@ namespace sst::native
       }
     }
 
+    void ExecuteUnguarded(State &s, const Command &c);
+
+    // A C++ exception escaping a command (std::bad_alloc / length_error from a draw whose guest data was garbage, e.g. freed while
+    // queued) would end the process without a crash report: log it, skip the command and carry on
     void Execute(State &s, const Command &c)
+    {
+      try
+      {
+        ExecuteUnguarded(s, c);
+      }
+      catch (const std::exception &e)
+      {
+        SetGuestOverlays(nullptr, 0);
+        s.renderer.SetDrawVertexCopies(nullptr, 0);
+        static std::atomic<uint32_t> logged{0};
+
+        if (logged.fetch_add(1) < 20)
+          REXLOG_ERROR("[sst-native] command {} failed and was skipped: {} (draw: prim {} indexed {} start {} count {} base vertex {} UP {:08X})", int(c.kind), e.what(), c.draw.prim, c.draw.indexed, c.draw.start, c.draw.count, c.draw.base_vertex, c.draw.up_data);
+      }
+      catch (...)
+      {
+        SetGuestOverlays(nullptr, 0);
+        s.renderer.SetDrawVertexCopies(nullptr, 0);
+        REXLOG_ERROR("[sst-native] command {} failed with an unknown exception and was skipped", int(c.kind));
+      }
+    }
+
+    void ExecuteUnguarded(State &s, const Command &c)
     {
       GuestOverlay overlays[9];
       uint32_t count = 0;
@@ -313,7 +369,12 @@ namespace sst::native
       switch (c.kind)
       {
       case Command::kDraw:
+        for (uint32_t i = 0; i < c.tex_count; ++i)
+          s.renderer.AddTextureSnapshot(c.tex[i].begin, c.tex[i].end, c.tex[i].data);
+
+        s.renderer.SetDrawVertexCopies(c.verts, c.vert_count);
         s.renderer.Draw(base, c.draw);
+        s.renderer.SetDrawVertexCopies(nullptr, 0);
         break;
 
       case Command::kClear:
@@ -469,6 +530,223 @@ namespace sst::native
         Overlay(live, size, copy);
       }
 
+      void RefreshWatch()
+      {
+        if (const uint64_t v = guest_watch::Version(); v != s_.watch_version)
+        {
+          guest_watch::Copy(s_.watch);
+          s_.watch_version = v;
+        }
+      }
+
+      // Vertices the draw reads from the start of each vertex buffer (the stream offset is part of the fetch address): start + count,
+      // or the highest index + base vertex. 0 when the draw is too big to check cheaply.
+      uint32_t DrawVertices(uint32_t dev, const DrawCall &call)
+      {
+        constexpr uint32_t kMaxIndices = 4096;
+
+        if (!call.indexed)
+          return call.count <= kMaxIndices ? call.start + call.count : 0;
+
+        if (call.count > kMaxIndices)
+          return 0;
+
+        const uint32_t ib = Be32(dev + kDevIndices);
+
+        if (!Plausible(ib))
+          return 0;
+
+        const uint32_t common = Be32(ib);
+        const bool index32 = (common >> 31) & 1;
+        const uint32_t endian = (common >> 29) & 3;
+        const uint32_t ib_addr = ToVirtual(Be32(ib + 0x18) & ~3u);
+        const uint32_t isz = index32 ? 4 : 2;
+
+        if (!Plausible(ib_addr) || !GuestReadable(ib_addr + call.start * isz, call.count * isz))
+          return 0;
+
+        // As the renderer decodes them: whole dwords around the range, swapped by the index buffer's swap mode, read little-endian
+        const uint32_t first_byte = call.start * isz;
+        const uint32_t aligned_begin = first_byte & ~3u;
+        const uint32_t aligned_end = (first_byte + call.count * isz + 3) & ~3u;
+        const uint8_t *src = HostPtr(s_.base, ib_addr + aligned_begin);
+        uint32_t words[kMaxIndices + 2];
+        const uint32_t nwords = std::min<uint32_t>((aligned_end - aligned_begin) / 4, uint32_t(std::size(words)));
+
+        for (uint32_t k = 0; k < nwords; ++k)
+        {
+          uint32_t x;
+          std::memcpy(&x, src + 4 * k, 4);
+          words[k] = endian == 1 ? ((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu) : endian == 2 ? __builtin_bswap32(x)
+                                                                                     : endian == 3   ? (x << 16) | (x >> 16)
+                                                                                                     : x;
+        }
+
+        const uint8_t *idx = reinterpret_cast<const uint8_t *>(words) + (first_byte - aligned_begin);
+        uint32_t max_index = 0;
+
+        for (uint32_t k = 0; k < call.count; ++k)
+        {
+          uint32_t v;
+
+          if (index32)
+          {
+            std::memcpy(&v, idx + 4 * k, 4);
+
+            if (v == 0xFFFFFFFFu)
+              continue; // strip restart
+          }
+          else
+          {
+            uint16_t h;
+            std::memcpy(&h, idx + 2 * k, 2);
+
+            if (h == 0xFFFFu)
+              continue;
+
+            v = h;
+          }
+
+          max_index = std::max(max_index, v);
+        }
+
+        const uint64_t vertices = uint64_t(call.base_vertex) + max_index + 1;
+        return vertices <= 16 * kMaxIndices ? uint32_t(vertices) : 0;
+      }
+
+      // Textures the draw samples that the game rewrites: copied now (once per frame each), because the game may have written the next
+      // frame's data by the time the render thread gets to this draw. Textures seen changing: always. Any known texture: for UI-sized
+      // draws (portraits, previews and text pages the game reloads as screens change), within a per-frame budget.
+      // A draw that tests depth (anything but ALWAYS) is part of the 3D scene, not UI, however few vertices it has. Small 3D draws
+      // (court details, effects) read static data; copying their textures and vertices filled the per-frame budget in matches
+      // (16 MB of textures + 12 MB of vertices a frame), slow on low-end CPUs and leaving the real HUD's textures uncopied.
+      bool DepthTested(uint32_t dev)
+      {
+        const uint32_t dc = Be32(dev + kDevDepthControl);
+        return (dc & 2) && ((dc >> 4) & 7) != 7;
+      }
+
+      void Textures(uint32_t dev, bool ui)
+      {
+        if (!Plausible(dev))
+          return;
+
+        RefreshWatch();
+
+        if (s_.watch.textures.empty())
+          return;
+
+        constexpr uint64_t kFrameBudget = 16ull << 20;
+        TextureSnap snaps[64];
+        uint32_t n = 0;
+
+        auto add = [&](uint32_t addr, uint32_t size)
+        {
+          if (!addr || !size || uint64_t(addr) + size > 0x20000000u || n >= 64 || !GuestPhysicalReadable(addr, size))
+            return;
+
+          uint8_t *copy = s_.arena->Alloc(size);
+          std::memcpy(copy, HostPtr(s_.base, addr | 0xA0000000u), size);
+          snaps[n++] = {addr, addr + size, copy};
+          s_.texture_bytes += size;
+          s_.frame_texture_bytes += size;
+        };
+
+        for (uint32_t i = 0; i < 32; ++i)
+        {
+          const uint32_t a = dev + kDevFetchConstants + 24 * i;
+
+          if ((Be32(a) & 3) != 2)
+            continue;
+
+          const uint32_t page = (Be32(a + 4) >> 12) & 0x1FFFF;
+          auto it = s_.watch.textures.find(page);
+
+          if (it == s_.watch.textures.end())
+            continue;
+
+          const guest_watch::TextureRange &r = it->second;
+
+          if (!r.changing && (!ui || s_.frame_texture_bytes + r.base_size + r.mip_size > kFrameBudget))
+            continue;
+
+          if (!s_.textures_copied.insert(page).second)
+            continue;
+
+          add(r.base_addr, r.base_size);
+          add(r.mip_addr, r.mip_size);
+        }
+
+        if (!n)
+          return;
+
+        auto *list = reinterpret_cast<TextureSnap *>(s_.arena->Alloc(sizeof(TextureSnap) * n));
+        std::copy(snaps, snaps + n, list);
+        cmd_.tex = list;
+        cmd_.tex_count = n;
+      }
+
+      // Vertex data the draw reads that the game rewrites between draws (UI sprites and text: one buffer reused for the next sprite, or
+      // data seen changing between frames): copied with every draw, as much as it reads. Static model data is read live.
+      void Vertices(uint32_t dev, uint32_t vertices, bool ui)
+      {
+        if (!Plausible(dev))
+          return;
+
+        RefreshWatch();
+        constexpr uint32_t kMaxStride = 64, kUiVertices = 256, kMaxBuffer = 1u << 20, kMaxPerDraw = 2u << 20;
+        Renderer::GuestCopy copies[16];
+        uint32_t n = 0, total = 0;
+
+        for (uint32_t slot = 0; slot < 96 && n < 16; ++slot)
+        {
+          const uint32_t dw0 = Be32(dev + kDevFetchConstants + 8 * slot);
+
+          if ((dw0 & 3) != 3)
+            continue;
+
+          const uint32_t phys = dw0 & 0x1FFFFFFCu;
+
+          if (!phys)
+            continue;
+
+          uint32_t want = 0;
+
+          if (auto it = s_.watch.vertices.find(phys); it != s_.watch.vertices.end())
+            want = std::max(it->second, vertices * kMaxStride);
+          else if (ui && vertices && vertices <= kUiVertices)
+            want = vertices * kMaxStride;
+
+          const uint32_t size = std::min({Be32(dev + kDevFetchConstants + 8 * slot + 4) & 0x03FFFFFCu, want, kMaxBuffer});
+
+          if (!size || total + size > kMaxPerDraw)
+            continue;
+
+          bool dup = false;
+
+          for (uint32_t i = 0; i < n && !dup; ++i)
+            dup = copies[i].begin == phys && copies[i].end - copies[i].begin >= size;
+
+          if (dup || !GuestPhysicalReadable(phys, size))
+            continue;
+
+          uint8_t *copy = s_.arena->Alloc(size);
+          std::memcpy(copy, HostPtr(s_.base, phys | 0xA0000000u), size);
+          copies[n++] = {phys, phys + size, copy};
+          total += size;
+        }
+
+        s_.vertex_bytes += total;
+
+        if (!n)
+          return;
+
+        auto *list = reinterpret_cast<Renderer::GuestCopy *>(s_.arena->Alloc(sizeof(Renderer::GuestCopy) * n));
+        std::copy(copies, copies + n, list);
+        cmd_.verts = list;
+        cmd_.vert_count = n;
+      }
+
       // The device block's chunks that changed since the last capture
       void DeviceDelta(uint32_t dev)
       {
@@ -555,6 +833,8 @@ namespace sst::native
         s_.batch.frame = ++s_.frame;
         Flush();
         s_.ucode_copies.clear();
+        s_.textures_copied.clear();
+        s_.frame_texture_bytes = 0;
         const auto wait_start = Clock::now();
         {
           std::unique_lock lock(s_.queue_mutex);
@@ -805,6 +1085,16 @@ namespace sst::native
           [&](Capture &cap, Command &)
           {
             cap.Device(call.device);
+            const uint32_t vertices = call.up_data ? 0 : cap.DrawVertices(call.device, call);
+            const bool ui = !cap.DepthTested(call.device);
+
+            if (REXCVAR_GET(sst_native_draw_copies))
+            {
+              cap.Textures(call.device, ui && (call.up_data ? call.count <= 256 : vertices && vertices <= 256));
+
+              if (!call.up_data)
+                cap.Vertices(call.device, vertices, ui);
+            }
 
             if (call.up_data)
               cap.Range(call.up_data, call.up_stride * (call.start + call.count));
@@ -1073,13 +1363,15 @@ namespace sst::native
       REXLOG_INFO("[sst-native] perf: game thread per frame: {:.2f} ms capturing {} calls ({:.1f} MB "
                   "of snapshots), {:.2f} ms waiting for the render thread; game frames over 20 ms: "
                   "{} (longest {:.1f} ms); longest capture in one frame {:.2f} ms; device block chunks "
-                  "copied {:.1f}%{}",
+                  "copied {:.1f}%; textures copied {:.2f} MB ({} known); vertex data copied {:.2f} MB ({} buffers watched){}",
                   s.capture_ms / frames, uint64_t(double(s.captured) / frames + 0.5), double(s.snapshot_bytes) / frames / (1 << 20), s.wait_ms / frames, s.swaps_over_20, s.swap_max_ms, s.capture_max_ms,
                   s.dev_chunks_total ? 100.0 * double(s.dev_chunks_copied) / double(s.dev_chunks_total) : 0.0,
+                  double(s.texture_bytes) / frames / (1 << 20), s.watch.textures.size(), double(s.vertex_bytes) / frames / (1 << 20), s.watch.vertices.size(),
                   s.ucode_skipped ? fmt::format("; {} draws without a microcode snapshot", s.ucode_skipped) : std::string());
       s.dev_chunks_copied = s.dev_chunks_total = 0;
       s.capture_ms = s.wait_ms = 0;
       s.captured = s.snapshot_bytes = s.period_frames = s.ucode_skipped = 0;
+      s.texture_bytes = s.vertex_bytes = 0;
       s.swap_max_ms = 0;
       s.swaps_over_20 = 0;
       s.capture_max_ms = 0;

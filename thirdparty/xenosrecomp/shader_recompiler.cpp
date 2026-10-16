@@ -1691,12 +1691,18 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
     else
     {
         out += "\n\tuint pc = 0;\n";
+#ifdef SST_RECOMP
+        // Port: a bounded loop. Jumps back depend on constants (light counts), and a draw with a huge count (seen at character load
+        // on Intel: PS 8E16CA25A35B980E) loops long enough that Windows resets the GPU (device removed / TDR). Every jump is one pass
+        // here; real shaders take a few dozen (8 lights per loop, a few jumps per light). 4096 was still too slow on a UHD 630.
+        out += "\tuint sstLoopGuard = 0;\n";
+        out += "\twhile (++sstLoopGuard <= 256u)\n";
+#else
         out += "\twhile (true)\n";
+#endif
         out += "\t{\n";
-#ifndef SST_RECOMP
         out += "\t\tswitch (pc)\n";
         out += "\t\t{\n";
-#endif
     }
 
     controlFlowCode = code;
@@ -1715,17 +1721,9 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
             if (!simpleControlFlow)
             {
                 indentation = 3;
-#ifdef SST_RECOMP
-                // SST: an if-chain instead of a switch with fall-through cases. Block N runs when pc <= N, so control falls
-                // through in order from pc on; a jump sets pc and restarts the loop. Intel's shader compiler mishandled the
-                // switch form (character materials drawn wrong on Intel GPUs only).
-                if (pc != 0)
-                    out += "\t\t}\n";
-                println("\t\tif (pc <= {})", pc);
-                out += "\t\t{\n";
-#else
+                // (SST cache versions 8-12 used an if-chain here, "if (pc <= N) { ... }"; 13 went back to the switch. The Intel GPU
+                // hangs blamed on it were the cube map scratch array - see CubeMapData in shader_common.h, cache version 14.)
                 println("\t\tcase {}:", pc);
-#endif
             }
             else
             {
@@ -1940,34 +1938,34 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
                     if (simpleControlFlow)
 #endif
                     {
-                    specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
+                        specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
 
-                    indent();
-                    out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)";
-                    indent();
-                    out += '{';
+                        indent();
+                        out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)";
+                        indent();
+                        out += '{';
 
-                    indent();
-                    out += "\tclip(oC0.w - g_AlphaThreshold);\n";
+                        indent();
+                        out += "\tclip(oC0.w - g_AlphaThreshold);\n";
 
-                    indent();
-                    out += "}";
+                        indent();
+                        out += "}";
 
 #ifdef UNLEASHED_RECOMP
-                    specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
+                        specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
 
-                    indent();
-                    out += "else if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_COVERAGE)";
-                    indent();
-                    out += '{';
+                        indent();
+                        out += "else if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_COVERAGE)";
+                        indent();
+                        out += '{';
 
-                    indent();
-                    out += "\toC0.w *= 1.0 + computeMipLevel(pixelCoord) * 0.25;\n";
-                    indent();
-                    out += "\toC0.w = 0.5 + (oC0.w - g_AlphaThreshold) / max(fwidth(oC0.w), 1e-6);\n";
+                        indent();
+                        out += "\toC0.w *= 1.0 + computeMipLevel(pixelCoord) * 0.25;\n";
+                        indent();
+                        out += "\toC0.w = 0.5 + (oC0.w - g_AlphaThreshold) / max(fwidth(oC0.w), 1e-6);\n";
 
-                    indent();
-                    out += '}';
+                        indent();
+                        out += '}';
 #endif
                     }
                 }
@@ -1987,6 +1985,10 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
                         // depth range kept the normal way round: an inverted range (MinDepth > MaxDepth) loses the small depth gaps of
                         // eyes / moustaches / decals over the surface under them on Intel GPUs
                         out += "\tif (g_SstDepthFlip != 0)\n\t\toPos.z = oPos.w - oPos.z;\n";
+                        // Port: a vertex with a non-finite or absurd position (garbage skinning / vertex data while a model loads) is
+                        // moved behind the near plane, so its triangles are clipped. Huge triangles with heavy pixel shaders made Intel
+                        // GPUs hang long enough for a reset (device removed / TDR). Real clip-space values stay far below 1e7.
+                        out += "\tif (!all(isfinite(oPos)) || max(max(abs(oPos.x), abs(oPos.y)), max(abs(oPos.z), abs(oPos.w))) > 1e7)\n\t\toPos = float4(0.0, 0.0, -2.0, 1.0);\n";
 #endif
                     }
                 }
