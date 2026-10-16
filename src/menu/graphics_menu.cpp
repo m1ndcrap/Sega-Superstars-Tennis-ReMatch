@@ -1467,10 +1467,10 @@ namespace sst::menu
     g_loaded_from_file = Load(s);
     g_current = s;
     Apply(g_current);
-    REXLOG_INFO("[sst-menu] video settings{}: {}", g_loaded_from_file ? " (sst_settings.ini)" : "", Describe(g_current));
     // ASPECT RATIO 4:3: a 4:3 video mode (1280x1024, the game's HD 4:3 mode) makes the game pick its 4:3 layouts and cameras at boot
     g_boot_aspect = std::clamp(g_current.v[kAspect], 0, 4);
     g_boot_precision = g_current.v[kShaderPrecision];
+    REXLOG_INFO("[sst-menu] video settings{}: {}", g_loaded_from_file ? " (sst_settings.ini)" : "", Describe(g_current));
     g_boot_four_three = g_boot_aspect == 0;
     ApplyAspect(nullptr); // scenes loaded at boot already see the aspect
     if (g_boot_four_three)

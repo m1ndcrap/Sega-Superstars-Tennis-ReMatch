@@ -4,7 +4,7 @@ A native Windows port of the Xbox 360 version of Sega Superstars Tennis, recompi
 
 ## Features
 
-- **Native D3D12 renderer**: internal resolution up to 2160p, render scale, FXAA/MSAA, shadows resolution, bloom toggle, brightness, VSync, a 30/60 FPS limit toggle, and an FPS counter. All of these are set in a new **VIDEO** page in Settings and in the pause menu.
+- **Native D3D12 renderer**: internal resolution up to 2160p, render scale, FXAA/MSAA, shadows resolution, bloom toggle, shader quality (ACCURATE, or FAST for weak GPUs), brightness, VSync, a 30/60 FPS limit toggle, and an FPS counter. All of these are set in a new **VIDEO** page in Settings and in the pause menu.
 - **Aspect ratios**: 4:3, 16:9, 16:10, 21:9 and 32:9. The 3D view is widened, and menu backgrounds fill the screen. The HUD adjust to each aspect ratio for a more natural look.
 - **Keyboard and mouse support**, with rebindable keys (**CONTROLS -> KEY BINDINGS**). Button prompts follow the device you're using (Xbox, PlayStation or keyboard icons).
 - **PlayStation controllers**: DualShock/DualSense prompts, a DualShock 3 diagram on the CONTROLS page, and an adaptive lightbar to distinguish which controller belongs to which player.
@@ -71,6 +71,7 @@ Requirements: Clang 18+, CMake 3.25+, Ninja, the Windows SDK (for `dxcompiler.dl
 
    The build also precompiles the game's shaders (target `sst_shader_pack`, tool `tools/shader_bake`). It reads the ShaderCache files from `assets/`, translates every shader with XenosRecomp, compiles each variant the renderer can use with DXC, and embeds the result in the exe, compressed (unpacked once at startup). The first build takes a minute or so for this; later builds only recompile shaders whose translation changed (`out/build/<preset>/shader_bake_work`). Options:
    - `-DSST_SHADER_BAKE=OFF`: skip it (shaders then compile on players' machines on first use).
+   - `-DSST_SHADER_BAKE_FAST=OFF`: skip the second pack for VIDEO > SHADER QUALITY: FAST (~40 MB of the exe, about twice the bake time on a clean build). Without it, FAST falls back to ACCURATE.
    - `-DSST_GAME_DIR=<path>`: the extracted game, if it isn't in `assets/`.
    - Shaders the game generates while running aren't in any game file, so the first build can't include them. The exe saves each one it has to compile to `cache/containers` next to itself, and the next build bakes them in automatically. Before a release, run the exe from the build folder, play through every character, court and mode once, then rebuild.
    - `-DSST_SHADER_DUMP_DIR=<path>`: also bake another folder of saved shaders (e.g. `cache/containers` copied from another PC, or `--sst_dump_shaders=true` output in `<exe>/d3d_trace/shaders`).

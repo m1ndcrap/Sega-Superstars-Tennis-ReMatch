@@ -146,14 +146,14 @@ namespace sst::native
       std::atomic<uint64_t> g_constant_version{0};
     }
 
-    void ConstantUse(uint64_t key, uint32_t bytes)
+    void ConstantUse(uint64_t key, uint32_t chunk_mask)
     {
       std::lock_guard lock(g_constant_mutex);
-      uint32_t &b = g_constant_use[key];
+      uint32_t &m = g_constant_use[key];
 
-      if (bytes > b)
+      if ((m | chunk_mask) != m)
       {
-        b = bytes;
+        m |= chunk_mask;
         g_constant_version.fetch_add(1, std::memory_order_release);
       }
     }

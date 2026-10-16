@@ -249,6 +249,12 @@ namespace sst::native
     // Bytes of the constant file a shader reads: up to its highest register, or everything with relative addressing. Cached per entry
     uint32_t ConstantBytes(const ShaderEntry *entry);
     std::unordered_map<const ShaderEntry *, uint32_t> constant_bytes_;
+    // Float constant chunks the shader reads (bit i = c[16i .. 16i+15]; all 16 if unknown or relatively addressed), for the game thread
+    uint32_t ConstantChunkMask(const ShaderEntry *entry);
+    std::unordered_map<const ShaderEntry *, uint32_t> constant_chunks_;
+    // ConstantUse keys already published with this mask (saves a global lock per draw)
+    std::unordered_map<uint64_t, uint32_t> constant_use_published_;
+    void PublishConstantUse(uint64_t key, uint32_t mask);
     // Geometry cache: decoded vertex / converted index data in one video memory pool (bump allocated; when full, everything is re-stored on next use)
     struct GeoEntry
     {

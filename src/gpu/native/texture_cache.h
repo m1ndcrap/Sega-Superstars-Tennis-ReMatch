@@ -47,11 +47,11 @@ namespace sst::native
     uint64_t Version(); // changes whenever the set does
     void Copy(Set &out);
 
-    // Float constant bytes a shader's draws use (the renderer uploads that many: Renderer::ConstantBytes; memory-export shaders all
-    // 4096), keyed by shader object and microcode pointer (ShaderKey). The game thread compares only those constant chunks of the device
-    // block per draw. Only ever grows per key.
+    // Float constant chunks a shader's draws read: bit i = c[16i .. 16i+15] (Renderer::ConstantChunkMask; memory-export shaders and
+    // shaders with relative constant addressing: all 16), keyed by shader object and microcode pointer (ShaderKey). The game thread
+    // compares only those constant chunks of the device block per draw. Only ever grows per key (bits are ORed in).
     inline uint64_t ShaderKey(uint32_t object, uint32_t ucode) { return (uint64_t(object) << 32) | ucode; }
-    void ConstantUse(uint64_t key, uint32_t bytes); // render thread
+    void ConstantUse(uint64_t key, uint32_t chunk_mask); // render thread
     uint64_t ConstantUseVersion();
     void CopyConstantUse(std::unordered_map<uint64_t, uint32_t> &out);
   }

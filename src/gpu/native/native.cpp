@@ -314,6 +314,8 @@ namespace sst::native
       {
         uint32_t size;
         const uint8_t *data;
+        uint32_t stamp = 0; // write_watch::Stamp at the copy / last compare
+        bool armed = false;
       };
 
       std::unordered_map<uint32_t, UcodeCopy> ucode_copies; // live address -> this frame's copy
@@ -322,7 +324,9 @@ namespace sst::native
       guest_watch::Set watch;
       // Constant bytes per shader (object, microcode) as the renderer uses them (guest_watch::ConstantUse)
       uint64_t constant_use_version = UINT64_MAX;
-      std::unordered_map<uint64_t, uint32_t> constant_use;
+      std::unordered_map<uint64_t, uint32_t> constant_use; // ShaderKey -> constant chunk mask
+      // ConstantChunks for the last (VS key, PS key, constant-use version): consecutive draws mostly keep their shaders
+      uint64_t cc_vs = ~0ull, cc_ps = ~0ull, cc_version = ~0ull, cc_result = 0;
       uint64_t dev_chunks_skipped = 0;
       // Vertex copies per buffer this logging period (perf line: where the copied bytes go)
       struct VertexCopyStat
@@ -358,11 +362,17 @@ namespace sst::native
       {
         const uint8_t *data;
         uint32_t size;
-        uint32_t stamp = 0;  // write_watch::Stamp of [phys, phys + size) when it was copied / last compared
-        bool armed = false;  // stamp is valid (watched since)
+        uint32_t stamp = 0;            // write_watch::Stamp of [phys, phys + size) when it was copied / last compared
+        bool armed = false;            // stamp is valid (watched since)
         WatchHealth *health = nullptr; // watch_health entry (3D path; looked up once per frame)
       };
       std::unordered_map<uint32_t, LastCopy> vertex_copies_this_frame;
+      uint64_t ucode_reuse_by_watch = 0;
+      // Microcode pages written while the microcode stays the same (busy data on the same pages): over 32 in a frame turns the
+      // microcode watch off for the session (each such write is a page fault)
+      uint64_t ucode_false_frame = 0;
+      uint32_t ucode_false = 0;
+      bool ucode_watch_off = false;
       uint64_t vertex_copies_reused = 0, vertex_reuse_by_watch = 0, vertex_watch_arms = 0, vertex_watch_false = 0;
       // Buffers whose watched pages keep getting written while the buffer's own bytes don't change (other data shares the page):
       // each such write is a page fault, so they go back to comparing for a while
@@ -703,16 +713,53 @@ namespace sst::native
 
         const uint8_t *host = HostPtr(s_.base, live);
         auto it = s_.ucode_copies.find(live);
+        // Microcode in the 0xA0000000 / 0xC0000000 views (physical = address - view base): write-watched, so an unchanged one isn't compared
+        const bool watch = write_watch::g_memory && !s_.ucode_watch_off && live >= 0xA0000000u && live < 0xE0000000u;
+        const uint32_t phys = live & 0x1FFFFFFFu;
 
-        if (it != s_.ucode_copies.end() && it->second.size == size && std::memcmp(it->second.data, host, size) == 0)
+        if (it != s_.ucode_copies.end() && it->second.size == size)
         {
-          Overlay(live, size, it->second.data);
-          return;
+          if (watch && it->second.armed && write_watch::Stamp(phys, size) == it->second.stamp)
+          {
+            Overlay(live, size, it->second.data);
+            ++s_.ucode_reuse_by_watch;
+            return;
+          }
+
+          const uint32_t stamp = watch ? write_watch::Stamp(phys, size) : 0;
+
+          if (watch)
+            write_watch::Arm(phys, size);
+
+          if (std::memcmp(it->second.data, host, size) == 0)
+          {
+            if (watch && it->second.armed)
+            {
+              if (s_.ucode_false_frame != s_.frame)
+                s_.ucode_false_frame = s_.frame, s_.ucode_false = 0;
+
+              if (++s_.ucode_false > 32)
+              {
+                s_.ucode_watch_off = true;
+                REXLOG_INFO("[sst-native] VS microcode write watch off: its pages are written often while the microcode stays the same");
+              }
+            }
+
+            it->second.stamp = stamp;
+            it->second.armed = watch;
+            Overlay(live, size, it->second.data);
+            return;
+          }
         }
+
+        const uint32_t stamp = watch ? write_watch::Stamp(phys, size) : 0;
+
+        if (watch)
+          write_watch::Arm(phys, size);
 
         uint8_t *copy = s_.arena->Alloc(size);
         std::memcpy(copy, host, size);
-        s_.ucode_copies[live] = {size, copy};
+        s_.ucode_copies[live] = {size, copy, stamp, watch};
         Overlay(live, size, copy);
       }
 
@@ -1121,9 +1168,9 @@ namespace sst::native
       }
 
       // The device block's chunks that changed since the last capture
-      // Device-block chunks worth comparing for this call: everything but the VS / PS float constants past what the bound shaders use
-      // (as the renderer reports it: guest_watch::ConstantUse). The compare is ~23 KB of reads per call - 2 ms a frame on a laptop -
-      // and 8 KB of it is constants, most of them unused by any one shader. Chunks not compared keep their old value in both the
+      // Device-block chunks worth comparing for this call: everything but the VS / PS float constant chunks the bound shaders don't read
+      // (as the renderer reports it: guest_watch::ConstantUse chunk masks). The compare is ~23 KB of reads per call and 8 KB of it is
+      // constants, many of them unused by any one shader. Chunks not compared keep their old value in both the
       // snapshot and the render thread's copy, so they stay in step and are sent as soon as a shader that reads them is drawn.
       uint64_t ConstantChunks(uint32_t dev)
       {
@@ -1137,27 +1184,33 @@ namespace sst::native
           s_.constant_use_version = v;
         }
 
-        auto bytes = [&](uint32_t object, uint32_t ucode_offset) -> uint32_t
+        // VS object +0x20 / PS object +0x18: the microcode pointer (both snapshotted, so the renderer keys them alike). ~0: unknown
+        auto key = [&](uint32_t object, uint32_t ucode_offset) -> uint64_t
         {
-          if (!object || !Plausible(object))
-            return 4096;
-
-          auto it = s_.constant_use.find(guest_watch::ShaderKey(object, Be32(object + ucode_offset)));
-          return it != s_.constant_use.end() ? std::min(it->second, 4096u) : 4096u;
+          return object && Plausible(object) ? guest_watch::ShaderKey(object, Be32(object + ucode_offset)) : ~0ull;
         };
 
-        // VS object +0x20 / PS object +0x18: the microcode pointer (both snapshotted, so the renderer keys them alike)
-        const uint32_t vs_chunks = (bytes(Be32(dev + 0x3198), 0x20) + kDevChunk - 1) / kDevChunk;
-        const uint32_t ps_chunks = (bytes(Be32(dev + 0x3194), 0x18) + kDevChunk - 1) / kDevChunk;
-        uint64_t skip = 0;
+        const uint64_t vs_key = key(Be32(dev + 0x3198), 0x20), ps_key = key(Be32(dev + 0x3194), 0x18);
 
-        for (uint32_t i = vs_chunks; i < 16; ++i)
-          skip |= uint64_t(1) << (kVsFirst + i);
+        if (vs_key == s_.cc_vs && ps_key == s_.cc_ps && s_.constant_use_version == s_.cc_version)
+          return s_.cc_result;
 
-        for (uint32_t i = ps_chunks; i < 16; ++i)
-          skip |= uint64_t(1) << (kPsFirst + i);
+        // Chunk masks the renderer published (bit i = c[16i .. 16i+15]); unknown shaders: every chunk
+        auto mask = [&](uint64_t k) -> uint64_t
+        {
+          if (k == ~0ull)
+            return 0xFFFF;
 
-        return kAll & ~skip;
+          auto it = s_.constant_use.find(k);
+          return it != s_.constant_use.end() ? (it->second & 0xFFFF) : 0xFFFF;
+        };
+
+        const uint64_t skip = ((~mask(vs_key) & 0xFFFF) << kVsFirst) | ((~mask(ps_key) & 0xFFFF) << kPsFirst);
+        s_.cc_vs = vs_key;
+        s_.cc_ps = ps_key;
+        s_.cc_version = s_.constant_use_version;
+        s_.cc_result = kAll & ~skip;
+        return s_.cc_result;
       }
 
       void DeviceDelta(uint32_t dev, uint64_t compare)
@@ -1867,6 +1920,11 @@ namespace sst::native
         REXLOG_INFO("[sst-native] perf: texture copies by texture:{} ({} textures; seen changing {:.2f} MB/frame)", text, v.size(), double(changing_bytes) / frames / (1 << 20));
         s.texture_copy_stats.clear();
       }
+
+      if (s.ucode_reuse_by_watch)
+        REXLOG_INFO("[sst-native] perf: VS microcode reused without comparing (write watch): {:.1f}/frame", double(s.ucode_reuse_by_watch) / frames);
+
+      s.ucode_reuse_by_watch = 0;
 
       if (s.texture_checks_hashed)
         REXLOG_INFO("[sst-native] perf: UI textures checked by hash: {:.1f}/frame, {:.1f}/frame unchanged (not copied)", double(s.texture_checks_hashed) / frames, double(s.texture_checks_unchanged) / frames);
