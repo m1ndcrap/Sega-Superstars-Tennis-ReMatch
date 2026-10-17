@@ -34,6 +34,7 @@ set(SSTREMATCH_SOURCES
   src/menu/script_asm.cpp
   src/menu/main_menu_quit.cpp
   src/movie/movie_debug.cpp
+  src/movie/movie_audio.cpp
   src/input/devices.cpp
   src/input/key_bindings.cpp
   src/debug/crash_log.cpp

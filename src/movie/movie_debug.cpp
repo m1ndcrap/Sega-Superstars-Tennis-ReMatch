@@ -32,7 +32,7 @@ namespace
 
   bool Plausible(uint32_t addr)
   {
-    return addr >= 0x10000000u && addr < 0xF0000000u;
+    return addr >= 0x10000000u && addr <= 0xFFFFF000u; // (physical allocations live at 0xE0000000-0xFFFFFFFF)
   }
 
   std::string GuestString(uint8_t *base, uint32_t addr, size_t max = 260)
