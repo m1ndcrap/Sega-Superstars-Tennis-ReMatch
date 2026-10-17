@@ -1,6 +1,7 @@
-// sst_rematch - ultrawide HUD anchoring
+// Ultrawide HUD anchoring
 
 #include "menu/hud_anchor.h"
+#include "menu/be_bytes.h"
 
 #include <algorithm>
 #include <cmath>
@@ -14,38 +15,15 @@ namespace sst::menu::hud
 {
   namespace
   {
-    uint32_t Rd32(const uint8_t *p)
-    {
-      return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
-    }
-
-    float RdF(const uint8_t *p)
-    {
-      const uint32_t u = Rd32(p);
-      float f;
-      std::memcpy(&f, &u, 4);
-      return f;
-    }
-
-    void WrF(uint8_t *p, float f)
-    {
-      uint32_t u;
-      std::memcpy(&u, &f, 4);
-      p[0] = uint8_t(u >> 24), p[1] = uint8_t(u >> 16), p[2] = uint8_t(u >> 8), p[3] = uint8_t(u);
-    }
-
-    constexpr uint32_t Tag(const char (&s)[5])
-    {
-      return (uint32_t(uint8_t(s[0])) << 24) | (uint32_t(uint8_t(s[1])) << 16) | (uint32_t(uint8_t(s[2])) << 8) | uint32_t(uint8_t(s[3]));
-    }
-
     struct Track
     {
       uint8_t *keys;
       uint16_t count, kind;
       float w;
+
       size_t KeySize() const { return kind == 2 ? 0x38 : kind == 1 ? 0x64
                                                                    : 0x28; } // 1: PART
+
       float X() const { return count ? RdF(keys + 0xC) : 0.0f; }
     };
 
@@ -62,8 +40,10 @@ namespace sst::menu::hud
     static const char *kNames[] = {"hud.dat", "hudicons.dat", "spechud.dat", "stadiumig.dat", "ingame.dat"};
 
     for (const char *n : kNames)
+    {
       if (name == n)
         return true;
+    }
 
     return false;
   }
@@ -77,6 +57,7 @@ namespace sst::menu::hud
   {
     if (shift <= 0.0f)
       return 0;
+
     // Chunks
     uint8_t *kfrm = nullptr, *objs = nullptr, *scne = nullptr;
     size_t kfrm_size = 0, objs_size = 0, scne_size = 0;
@@ -143,8 +124,10 @@ namespace sst::menu::hud
           const uint32_t kids = Rd32(objs + off + 0x14), list = Rd32(objs + off + 0x18);
 
           if (list + 4 * size_t(kids) <= objs_size)
+          {
             for (uint32_t c = 0; c < kids; ++c)
               o.children.push_back(Rd32(objs + list + 4 * c));
+          }
         }
 
         objects[Rd32(e)] = std::move(o);
@@ -306,21 +289,25 @@ namespace sst::menu::hud
         continue;
 
       const float centre = 0.5f * (lo + hi);
+
       // Elements spanning most of the width (backgrounds, banners) stay centred.
       const float side_by_centre = !sides || (hi - lo) > 0.6f ? 0.0f : centre < 0.42f ? -1.0f
-                                                         : centre > 0.58f   ? 1.0f
-                                                                            : 0.0f;
+                                                                   : centre > 0.58f   ? 1.0f
+                                                                                      : 0.0f;
       // (Edge-only scenes: the element must also reach the outer part of its side)
       const float side = edge_only && ((side_by_centre < 0.0f && lo > 0.15f) || (side_by_centre > 0.0f && hi < 0.85f)) ? 0.0f : side_by_centre;
 
       if (log)
+      {
         log->push_back(fmt::format("{:08X} x {:.3f}-{:.3f} -> {}", h, lo, hi, side < 0 ? "left" : side > 0 ? "right"
                                                                                                            : "centre"));
+      }
 
       if (side == 0.0f)
       {
         // Centred elements that wait outside the 16:9 frame (banners that slide in, e.g. POINT / OUT / DOUBLE FAULT) would show in the extra width: keyframes that are off the frame move off the wider screen too
         int parked = 0;
+
         // park(object, where its group rests, every x its group can be at): a keyframe that is off the frame where the group rests moves off the wider screen, if the object also has a keyframe on screen there (it slides in: an unused 2P / 3P banner), or if that keyframe is off the frame wherever the group goes (it simply waits off-screen). Objects that only come on screen as their group slides (a second page) stay. Sizes come from pictures (texts, often blank, only when a group has no pictures), each part at its own resting place. A part that waits off-screen only counts as waiting when its whole group is off that side as well: a group that straddles the edge is one picture cut by it (the MsgBox loading ring sits in the top-left corner until the game moves it next to a player), not a stray
         std::function<void(uint32_t, float, const std::vector<float> &, Ext, int)> park = [&](uint32_t c, float rest_x, const std::vector<float> &group_xs, Ext parent, int depth)
         {
@@ -332,11 +319,16 @@ namespace sst::menu::hud
           auto ct = tracks.find(c);
           Ext e = Size(c);
           std::vector<float> xs; // this object's keyframe x values
+
           if (ct != tracks.end())
+          {
             for (uint16_t k = 0; k < ct->second.count; ++k)
               xs.push_back(RdF(ct->second.keys + k * ct->second.KeySize() + 0xC));
+          }
           else
+          {
             xs.push_back(0.0f);
+          }
 
           if (ct != tracks.end() && e.Valid())
           {
@@ -396,11 +388,16 @@ namespace sst::menu::hud
           std::vector<float> child_xs;
 
           for (float g : group_xs)
+          {
             for (float x : xs)
+            {
               if (child_xs.size() < 64)
                 child_xs.push_back(g + x);
+            }
+          }
 
           Ext here; // this group at rest, on the layout
+
           if (e.Valid())
             here.Add(rest_x + rest + e.lo, rest_x + rest + e.hi);
 

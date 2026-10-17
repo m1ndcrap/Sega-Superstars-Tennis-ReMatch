@@ -1,6 +1,7 @@
-// sst_rematch - QUIT: the main menu script patch
+// QUIT: the main menu script patch
 
 #include "menu/main_menu_quit.h"
+#include "menu/script_asm.h"
 
 #include <algorithm>
 #include <cstring>
@@ -10,165 +11,26 @@
 
 namespace sst::menu::quit
 {
+  using script::Asm;
+  using script::ModuleSize;
+
   namespace
   {
-    uint32_t Rd32(const uint8_t *p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
     int32_t S32(uint32_t v) { return int32_t(v); }
-
-    void Wr32(uint8_t *p, uint32_t v)
-    {
-      p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
-    }
-
-    void Put32(Bytes &b, uint32_t v)
-    {
-      b.push_back(uint8_t(v >> 24)), b.push_back(uint8_t(v >> 16)), b.push_back(uint8_t(v >> 8)), b.push_back(uint8_t(v));
-    }
-
-    // Script bytecode (opcodes: claude/ingame-menu-re.md, tools/sbn_asm.py); addresses are module offsets
-    class Asm
-    {
-    public:
-      explicit Asm(uint32_t base) : base_(base) {}
-      uint32_t pc() const { return base_ + uint32_t(b_.size()); }
-      void u8(uint8_t v) { b_.push_back(v); }
-      void u16(uint16_t v) { u8(uint8_t(v >> 8)), u8(uint8_t(v)); }
-      void u32(uint32_t v) { Put32(b_, v); }
-      void pushi(int32_t v) { u8(0x01), u32(uint32_t(v)); }
-      void pushh_raw(uint32_t h) { u8(0x02), u32(h); }
-      void pushg(uint16_t g) { u8(0x09), u16(g); }
-      void op(uint8_t o) { u8(0x0D), u8(o); }
-      void native(uint8_t group, uint8_t index, uint8_t argc) { u8(0x12), u8(argc), u16(uint16_t(group << 8 | index)); }
-      void push0() { u8(0x17); }
-      void pop() { u8(0x18); }
-      void ret() { u8(0x1B); }
-      void yield() { u8(0x1D); }
-      void index() { u8(0x23); }
-      void stabs(int16_t s) { u8(0x27), u16(uint16_t(s)); }
-      void pushabs(int16_t s) { u8(0x29), u16(uint16_t(s)); }
-      void setgh(uint32_t h) { u8(0x2D), u32(h); }
-      void pushgh(uint32_t h) { u8(0x2F), u32(h); }
-      // call (short form): argc, i32 relative to the next instruction
-      void call(uint8_t argc, uint32_t target)
-      {
-        u8(0x1A), u8(argc);
-        u32(uint32_t(int32_t(target) - int32_t(pc() + 4)));
-      }
-
-      // call to a label in this code
-      void call_label(uint8_t argc, int label)
-      {
-        u8(0x1A), u8(argc);
-        calls_.push_back({b_.size(), label});
-        u32(0);
-      }
-
-      void jump_abs(uint8_t opc, uint32_t target)
-      {
-        u8(opc);
-        u16(uint16_t(int16_t(int32_t(target) - int32_t(pc() + 2))));
-      }
-
-      uint32_t address(int label) const { return labels_[label]; }
-
-      // 0x13 jt, 0x14 jf, 0x15 jmp: i16 relative to the next instruction
-      void jump(uint8_t opc, int label)
-      {
-        u8(opc);
-        fix_.push_back({b_.size(), label});
-        u16(0);
-      }
-
-      int label()
-      {
-        labels_.push_back(UINT32_MAX);
-        return int(labels_.size()) - 1;
-      }
-
-      void here(int l) { labels_[l] = pc(); }
-
-      bool finish(Bytes &out)
-      {
-        for (auto [at, l] : calls_)
-        {
-          if (labels_[l] == UINT32_MAX)
-            return false;
-
-          Wr32(b_.data() + at, uint32_t(int32_t(labels_[l]) - int32_t(base_ + at + 4)));
-        }
-
-        for (auto [at, l] : fix_)
-        {
-          if (labels_[l] == UINT32_MAX)
-            return false;
-
-          const int32_t rel = int32_t(labels_[l]) - int32_t(base_ + at + 2);
-
-          if (rel < -32768 || rel > 32767)
-            return false;
-
-          b_[at] = uint8_t(uint16_t(rel) >> 8);
-          b_[at + 1] = uint8_t(rel);
-        }
-
-        out = b_;
-        return true;
-      }
-
-    private:
-      uint32_t base_;
-      Bytes b_;
-      std::vector<uint32_t> labels_;
-      std::vector<std::pair<size_t, int>> fix_;
-      std::vector<std::pair<size_t, int>> calls_;
-    };
 
     // mainmenu facts (Xbox)
     constexpr int16_t kSlotLevel = 12, kSlotCursor = 13, kSlotTimer = 15, kSlotLeave = 25; // level: 1 category list, 0 sub-items
     constexpr uint16_t kGlobalActions = 7;
     constexpr int kRowIndex = 6; // the new category (after OPTIONS, index 5)
+
     // Message box (script "msgbox"): message to show (cleared when dismissed), its flags, the chosen button
     constexpr uint32_t kMsgId = 0x1473B103, kMsgChoice = 0x65AEA351;
     constexpr std::pair<uint32_t, int32_t> kMsgFlags[] = {{0x94557658, 1}, {0xDD766DAB, 1}, {0xD0CA61AA, 1}, {0x100F3079, -1}};
 
-    // The category list's "select" code for a row without sub-items:
-    //   push0; pushg 7; pushabs 13; index; pushi 0; index; call 1 -> action(); pop; pushi 0; stabs 15; pushi 1; stabs 25
+    // The category list's "select" code for a row without sub-items: push0, pushg 7, pushabs 13, index, pushi 0, index, call 1 -> action(), pop, pushi 0, stabs 15, pushi 1, stabs 25
     // (bytes 16-23 of the call: argc, i32 target, debug line)
     constexpr uint8_t kSelectSig[] = {0x17, 0x09, 0x00, 0x07, 0x29, 0x00, 0x0D, 0x23, 0x01, 0x00, 0x00, 0x00, 0x00, 0x23, 0x34, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x18, 0x01, 0x00, 0x00, 0x00, 0x00, 0x27, 0x00, 0x0F, 0x01, 0x00, 0x00, 0x00, 0x01, 0x27, 0x00, 0x19};
     constexpr size_t kSelectWild0 = 16, kSelectWild1 = 24; // call target + debug line
-
-    size_t ModuleSize(const uint8_t *m, size_t max_size)
-    {
-      if (max_size < 0x20)
-        return 0;
-
-      const uint32_t code = Rd32(m), functab = Rd32(m + 4), t2 = Rd32(m + 8), t3 = Rd32(m + 12), debug = Rd32(m + 28);
-
-      if (code != 0x20 || !(code <= functab && functab <= t2 && t2 <= t3 && t3 <= debug) || debug + 4 > max_size)
-        return 0;
-
-      const uint32_t first = Rd32(m + debug);
-
-      if (first < debug + 4 || ((first - debug) & 3) || first - debug > 64)
-        return 0;
-
-      size_t end = first;
-
-      for (uint32_t p = debug; p < first; p += 4)
-      {
-        size_t s = Rd32(m + p);
-
-        while (s < max_size && m[s])
-          ++s;
-
-        if (s >= max_size)
-          return 0;
-
-        end = std::max(end, s + 1);
-      }
-
-      return (end + 3) & ~size_t(3);
-    }
   }
 
   std::optional<Bytes> PatchScript(const uint8_t *m, size_t size, std::string &error)
@@ -187,6 +49,7 @@ namespace sst::menu::quit
 
     if (nglob < 11 || t2 + 4 + 5 * size_t(nglob) > t3)
       return error = "globals", std::nullopt;
+
     // Arrays of the category tables: the expected sizes (6 categories; table 10: two labels per category with sub-items)
     struct Arr
     {
@@ -228,6 +91,7 @@ namespace sst::menu::quit
         {8, 6, {{0, 0}}},
         {10, 10, {{kOptionsFrom, 3}, {kOptionsTo, 3}}}, // OPTIONS (category 5) pushes the new row down
     };
+
     std::vector<Arr> arrays;
 
     for (const Change &c : changes)
@@ -242,6 +106,7 @@ namespace sst::menu::quit
 
     // The select code
     uint32_t site = 0, action_fn = 0;
+
     int found = 0;
 
     for (uint32_t p = 0x20; p + sizeof(kSelectSig) <= functab; ++p)
@@ -276,8 +141,10 @@ namespace sst::menu::quit
       int starts = 0;
 
       for (uint32_t p = 0x20; p + sizeof(kLoopStart) <= functab; ++p)
+      {
         if (std::memcmp(m + p, kLoopStart, sizeof(kLoopStart)) == 0)
           loop_start = p, ++starts;
+      }
 
       if (starts != 1)
         return error = fmt::format("main loop found {} times", starts), std::nullopt;
@@ -297,11 +164,12 @@ namespace sst::menu::quit
     }
 
     // Code added after the game's code:
-    //   ask:    the YES / NO message; YES quits
-    //   select: replaces the select code: the new row asks, any other row runs the original code
-    //   frame:  called at the end of every main loop frame: Esc on the category list (abs 12 = 1) asks too; then the frame's yield
+    // ask: the YES / NO message; YES quits
+    // select: replaces the select code: the new row asks, any other row runs the original code
+    // frame: called at the end of every main loop frame: Esc on the category list (abs 12 = 1) asks too; then the frame's yield
     Asm a(functab);
     const int ask = a.label(), wait = a.label(), closed = a.label(), no = a.label(), other = a.label(), frame = a.label(), no_esc = a.label();
+
     // select
     a.pushabs(kSlotCursor);
     a.pushi(kRowIndex);
@@ -327,6 +195,7 @@ namespace sst::menu::quit
     a.stabs(kSlotLeave);
     a.push0();
     a.ret();
+
     // ask
     a.here(ask);
     a.native(0x53, uint8_t(kNativeDialogBegin), 0);
@@ -357,6 +226,7 @@ namespace sst::menu::quit
     a.here(no);
     a.push0();
     a.ret();
+
     // frame
     a.here(frame);
     a.pushabs(kSlotLevel);
@@ -370,6 +240,7 @@ namespace sst::menu::quit
     a.yield();
     a.push0();
     a.ret();
+
     Bytes fn;
 
     if (!a.finish(fn))
@@ -381,11 +252,13 @@ namespace sst::menu::quit
       fn.push_back(0x11); // nop
 
     const uint32_t d1 = uint32_t(fn.size());
+
     // New module: [0, functab) code | function | [functab, t3) function table and globals | new arrays | [t3, end) symbols and debug info
     Bytes out(m, m + functab);
     out.insert(out.end(), fn.begin(), fn.end());
     out.insert(out.end(), m + functab, m + t3);
     const uint32_t block = uint32_t(out.size());
+
     // [kAction]: elements, then the object
     const uint32_t action_elems = uint32_t(out.size());
     Put32(out, kAction);
@@ -440,6 +313,7 @@ namespace sst::menu::quit
       Put32(out, n);
       Put32(out, uint32_t(int32_t(elems) - int32_t(obj)));
       Put32(out, 0x80000000u | n);
+
       // The global now points at the new array
       const uint32_t slot = old.slot + d1;
       Wr32(out.data() + slot, uint32_t(int32_t(obj) - int32_t(slot)));
@@ -447,6 +321,7 @@ namespace sst::menu::quit
 
     const uint32_t d2 = uint32_t(out.size()) - block;
     out.insert(out.end(), m + t3, m + msize);
+
     // The main loop's frame end calls "frame" instead of yielding itself
     {
       Asm s(loop_end);
@@ -463,6 +338,7 @@ namespace sst::menu::quit
       code.resize(14, 0x11); // nop
       std::copy(code.begin(), code.end(), out.begin() + loop_end);
     }
+
     // The select code calls "select" (the start of the added code) instead
     {
       Asm s(site);
@@ -477,6 +353,7 @@ namespace sst::menu::quit
       code.resize(sizeof(kSelectSig), 0x11); // nop
       std::copy(code.begin(), code.end(), out.begin() + site);
     }
+
     // Header and debug info pointers
     Wr32(out.data() + 4, functab + d1);
     Wr32(out.data() + 8, t2 + d1);

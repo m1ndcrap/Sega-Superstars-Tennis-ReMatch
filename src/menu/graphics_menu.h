@@ -1,4 +1,4 @@
-// sst_rematch - in-game VIDEO page (Options > Settings > VIDEO)
+// The port's menu changes (VIDEO page, QUIT, CONTROLS, wide layouts, etc) startup. See menu_internal.h for the parts...
 
 #pragma once
 

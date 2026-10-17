@@ -1,6 +1,8 @@
-// sst_rematch - native renderer: textures and samplers (see texture_cache.h)
+// Native renderer: textures and samplers
 
 #include "gpu/native/texture_cache.h"
+#include "gpu/native/guest_watch.h"
+#include "gpu/native/texture_formats.h"
 #include "gpu/native/guest_memory.h"
 
 #include <atomic>
@@ -23,163 +25,13 @@
 #include <cmath>
 #include <cstring>
 
-REXCVAR_DEFINE_BOOL(sst_native_textures, true, "SST",
-                    "Native renderer: emulate textures (false = white placeholders)");
-
-REXCVAR_DEFINE_INT32(sst_native_anisotropy, -1, "SST",
-                     "Native renderer: anisotropic filtering. -1 = as the game asks, 0 = off, "
-                     "2 / 4 / 8 / 16 = force that level on mipmapped linear textures");
-
-REXCVAR_DEFINE_INT32(sst_native_texture_budget_mb, 1536, "SST",
-                     "Native renderer: video memory for textures before unused ones are freed");
-
-REXCVAR_DEFINE_BOOL(sst_native_texture_srgb, false, "SST",
-                    "Native renderer: sample gamma textures as sRGB (linearised). Off until "
-                    "render targets are emulated with gamma, which re-encodes the result");
+REXCVAR_DEFINE_BOOL(sst_native_textures, true, "SST", "Native renderer: emulate textures (false = white placeholders)");
+REXCVAR_DEFINE_INT32(sst_native_anisotropy, -1, "SST", "Native renderer: anisotropic filtering. -1 = as the game asks, 0 = off, 2 / 4 / 8 / 16 = force that level on mipmapped linear textures");
+REXCVAR_DEFINE_INT32(sst_native_texture_budget_mb, 1536, "SST", "Native renderer: video memory for textures before unused ones are freed");
+REXCVAR_DEFINE_BOOL(sst_native_texture_srgb, false, "SST", "Native renderer: sample gamma textures as sRGB (linearised). Off until render targets are emulated with gamma, which re-encodes the result");
 
 namespace sst::native
 {
-  namespace guest_watch
-  {
-    namespace
-    {
-      constexpr uint64_t kForgetFrames = 3600; // a minute without changes
-
-      struct TextureEntry
-      {
-        TextureRange range;
-        uint64_t last_change = 0;
-      };
-
-      struct VertexEntry
-      {
-        uint32_t bytes = 0;
-        uint64_t last_change = 0;
-      };
-
-      std::mutex g_mutex;
-      std::unordered_map<uint32_t, TextureEntry> g_textures;
-      std::unordered_map<uint32_t, VertexEntry> g_vertices;
-      std::atomic<uint64_t> g_version{0};
-
-      void Bump() { g_version.fetch_add(1, std::memory_order_release); }
-    }
-
-    void KnownTexture(uint32_t base_page, const TextureRange &range)
-    {
-      std::lock_guard lock(g_mutex);
-      TextureEntry &e = g_textures[base_page];
-      const bool changing = e.range.changing, external = e.range.external;
-      e.range = range;
-      e.range.changing = changing;
-      e.range.external = external;
-      Bump();
-    }
-
-    void ExternalTexture(uint32_t base_page, bool external)
-    {
-      std::lock_guard lock(g_mutex);
-      TextureEntry &e = g_textures[base_page]; // (also before the texture is ever loaded from guest memory)
-
-      if (e.range.external != external)
-      {
-        e.range.external = external;
-        Bump();
-      }
-    }
-
-    void TextureChanged(uint32_t base_page, uint64_t frame)
-    {
-      std::lock_guard lock(g_mutex);
-      auto it = g_textures.find(base_page);
-
-      if (it == g_textures.end())
-        return;
-
-      it->second.last_change = frame;
-
-      if (!it->second.range.changing)
-      {
-        it->second.range.changing = true;
-        Bump();
-      }
-    }
-
-    void VerticesChanged(uint32_t phys, uint32_t bytes, uint64_t frame)
-    {
-      std::lock_guard lock(g_mutex);
-      VertexEntry &e = g_vertices[phys];
-      e.last_change = frame;
-
-      if (bytes > e.bytes)
-      {
-        e.bytes = bytes;
-        Bump();
-      }
-    }
-
-    void Prune(uint64_t frame)
-    {
-      std::lock_guard lock(g_mutex);
-      bool changed = false;
-
-      for (auto &[page, e] : g_textures)
-        if (e.range.changing && frame > e.last_change + kForgetFrames)
-        {
-          e.range.changing = false;
-          changed = true;
-        }
-
-      changed |= std::erase_if(g_vertices, [&](const auto &e)
-                               { return frame > e.second.last_change + kForgetFrames; }) > 0;
-
-      if (changed)
-        Bump();
-    }
-
-    uint64_t Version() { return g_version.load(std::memory_order_acquire); }
-
-    namespace
-    {
-      std::mutex g_constant_mutex;
-      std::unordered_map<uint64_t, uint32_t> g_constant_use;
-      std::atomic<uint64_t> g_constant_version{0};
-    }
-
-    void ConstantUse(uint64_t key, uint32_t chunk_mask)
-    {
-      std::lock_guard lock(g_constant_mutex);
-      uint32_t &m = g_constant_use[key];
-
-      if ((m | chunk_mask) != m)
-      {
-        m |= chunk_mask;
-        g_constant_version.fetch_add(1, std::memory_order_release);
-      }
-    }
-
-    uint64_t ConstantUseVersion() { return g_constant_version.load(std::memory_order_acquire); }
-
-    void CopyConstantUse(std::unordered_map<uint64_t, uint32_t> &out)
-    {
-      std::lock_guard lock(g_constant_mutex);
-      out = g_constant_use;
-    }
-
-    void Copy(Set &out)
-    {
-      std::lock_guard lock(g_mutex);
-      out.textures.clear();
-      out.vertices.clear();
-
-      for (const auto &[page, e] : g_textures)
-        out.textures.emplace(page, e.range);
-
-      for (const auto &[phys, e] : g_vertices)
-        out.vertices.emplace(phys, e.bytes);
-    }
-  }
-
   void TextureCache::AddSnapshot(uint32_t begin, uint32_t end, const uint8_t *data)
   {
     if (data && end > begin)
@@ -189,8 +41,10 @@ namespace sst::native
   const uint8_t *TextureCache::Source(uint32_t addr, uint32_t size) const
   {
     for (const Snapshot &s : snapshots_)
+    {
       if (addr >= s.begin && uint64_t(addr) + size <= s.end)
         return s.data - s.begin;
+    }
 
     return membase_;
   }
@@ -198,333 +52,13 @@ namespace sst::native
   using Microsoft::WRL::ComPtr;
   namespace xenos = rex::graphics::xenos;
   namespace texture_util = rex::graphics::texture_util;
+  using namespace texture_format;
   using rex::graphics::FormatInfo;
 
   namespace
   {
     constexpr uint32_t kGuestPhysicalSize = 0x20000000u;
     constexpr uint64_t kFrameUploadLimit = 64ull << 20; // new textures per frame (bytes)
-
-    enum class Load : uint8_t
-    {
-      kNone,
-      kCopy,
-      k565,
-      k1555,
-      k4444,
-      kDepthUnorm,
-      kDepthFloat
-    };
-
-    constexpr uint16_t Swz(uint32_t x, uint32_t y, uint32_t z, uint32_t w)
-    {
-      return uint16_t(x | (y << 3) | (z << 6) | (w << 9));
-    }
-
-    constexpr uint16_t kRGBA = Swz(0, 1, 2, 3), kRGGG = Swz(0, 1, 1, 1), kRRRR = Swz(0, 0, 0, 0), kRGBB = Swz(0, 1, 2, 2);
-
-    // Host representation of a guest format. `swizzle` maps the guest's data components (x y z w) to host components (as in Xenia's host format table)
-    struct HostFormat
-    {
-      DXGI_FORMAT unorm = DXGI_FORMAT_UNKNOWN;
-      DXGI_FORMAT snorm = DXGI_FORMAT_UNKNOWN; // UNKNOWN: no signed variant
-      Load load = Load::kNone;
-      uint8_t host_bpb = 0; // bytes per host block (texel for uncompressed)
-      bool block = false;   // host format is 4x4 block-compressed
-      uint16_t swizzle = kRGBA;
-    };
-
-    HostFormat GetHostFormat(uint32_t format)
-    {
-      using F = xenos::TextureFormat;
-
-      auto plain = [](DXGI_FORMAT u, DXGI_FORMAT s, uint8_t bpb, uint16_t swz)
-      {
-        return HostFormat{u, s, Load::kCopy, bpb, false, swz};
-      };
-
-      auto bc = [](DXGI_FORMAT u, uint8_t bpb, uint16_t swz)
-      {
-        return HostFormat{u, DXGI_FORMAT_UNKNOWN, Load::kCopy, bpb, true, swz};
-      };
-
-      switch (F(format))
-      {
-      case F::k_8:
-      case F::k_8_A:
-        return plain(DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_SNORM, 1, kRRRR);
-
-      case F::k_1_5_5_5:
-        return {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, Load::k1555, 4, false, kRGBA};
-
-      case F::k_5_6_5:
-        return {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, Load::k565, 4, false, kRGBB};
-
-      case F::k_4_4_4_4:
-        return {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, Load::k4444, 4, false, kRGBA};
-
-      case F::k_8_8_8_8:
-      case F::k_8_8_8_8_A:
-      case F::k_8_8_8_8_AS_16_16_16_16:
-        return plain(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_SNORM, 4, kRGBA);
-
-      case F::k_2_10_10_10:
-      case F::k_2_10_10_10_AS_16_16_16_16:
-        return plain(DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_UNKNOWN, 4, kRGBA);
-
-      case F::k_8_8:
-        return plain(DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8_SNORM, 2, kRGGG);
-
-      case F::k_DXT1:
-      case F::k_DXT1_AS_16_16_16_16:
-        return bc(DXGI_FORMAT_BC1_UNORM, 8, kRGBA);
-
-      case F::k_DXT2_3:
-      case F::k_DXT2_3_AS_16_16_16_16:
-        return bc(DXGI_FORMAT_BC2_UNORM, 16, kRGBA);
-
-      case F::k_DXT4_5:
-      case F::k_DXT4_5_AS_16_16_16_16:
-        return bc(DXGI_FORMAT_BC3_UNORM, 16, kRGBA);
-
-      case F::k_DXN:
-        return bc(DXGI_FORMAT_BC5_UNORM, 16, kRGGG);
-
-      case F::k_DXT5A:
-        return bc(DXGI_FORMAT_BC4_UNORM, 8, kRRRR);
-
-      case F::k_24_8:
-        return {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN, Load::kDepthUnorm, 4, false, kRRRR};
-
-      case F::k_24_8_FLOAT:
-        return {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN, Load::kDepthFloat, 4, false, kRRRR};
-
-      case F::k_16:
-        return plain(DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_SNORM, 2, kRRRR);
-
-      case F::k_16_16:
-        return plain(DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_SNORM, 4, kRGGG);
-
-      case F::k_16_16_16_16:
-        return plain(DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16B16A16_SNORM, 8, kRGBA);
-
-      case F::k_16_EXPAND:
-      case F::k_16_FLOAT:
-        return plain(DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_UNKNOWN, 2, kRRRR);
-
-      case F::k_16_16_EXPAND:
-      case F::k_16_16_FLOAT:
-        return plain(DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_UNKNOWN, 4, kRGGG);
-
-      case F::k_16_16_16_16_EXPAND:
-      case F::k_16_16_16_16_FLOAT:
-        return plain(DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_UNKNOWN, 8, kRGBA);
-
-      case F::k_32_FLOAT:
-        return plain(DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN, 4, kRRRR);
-
-      case F::k_32_32_FLOAT:
-        return plain(DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_UNKNOWN, 8, kRGGG);
-
-      case F::k_32_32_32_32_FLOAT:
-        return plain(DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_UNKNOWN, 16, kRGBA);
-
-      default:
-        return {};
-      }
-    }
-
-    DXGI_FORMAT SrgbVariant(DXGI_FORMAT f)
-    {
-      switch (f)
-      {
-      case DXGI_FORMAT_R8G8B8A8_UNORM:
-        return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-
-      case DXGI_FORMAT_BC1_UNORM:
-        return DXGI_FORMAT_BC1_UNORM_SRGB;
-
-      case DXGI_FORMAT_BC2_UNORM:
-        return DXGI_FORMAT_BC2_UNORM_SRGB;
-
-      case DXGI_FORMAT_BC3_UNORM:
-        return DXGI_FORMAT_BC3_UNORM_SRGB;
-
-      default:
-        return f;
-      }
-    }
-
-    const char *FormatName(uint32_t format)
-    {
-      const FormatInfo *fi = FormatInfo::Get(format);
-      return fi && fi->name ? fi->name : "?";
-    }
-
-    void SwapEndian(uint8_t *p, uint32_t n, uint32_t endian)
-    {
-      switch (endian)
-      {
-      case 1: // 8in16
-        for (uint32_t i = 0; i + 1 < n; i += 2)
-          std::swap(p[i], p[i + 1]);
-
-        break;
-
-      case 2: // 8in32
-        for (uint32_t i = 0; i + 3 < n; i += 4)
-        {
-          uint32_t v;
-          std::memcpy(&v, p + i, 4);
-          v = __builtin_bswap32(v);
-          std::memcpy(p + i, &v, 4);
-        }
-
-        break;
-
-      case 3: // 16in32
-        for (uint32_t i = 0; i + 3 < n; i += 4)
-        {
-          uint32_t v;
-          std::memcpy(&v, p + i, 4);
-          v = (v >> 16) | (v << 16);
-          std::memcpy(p + i, &v, 4);
-        }
-
-        break;
-
-      default:
-        break;
-      }
-    }
-
-    // Xenos 20e4 float depth (upper 24 bits) -> float32 (Xenia's Float20e4To32)
-    uint32_t Float20e4To32(uint32_t f24)
-    {
-      f24 &= 0xFFFFFF;
-
-      if (!f24)
-        return 0;
-
-      uint32_t mantissa = f24 & 0xFFFFF;
-      uint32_t exponent = f24 >> 20;
-
-      if (!exponent)
-      {
-        uint32_t lz = 0;
-
-        while (!(mantissa & (0x80000u >> lz)) && lz < 20)
-          ++lz;
-
-        lz += 1; // shift so the leading 1 leaves the 20-bit mantissa
-        exponent = uint32_t(1 - int32_t(lz));
-        mantissa = (mantissa << lz) & 0xFFFFF;
-      }
-
-      return ((exponent + 112) << 23) | (mantissa << 3);
-    }
-
-    // Converts one swapped guest block into the host block
-    void Convert(Load load, const uint8_t *in, uint32_t in_bytes, uint8_t *out)
-    {
-      switch (load)
-      {
-      case Load::kCopy:
-        std::memcpy(out, in, in_bytes);
-        break;
-
-      case Load::k565:
-      {
-        uint16_t v;
-        std::memcpy(&v, in, 2);
-        const uint32_t r = v & 31, g = (v >> 5) & 63, b = (v >> 11) & 31;
-        out[0] = uint8_t((r << 3) | (r >> 2));
-        out[1] = uint8_t((g << 2) | (g >> 4));
-        out[2] = uint8_t((b << 3) | (b >> 2));
-        out[3] = 255;
-        break;
-      }
-
-      case Load::k1555:
-      {
-        uint16_t v;
-        std::memcpy(&v, in, 2);
-        const uint32_t r = v & 31, g = (v >> 5) & 31, b = (v >> 10) & 31;
-        out[0] = uint8_t((r << 3) | (r >> 2));
-        out[1] = uint8_t((g << 3) | (g >> 2));
-        out[2] = uint8_t((b << 3) | (b >> 2));
-        out[3] = (v >> 15) ? 255 : 0;
-        break;
-      }
-
-      case Load::k4444:
-      {
-        uint16_t v;
-        std::memcpy(&v, in, 2);
-
-        for (int i = 0; i < 4; ++i)
-          out[i] = uint8_t(((v >> (4 * i)) & 15) * 17);
-
-        break;
-      }
-
-      case Load::kDepthUnorm:
-      {
-        uint32_t v;
-        std::memcpy(&v, in, 4);
-        const float f = float(v >> 8) * (1.0f / 16777215.0f);
-        std::memcpy(out, &f, 4);
-        break;
-      }
-
-      case Load::kDepthFloat:
-      {
-        uint32_t v;
-        std::memcpy(&v, in, 4);
-        const uint32_t f = Float20e4To32(v >> 8);
-        std::memcpy(out, &f, 4);
-        break;
-      }
-
-      default:
-        break;
-      }
-    }
-
-    uint32_t Log2Floor(uint32_t v)
-    {
-      uint32_t r = 0;
-
-      while (v >>= 1)
-        ++r;
-
-      return r;
-    }
-
-    D3D12_TEXTURE_ADDRESS_MODE AddressMode(xenos::ClampMode m)
-    {
-      switch (m)
-      {
-      case xenos::ClampMode::kRepeat:
-        return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-
-      case xenos::ClampMode::kMirroredRepeat:
-        return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
-
-      case xenos::ClampMode::kClampToEdge:
-      case xenos::ClampMode::kClampToHalfway:
-        return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-
-      case xenos::ClampMode::kMirrorClampToEdge:
-      case xenos::ClampMode::kMirrorClampToHalfway:
-        return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
-
-      default:
-        return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-      }
-    }
-
-    const char kSwizzleChars[] = "xyzw01??";
 
   }
 
@@ -588,8 +122,10 @@ namespace sst::native
     std::vector<std::pair<uint64_t, uint64_t>> candidates; // (used frame, key hash)
 
     for (const auto &[hash, t] : textures_)
+    {
       if (t->used_frame + 4 < frame_)
         candidates.emplace_back(t->used_frame, hash);
+    }
 
     std::sort(candidates.begin(), candidates.end());
 
@@ -689,13 +225,13 @@ namespace sst::native
     if (stats_.logged < 48)
     {
       ++stats_.logged;
-      REXLOG_INFO("[sst-native] texture #{}: {}x{}{} {} {} {}, mips {}-{}{}, base {:08X} ({} bytes), "
-                  "mips {:08X} ({} bytes), endian {}{} -> DXGI {}",
-                  stats_.created, k.width, k.height, dim == xenos::DataDimension::k3D ? fmt::format("x{}", k.depth_or_array) : dim == xenos::DataDimension::kCube ? std::string(" cube")
-                                                                                                                           : k.depth_or_array > 1                 ? fmt::format(" [{}]", k.depth_or_array)
-                                                                                                                                                                  : std::string(),
-                  FormatName(k.format), k.tiled ? "tiled" : "linear", fmt::format("pitch {}", k.pitch << 5), k.mip_min, k.mip_max, k.packed ? " (packed tail)" : "", k.base_page << 12, t->base_size, k.mip_page << 12, t->mip_size, k.endian, k.signed_mode == 1 ? ", signed" : k.signed_mode == 2 ? ", sRGB"
-                                                                                                                                                                                                                                                                                                    : "",
+      REXLOG_INFO("[sst-native] texture #{}: {}x{}{} {} {} {}, mips {}-{}{}, base {:08X} ({} bytes), mips {:08X} ({} bytes), endian {}{} -> DXGI {}", stats_.created, k.width, k.height,
+                  dim == xenos::DataDimension::k3D ? fmt::format("x{}", k.depth_or_array) : dim == xenos::DataDimension::kCube ? std::string(" cube")
+                                                                                        : k.depth_or_array > 1                 ? fmt::format(" [{}]", k.depth_or_array)
+                                                                                                                               : std::string(),
+                  FormatName(k.format), k.tiled ? "tiled" : "linear", fmt::format("pitch {}", k.pitch << 5), k.mip_min, k.mip_max, k.packed ? " (packed tail)" : "", k.base_page << 12, t->base_size, k.mip_page << 12, t->mip_size, k.endian,
+                  k.signed_mode == 1 ? ", signed" : k.signed_mode == 2 ? ", sRGB"
+                                                                       : "",
                   uint32_t(format));
     }
 
@@ -762,6 +298,7 @@ namespace sst::native
     const auto start = std::chrono::steady_clock::now();
     std::vector<UINT> loaded;
     uint8_t block[16];
+
     // Button-icon atlas pages: the icons follow the input device in use (prompts.h)
     int prompt_page = -1;
 
@@ -784,6 +321,7 @@ namespace sst::native
       const uint32_t stored = std::min(level, layout.packed_level);
       const texture_util::TextureGuestLayout::Level &lay = is_base ? layout.base : layout.mips[stored];
       const uint32_t level_addr = is_base ? (k.base_page << 12) : (k.mip_page << 12) + layout.mip_offsets_bytes[stored];
+
       // This frame's copy of the data (volatile textures), else guest memory
       const uint32_t region_begin = is_base ? (k.base_page << 12) : (k.mip_page << 12);
       const uint32_t region_size = is_base ? t.base_size : t.mip_size;
@@ -792,6 +330,7 @@ namespace sst::native
 
       if (src_mem != membase_)
         ++stats_.from_snapshots;
+
       uint32_t ox = 0, oy = 0, oz = 0;
 
       if (level >= layout.packed_level)
@@ -952,6 +491,7 @@ namespace sst::native
     }
 
     const auto dim = tf.dimension;
+
     // Shader dimension (FetchOpDimension: 0 1D, 1 2D, 2 3D/stacked, 3 cube) vs the texture
     uint32_t view_kind = 0; // 0 2D, 1 3D, 2 cube
     bool compatible = false;
@@ -982,9 +522,7 @@ namespace sst::native
       ++stats_.dimension_mismatch;
 
       if (LogOnce(0x300000000ull | (uint64_t(fetch_dimension) << 8) | uint64_t(dim) << 4 | uint64_t(tf.stacked)))
-        REXLOG_WARN("[sst-native] texture: shader samples dimension {} but the texture is {}{} "
-                    "(placeholder)",
-                    fetch_dimension, uint32_t(dim), tf.stacked ? " stacked" : "");
+        REXLOG_WARN("[sst-native] texture: shader samples dimension {} but the texture is {}{} (placeholder)", fetch_dimension, uint32_t(dim), tf.stacked ? " stacked" : "");
 
       return kNone;
     }
@@ -1013,8 +551,11 @@ namespace sst::native
     if (used_signs & ~1u)
     {
       if (LogOnce(0x400000000ull | (uint64_t(format) << 8) | used_signs))
-        REXLOG_INFO("[sst-native] texture: {} with signs {}{}{}{} (swizzle {}{}{}{}): {}", FormatName(format), signs[0], signs[1], signs[2], signs[3], kSwizzleChars[swizzle & 7], kSwizzleChars[(swizzle >> 3) & 7], kSwizzleChars[(swizzle >> 6) & 7], kSwizzleChars[(swizzle >> 9) & 7], signed_mode == 1 ? "signed format" : signed_mode == 2 ? "sRGB format"
-                                                                                                                                                                                                                                                                                                                                                  : "sampled as unsigned (not emulated yet)");
+      {
+        REXLOG_INFO("[sst-native] texture: {} with signs {}{}{}{} (swizzle {}{}{}{}): {}", FormatName(format), signs[0], signs[1], signs[2], signs[3], kSwizzleChars[swizzle & 7], kSwizzleChars[(swizzle >> 3) & 7], kSwizzleChars[(swizzle >> 6) & 7], kSwizzleChars[(swizzle >> 9) & 7],
+                    signed_mode == 1 ? "signed format" : signed_mode == 2 ? "sRGB format"
+                                                                          : "sampled as unsigned (not emulated yet)");
+      }
     }
 
     if (tf.exp_adjust != 0 && LogOnce(0x500000000ull | uint32_t(tf.exp_adjust & 63)))
@@ -1070,6 +611,7 @@ namespace sst::native
 
     // Button-icon pages are uploaded again when the icons to show change (another input device)
     const bool prompt_stale = t->resident && t->prompt_page >= 0 && t->prompt_generation != prompts::Generation();
+
     // Textures whose data hasn't changed for a while are re-checked every 8th frame only (staggered), which keeps hashing cheap in matches
     const bool throttled = !prompt_stale && t->resident && t->stable_checks >= 60 && ((frame_ + (hash >> 61)) & 7) != 0;
 
@@ -1079,8 +621,7 @@ namespace sst::native
       ++stats_.checks_skipped;
     }
 
-    // The game thread hashed it at draw time (unchanged since its last copy): no need to read guest memory, which the game may already
-    // be rewriting for a later frame
+    // The game thread hashed it at draw time (unchanged since its last copy): no need to read guest memory, which the game may already be rewriting for a later frame
     if (t->checked_frame != frame_ && t->resident && !prompt_stale && !unchanged_.empty())
     {
       for (const auto &[page, h] : unchanged_)
@@ -1351,9 +892,7 @@ namespace sst::native
 
   std::string TextureCache::StatusLine() const
   {
-    return fmt::format("textures: {} live ({} MB), {} lookups, created {}, uploads {} (re-uploads {}) {:.1f} MB "
-                       "in {:.1f} ms, hashed {:.1f} MB in {:.1f} ms, unsupported {}, bad {}, dimension "
-                       "mismatches {}, failed {}, evicted {}, loads deferred {}, checks skipped (stable) {}, loads from draw-time copies {}, unchanged per the game thread {} (not matching {}), resolved-texture reads {} (size mismatches {}), samplers {}{}{}",
+    return fmt::format("textures: {} live ({} MB), {} lookups, created {}, uploads {} (re-uploads {}) {:.1f} MB in {:.1f} ms, hashed {:.1f} MB in {:.1f} ms, unsupported {}, bad {}, dimension mismatches {}, failed {}, evicted {}, loads deferred {}, checks skipped (stable) {}, loads from draw-time copies {}, unchanged per the game thread {} (not matching {}), resolved-texture reads {} (size mismatches {}), samplers {}{}{}",
                        textures_.size(), total_bytes_ >> 20, stats_.lookups, stats_.created, stats_.uploads, stats_.reuploads, double(stats_.upload_bytes) / (1 << 20), stats_.upload_ms, double(stats_.hashed_bytes) / (1 << 20), stats_.hash_ms, stats_.unsupported, stats_.bad, stats_.dimension_mismatch, stats_.failed, stats_.evicted, stats_.deferred_loads, stats_.checks_skipped, stats_.from_snapshots, stats_.unchanged_hits, stats_.unchanged_misses, stats_.external_hits, stats_.external_mismatch, samplers_.size(), stats_.srv_full ? fmt::format(", SRV heap full x{}", stats_.srv_full) : std::string(), stats_.sampler_full ? fmt::format(", sampler heap full x{}", stats_.sampler_full) : std::string());
   }
 }

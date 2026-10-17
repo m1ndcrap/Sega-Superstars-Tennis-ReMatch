@@ -1,7 +1,8 @@
-// sst_rematch - in-game achievements
+// In-game achievements
 
 #include "menu/achievements.h"
-#include "menu/scene_widen.h"
+#include "menu/guest.h"
+#include "menu/scene_patches.h"
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -27,11 +28,9 @@
 
 #include <fmt/format.h>
 
-REXCVAR_DEFINE_BOOL(sst_achievements_ui, true, "SST",
-                    "Achievements in the game's own style: Options > ACHIEVEMENTS list and unlock popups (instead of the SDK's overlay and toasts)");
+REXCVAR_DEFINE_BOOL(sst_achievements_ui, true, "SST", "Achievements in the game's own style: Options > ACHIEVEMENTS list and unlock popups (instead of the SDK's overlay and toasts)");
 REXCVAR_DEFINE_INT32(sst_achievement_popup_ms, 4000, "SST", "How long an achievement popup stays on screen (milliseconds)");
-REXCVAR_DEFINE_STRING(sst_achievement_popup_sound, "Start", "SST",
-                      "Sound the achievement popup plays: one of the menu sounds (Start, Select, Move, Back), a sound hash (#1234ABCD), or none");
+REXCVAR_DEFINE_STRING(sst_achievement_popup_sound, "Start", "SST", "Sound the achievement popup plays: one of the menu sounds (Start, Select, Move, Back), a sound hash (#1234ABCD), or none");
 REXCVAR_DEFINE_BOOL(sst_achievement_popup_test, false, "SST", "Test: show the first achievement's popup once the game is up (nothing is unlocked)");
 
 // Scene natives (thin wrappers around the scene manager 0x82DB4370): r5 values, r6 types, r7 count, r3 result
@@ -61,6 +60,7 @@ namespace sst::ach
     constexpr uint32_t kPopupDesc[3] = {0x5341E007, 0x5341E008, 0x5341E009};   // description lines
     constexpr uint32_t kPopupIcon = 0x5341E010;                                // + slot
     constexpr uint32_t kPopupHide = 0x5341E100, kPopupShow = 0x5341E101;
+
     // text ids
     constexpr uint32_t kTextBlank = 0x5341F000;
     constexpr uint32_t kTextName = 0x5341A000, kTextDesc = 0x5341B000;    // + row
@@ -70,8 +70,10 @@ namespace sst::ach
     constexpr uint32_t kTextPopupName = 0x5341F021; // + 0 / 1
     constexpr uint32_t kTextPopupDesc = 0x5341F030; // + line x 2 + 0 / 1
     constexpr uint32_t kPopupFont = 0x69995503;     // MsgBox body font (its advances wrap the description)
+
     // scripts (lookup2)
     constexpr uint32_t kScriptAchievements = 0xDB57BE7A, kScriptRecords = 0x92CC7DA7, kScriptMainMenu = 0x9E754704;
+
     // icons: slots of 64 x 64 in one 512 x 64 page; slots 0-3 the pictures, 4-7 the same greyed (locked)
     constexpr uint32_t kIcon = 64, kSlots = 8, kLockedOffset = 4;
     constexpr uint32_t kPageW = kIcon * kSlots, kPageH = kIcon, kPageBytes = kPageW * kPageH * 4;
@@ -100,22 +102,27 @@ namespace sst::ach
       bool loaded = false;
       std::vector<Entry> list;
       std::vector<uint8_t> page; // ARGB, kPageW x kPageH
+
       // guest memory: strings, popup text buffers, native call scratch
       uint32_t pool = 0, pool_used = 0, scratch = 0;
       std::unordered_map<uint32_t, uint32_t> texts; // text id -> guest string
       std::unordered_map<std::string, Gpu> gpu;     // ".gpu" file name -> icon page
       bool list_ready = false, popup_ready = false;
       bool summary_alt = false;
+
       // popups
       std::deque<uint32_t> queue;
+
       enum class Popup
       {
         kIdle,
         kShown,
         kLeaving
       } popup = Popup::kIdle;
+
       std::chrono::steady_clock::time_point since;
       bool popup_alt = false;
+
       // the page script in guest memory; the game's module it replaces
       uint32_t script = 0, original = 0;
       bool tested = false;  // sst_achievement_popup_test done
@@ -144,8 +151,10 @@ namespace sst::ach
         b -= c, b -= a, b ^= a << 10;
         c -= a, c -= b, c ^= b >> 15;
       };
+
       const uint8_t *k = reinterpret_cast<const uint8_t *>(key.data());
       uint32_t len = uint32_t(key.size()), a = 0x9E3779B9u, b = 0x9E3779B9u, c = 0x04C11DB7u;
+
       auto le = [](const uint8_t *p)
       { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); };
 
@@ -163,36 +172,47 @@ namespace sst::ach
       case 11:
         c += uint32_t(k[10]) << 24;
         [[fallthrough]];
+
       case 10:
         c += uint32_t(k[9]) << 16;
         [[fallthrough]];
+
       case 9:
         c += uint32_t(k[8]) << 8;
         [[fallthrough]];
+
       case 8:
         b += uint32_t(k[7]) << 24;
         [[fallthrough]];
+
       case 7:
         b += uint32_t(k[6]) << 16;
         [[fallthrough]];
+
       case 6:
         b += uint32_t(k[5]) << 8;
         [[fallthrough]];
+
       case 5:
         b += k[4];
         [[fallthrough]];
+
       case 4:
         a += uint32_t(k[3]) << 24;
         [[fallthrough]];
+
       case 3:
         a += uint32_t(k[2]) << 16;
         [[fallthrough]];
+
       case 2:
         a += uint32_t(k[1]) << 8;
         [[fallthrough]];
+
       case 1:
         a += k[0];
         [[fallthrough]];
+
       default:
         break;
       }
@@ -201,58 +221,11 @@ namespace sst::ach
       return c;
     }
 
-    uint8_t *GuestPtr(uint8_t *base, uint32_t a)
-    {
-      return base + a + rex::memory::detail::PhysicalHostOffset(a);
-    }
-
-    void Store32(uint8_t *base, uint32_t a, uint32_t v)
-    {
-      uint8_t *p = GuestPtr(base, a);
-      p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
-    }
-
-    uint32_t Load32(uint8_t *base, uint32_t a)
-    {
-      const uint8_t *p = GuestPtr(base, a);
-      return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
-    }
-
-    // The front-end's script directory (front end + 0x488): a binary tree of nodes {+4 left, +8 right, +0x10 name hash, +0x18 module}
-    uint32_t FindScript(uint8_t *base, uint32_t front_end, uint32_t hash)
-    {
-      uint32_t node = Load32(base, front_end + 0x488);
-
-      for (int guard = 0; node && guard < 64; ++guard)
-      {
-        const uint32_t key = Load32(base, node + 0x10);
-
-        if (key == hash)
-          return node;
-
-        node = Load32(base, node + (hash > key ? 8 : 4));
-      }
-
-      return 0;
-    }
-
-    std::string FileName(uint8_t *base, uint32_t path)
-    {
-      std::string s;
-
-      for (uint32_t i = 0; i < 260; ++i)
-      {
-        const char c = char(*GuestPtr(base, path + i));
-
-        if (!c)
-          break;
-
-        s += char(std::tolower(uint8_t(c)));
-      }
-
-      const size_t slash = s.find_last_of("\\/:");
-      return slash == std::string::npos ? s : s.substr(slash + 1);
-    }
+    using sst::menu::FindScriptNode;
+    using sst::menu::GuestFileName;
+    using sst::menu::GuestPtr;
+    using sst::menu::Load32;
+    using sst::menu::Store32;
 
     bool Enabled()
     {
@@ -316,7 +289,9 @@ namespace sst::ach
         g.pool_used += (size + 3) & ~3u;
       }
       else if (room && n > room)
+      {
         return it->second;
+      }
 
       std::memcpy(GuestPtr(base, it->second), text.c_str(), std::min(n, room ? room : n));
       return it->second;
@@ -339,8 +314,10 @@ namespace sst::ach
         return;
 
       g.loaded = true;
+
       std::sort(infos.begin(), infos.end(), [](const auto &a, const auto &b)
                 { return a.id < b.id; });
+
       g.page.assign(kPageBytes, 0);
       std::map<uint32_t, int> slots; // XDBF image id -> slot
       const auto xdbf = ks->title_xdbf();
@@ -353,6 +330,7 @@ namespace sst::ach
         e.desc = Clean(a.description.empty() ? a.unachieved_description : a.description);
         e.gamerscore = a.gamerscore;
         e.score = fmt::format("{}G", a.gamerscore);
+
         // Descriptions in the records' font (about 12.3 px a character): at most 0.85, smaller when long
         const float est = float(e.desc.size()) * 12.3f;
         e.desc_scale = est > 0.0f ? std::min(0.85f, 900.0f / est) : 0.85f;
@@ -372,6 +350,7 @@ namespace sst::ach
 
             // Scaled (nearest) into the slot; the locked copy greyed and darker. Memory order A, R, G, B (k_8_8_8_8, 8-in-32)
             for (uint32_t y = 0; y < kIcon; ++y)
+            {
               for (uint32_t x = 0; x < kIcon; ++x)
               {
                 const uint8_t *s = &rgba[(size_t(y * uint32_t(h) / kIcon) * uint32_t(w) + x * uint32_t(w) / kIcon) * 4];
@@ -381,6 +360,7 @@ namespace sst::ach
                 uint8_t *l = &g.page[(size_t(y) * kPageW + (slot + kLockedOffset) * kIcon + x) * 4];
                 l[0] = s[3], l[1] = grey, l[2] = grey, l[3] = grey;
               }
+            }
           }
         }
 
@@ -650,6 +630,7 @@ namespace sst::ach
     std::lock_guard<std::recursive_mutex> lock(g.mutex);
     g.manager = &manager;
     REXLOG_INFO("[sst-ach] game-styled achievements {}{}", Enabled() ? "on" : "off (SDK overlay and toasts)", REXCVAR_GET(sst_achievement_popup_test) ? ", popup test at the main menu" : "");
+
     manager.RegisterNotificationCallback([](const rex::system::AchievementEvent &event)
                                          {
       if (!Enabled())
@@ -700,7 +681,7 @@ namespace sst::ach
       return false;
     }
 
-    sst::menu::widen::IconPage page;
+    sst::menu::scenes::IconPage page;
     page.data_offset = gpu->second.offset;
     page.width = kPageW;
     page.height = kPageH;
@@ -712,7 +693,7 @@ namespace sst::ach
 
     if (dat_name == "sstmainmenu.dat")
     {
-      sst::menu::widen::AchievementList list;
+      sst::menu::scenes::AchievementList list;
       list.page_hash = kListPage;
       list.list = kList;
       list.summary = kSummary;
@@ -734,7 +715,7 @@ namespace sst::ach
         list.desc_scale.push_back(e.desc_scale);
       }
 
-      if (!sst::menu::widen::AddAchievementList(dat, dat_size, rel, rel_size, list, out_dat, out_rel, error))
+      if (!sst::menu::scenes::AddAchievementList(dat, dat_size, rel, rel_size, list, out_dat, out_rel, error))
       {
         REXLOG_ERROR("[sst-ach] ACHIEVEMENTS page not added: {}", error);
         return false;
@@ -744,7 +725,7 @@ namespace sst::ach
       return true;
     }
 
-    sst::menu::widen::AchievementPopup popup;
+    sst::menu::scenes::AchievementPopup popup;
     popup.page_hash = kPopupPage;
     popup.group = kPopupGroup;
     popup.bar = kPopupBar;
@@ -753,13 +734,14 @@ namespace sst::ach
 
     for (int k = 0; k < 3; ++k)
       popup.panel[k] = kPopupPanels[k], popup.desc[k] = kPopupDesc[k];
+
     popup.icon_base = kPopupIcon;
     popup.hide_label = kPopupHide;
     popup.show_label = kPopupShow;
     popup.text_blank = kTextBlank;
     popup.page = page;
 
-    if (!sst::menu::widen::AddAchievementPopup(dat, dat_size, rel, rel_size, popup, out_dat, out_rel, error))
+    if (!sst::menu::scenes::AddAchievementPopup(dat, dat_size, rel, rel_size, popup, out_dat, out_rel, error))
     {
       REXLOG_ERROR("[sst-ach] unlock popup not added: {}", error);
       return false;
@@ -809,9 +791,10 @@ namespace sst::ach
 
         // ACHIEVEMENTS leaves the menu like the other items: after choosing an item the menu stays for actions 12 and 14 (the Xbox 360 overlays: downloads, achievements) and leaves for the rest; the "14" of that test becomes 999 in the running module, so action 14 leaves and starts "options_achievements" (see OverrideNative)
         if (Enabled())
-          if (const uint32_t node = FindScript(base, front_end, kScriptMainMenu))
+          if (const uint32_t node = FindScriptNode(base, front_end, kScriptMainMenu))
           {
             const uint32_t module = Load32(base, node + 0x18);
+
             // pushabs 11; pushi 12; ne; pushabs 11; pushi 14; ne; and
             static const uint8_t kTest[] = {0x29, 0x00, 0x0B, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x0D, 0x15, 0x29, 0x00, 0x0B, 0x01, 0x00, 0x00, 0x00, 0x0E, 0x0D, 0x15, 0x0D, 0x19};
             int patched = 0;
@@ -842,7 +825,7 @@ namespace sst::ach
       return;
 
     // ACHIEVEMENTS: the port's page instead of the Xbox 360 system UI (when the list is in the scene)
-    const uint32_t node = FindScript(base, front_end, kScriptAchievements);
+    const uint32_t node = FindScriptNode(base, front_end, kScriptAchievements);
 
     if (!node)
     {
@@ -888,7 +871,7 @@ namespace sst::ach
     if (!g.list_ready || !g.front_end || !ctx.r4.u32)
       return false;
 
-    const uint32_t node = FindScript(base, g.front_end, kScriptMainMenu);
+    const uint32_t node = FindScriptNode(base, g.front_end, kScriptMainMenu);
     const uint32_t module = node ? Load32(base, node + 0x18) : 0;
 
     if (!module || Load32(base, ctx.r4.u32 + 8) != module)
@@ -951,6 +934,7 @@ namespace sst::ach
     {
       uint32_t unlocked = 0, score = 0, total = 0;
       g.summary_alt = !g.summary_alt;
+
       // Shown first: showing a group shows its children (both icons of every row)
       Show(ctx, base, kList, true);
       Show(ctx, base, kSummary, true);
@@ -965,6 +949,7 @@ namespace sst::ach
         total += e.gamerscore;
         SetText(ctx, base, kRowName + r, kTextName + r);
         SetText(ctx, base, kRowDesc + r, kTextDesc + r);
+
         // Unlock date and time in the gamerscore's place (local time; blank while locked)
         const uint32_t date = (g.summary_alt ? kTextDateAlt : kTextDate) + r;
         PutText(base, date, on ? UnlockDate(e.id) : std::string(" "), 32);
@@ -1027,6 +1012,7 @@ namespace sst::ach
 
     using clock = std::chrono::steady_clock;
     const auto now = clock::now();
+
     const auto ms = [&]
     { return std::chrono::duration_cast<std::chrono::milliseconds>(now - g.since).count(); };
 
@@ -1038,6 +1024,7 @@ namespace sst::ach
       PutTexts(base);
       const uint32_t id = g.queue.front();
       g.queue.pop_front();
+
       const auto it = std::find_if(g.list.begin(), g.list.end(), [&](const Entry &e)
                                    { return e.id == id; });
 
@@ -1047,8 +1034,9 @@ namespace sst::ach
       g.popup_alt = !g.popup_alt;
       const uint32_t alt = g.popup_alt ? 1 : 0;
       PutText(base, kTextPopupName + alt, it->name, kPopupText);
+
       // The description wrapped to the popup's width (up to three lines; the panel picture of that height)
-      const std::vector<std::string> lines = Wrap(base, it->desc, sst::menu::widen::kPopupDescWidth, 3);
+      const std::vector<std::string> lines = Wrap(base, it->desc, sst::menu::scenes::kPopupDescWidth, 3);
 
       for (uint32_t k = 0; k < 3; ++k)
         PutText(base, kTextPopupDesc + k * 2 + alt, k < lines.size() ? lines[k] : std::string(" "), kPopupText);
@@ -1111,12 +1099,13 @@ extern "C" REX_FUNC(sub_82594820)
   if (int32_t(ctx.r3.u32) <= 0 || !sst::ach::Enabled())
     return;
 
-  const std::string name = sst::ach::FileName(base, path);
+  const std::string name = sst::menu::GuestFileName(base, path);
 
   if (name != "sstmainmenu.gpu" && name != "msgbox.gpu")
     return;
 
   const uint32_t offset = (ctx.r3.u32 + 0xFFF) & ~0xFFFu;
+
   {
     std::lock_guard<std::recursive_mutex> lock(sst::ach::g.mutex);
     auto &gpu = sst::ach::g.gpu[name];
@@ -1124,6 +1113,7 @@ extern "C" REX_FUNC(sub_82594820)
     if (gpu.offset != offset)
       gpu = {offset, false};
   }
+
   ctx.r3.u32 = offset + sst::ach::kPageBytes;
 }
 
@@ -1137,7 +1127,7 @@ namespace sst::ach
       if (!buffer || !Enabled())
         return;
 
-      const std::string name = FileName(base, path);
+      const std::string name = GuestFileName(base, path);
 
       if (name != "sstmainmenu.gpu" && name != "msgbox.gpu")
         return;
@@ -1161,6 +1151,7 @@ namespace sst::ach
 
 extern "C" void __imp__sub_825947C8(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_82594758(PPCContext &__restrict, uint8_t *);
+
 extern "C" REX_FUNC(sub_825947C8)
 {
   sst::ach::WritePage(base, ctx.r3.u32, ctx.r4.u32);

@@ -1,4 +1,5 @@
-// sst_rematch - ultrawide layouts for SumoTool scenes
+// The port's changes to the game's SumoTool scenes (the .DAT / .REL pairs scene_files.cpp hands over as they load): wide layouts (scene_widen.cpp), main menu / Settings rows and arrows (scene_rows.cpp), the achievements list and popup (scene_achievements.cpp).
+// Each takes the scene's two files and returns new ones, or false and why. The format: scene_format.h
 
 #pragma once
 
@@ -7,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace sst::menu::widen
+namespace sst::menu::scenes
 {
   using Bytes = std::vector<uint8_t>;
 
@@ -26,10 +27,10 @@ namespace sst::menu::widen
   // Main menu: a new category row below OPTIONS (a copy of the Xbox LIVE row: no sub-items). Hashes and labels are the caller's (the main menu script's tables refer to them)
   struct MainMenuRow
   {
-    uint32_t parent, row, highlight; // position group, row group (the script's category list), highlight group
-    uint32_t first_child;            // the copied children get first_child, first_child + 1, ...
-    uint32_t text;                   // text id of the row's label
-    uint32_t bar_label;              // cursor bar key for the row
+    uint32_t parent, row, highlight;   // position group, row group (the script's category list), highlight group
+    uint32_t first_child;              // the copied children get first_child, first_child + 1, ...
+    uint32_t text;                     // text id of the row's label
+    uint32_t bar_label;                // cursor bar key for the row
     uint32_t options_from, options_to; // row keys: pushed down while OPTIONS is open (y 0 -> options_shift)
     float options_shift;
   };
@@ -52,25 +53,25 @@ namespace sst::menu::widen
   // Achievement icons: a linear 32-bit ARGB texture page added to a scene (its pixels are written after the scene's .GPU file, at data_offset in the file's buffer), split into square slots side by side
   struct IconPage
   {
-    uint32_t data_offset = 0;     // in the .GPU buffer (4 KB aligned)
+    uint32_t data_offset = 0;       // in the .GPU buffer (4 KB aligned)
     uint32_t width = 0, height = 0; // pixels (width a multiple of 32)
-    std::vector<uint32_t> slots;  // texture hash per slot (slot k: columns [k * height, (k + 1) * height))
+    std::vector<uint32_t> slots;    // texture hash per slot (slot k: columns [k * height, (k + 1) * height))
   };
 
   // Options > ACHIEVEMENTS: a scrolling list on the RECORDS page (scene 487BEEA2), in the records' clipped panel. Row i: group row_group + i (y offset i x pitch) with a blue panel, the icon (colour, and greyed for locked), name, description and gamerscore texts. All texts start blank (text_blank); the page sets them
   struct AchievementList
   {
-    uint32_t page_hash = 0;              // new scene page holding the list and the summary
-    uint32_t list = 0;                   // the rows' group (in the records' content group's place; scrolls with keys d32c49f0 (top) .. 03ccad8d (bottom))
-    uint32_t summary = 0;                // TEXT right of the page title
+    uint32_t page_hash = 0;                                                                                              // new scene page holding the list and the summary
+    uint32_t list = 0;                                                                                                   // the rows' group (in the records' content group's place; scrolls with keys d32c49f0 (top) .. 03ccad8d (bottom))
+    uint32_t summary = 0;                                                                                                // TEXT right of the page title
     uint32_t row_group = 0, row_panel = 0, row_icon = 0, row_icon_locked = 0, row_name = 0, row_desc = 0, row_score = 0; // + row
     uint32_t text_blank = 0;
     IconPage page;
-    std::vector<int> icon_slot;          // per row: colour slot (locked: icon_slot + locked_offset)
+    std::vector<int> icon_slot; // per row: colour slot (locked: icon_slot + locked_offset)
     int locked_offset = 4;
-    std::vector<float> desc_scale;       // per row
+    std::vector<float> desc_scale; // per row
     int visible_rows = 5;
-    float pitch = 0;                     // out: row spacing (layout heights)
+    float pitch = 0; // out: row spacing (layout heights)
   };
 
   bool AddAchievementList(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, AchievementList &list, Bytes &out_dat, Bytes &out_rel, std::string &error);
@@ -90,9 +91,6 @@ namespace sst::menu::widen
   constexpr float kPopupDescWidth = 535.0f;
 
   bool AddAchievementPopup(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, const AchievementPopup &popup, Bytes &out_dat, Bytes &out_rel, std::string &error);
-
-  // Test: parses and rewrites the scene unchanged (should give the same bytes).
-  bool RoundTrip(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, Bytes &out_dat, Bytes &out_rel, std::string &error);
 
   // Extra buffer room to reserve when reading a scene file that may be widened.
   inline uint32_t ExtraRoom(uint32_t size, bool rel)

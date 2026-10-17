@@ -1,4 +1,4 @@
-// sst_rematch - native D3D12 renderer (exe side)
+// Native D3D12 renderer
 
 #pragma once
 
@@ -29,9 +29,6 @@ namespace sst::native
   // hook entry points (game threads)
   // Create{Vertex,Pixel}Shader: `container` is the guest address of the shader container (r3 before the call), `object` the returned shader object.
   void OnCreateShader(const uint8_t *base, uint32_t container, uint32_t object);
-
-  // SetStreamSource(dev, stream, vb, offset, stride)
-  void OnSetStreamSource(const HookArgs &a);
 
   // DrawIndexedVertices(dev, prim, base_vertex, start_index, index_count)
   // DrawVertices(dev, prim, start_vertex, vertex_count)

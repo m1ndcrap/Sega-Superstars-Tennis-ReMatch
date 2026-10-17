@@ -1,6 +1,4 @@
 // sst_rematch - ReXGlue Recompiled Project
-//
-// Customize your app by overriding virtual hooks from rex::ReXApp.
 
 #pragma once
 
@@ -27,13 +25,11 @@ class SstRematchApp : public rex::ReXApp
 public:
   using rex::ReXApp::ReXApp;
 
-  static std::unique_ptr<rex::ui::WindowedApp> Create(
-      rex::ui::WindowedAppContext &ctx)
+  static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext &ctx)
   {
     // Started by the VIDEO page's restart: let the previous run exit first.
     sst::menu::WaitForRestartParent();
-    return std::unique_ptr<SstRematchApp>(new SstRematchApp(ctx, "sst_rematch",
-                                                            PPCImageConfig));
+    return std::unique_ptr<SstRematchApp>(new SstRematchApp(ctx, "sst_rematch", PPCImageConfig));
   }
 
   void OnConfigurePaths(rex::PathConfig &paths) override
@@ -44,18 +40,16 @@ public:
     }
   }
 
-  // The GPU is a runtime-loaded plugin and the gpu_plugin cvar defaults to empty (= no GPU emulation). Without --gpu_plugin the port's own native renderer ("sst") is used when its plugin sits next to the exe, so double-clicking the exe starts it; else the SDK's emulated GPU ("xenos")
+  // The GPU is a runtime-loaded plugin; the gpu_plugin cvar defaults to empty (no GPU). On Windows it is always the port's native renderer ("sst", rexgpu-sst.dll next to the exe)
   void OnPreSetup(rex::RuntimeConfig &config) override
   {
     if (config.gpu_plugin.empty())
     {
-      const auto dir = rex::filesystem::GetExecutableFolder();
-      bool have_sst = false;
-
-      for (const char *name : {"rexgpu-sst.dll", "rexgpu-sstd.dll", "rexgpu-sstrd.dll", "librexgpu-sst.so", "librexgpu-sst.dylib"})
-        have_sst = have_sst || std::filesystem::exists(dir / name);
-
-      config.gpu_plugin = have_sst ? "sst" : "xenos";
+#ifdef _WIN32
+      config.gpu_plugin = "sst";
+#else
+      config.gpu_plugin = "xenos";
+#endif
     }
 #ifdef _WIN32
     // Dual-GPU PCs: the dedicated GPU unless --d3d12_adapter says otherwise
@@ -67,9 +61,7 @@ public:
     { return sst::input::CreateInputSystem(tool_mode); };
   }
 
-  // Video settings (sst_settings.ini, VIDEO page), then the native
-  // renderer: attaches to the "sst" GPU plugin when it is the one loaded
-  // (--gpu_plugin=sst), otherwise does nothing.
+  // Video settings (sst_settings.ini, VIDEO page), then the native renderer: attaches to the "sst" GPU plugin when it is the one loaded (--gpu_plugin=sst), otherwise does nothing
   void OnPostSetup() override
   {
     sst::menu::Initialize([this](bool fullscreen)
@@ -77,9 +69,12 @@ public:
                                                          {
         if (auto* w = window(); w && w->IsFullscreen() != fullscreen) w->SetFullscreen(fullscreen); }); }, [this]
                           { app_context().RequestDeferredQuit(); });
+
     sst::native::Initialize(runtime());
+
     // Achievements in the game's style (Options > ACHIEVEMENTS, unlock popups)
     sst::ach::Initialize(achievements());
+
     // After the runtime's own handlers: a crash is logged with the guest functions on the stack
     sst::debug::InstallCrashLog();
   }

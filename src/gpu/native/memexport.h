@@ -1,4 +1,4 @@
-// sst_rematch - native renderer: CPU execution of memory-export vertex shaders
+// Native renderer: running memory-export vertex shaders on the CPU
 
 #pragma once
 
@@ -69,8 +69,6 @@ namespace sst::native
     ~MemexportRunner();
     uint32_t worker_threads() const;
 
-    // ucode: host-endian microcode (control flow first), `dwords` long
-    // Runs the shader once per entry of `vertex_indices` (r0.x = index), writing all memory exports. Returns false if nothing could be run
     // ucode: host-endian microcode (control flow first), `dwords` long. Runs the shader once per entry of `vertex_indices` (r0.x = index), writing all memory exports. Returns false if nothing could be run
     bool Run(const uint32_t *ucode, uint32_t dwords, const VsConstants &constants, const uint32_t *vertex_indices, uint32_t count, MemexportStats *stats, bool force_per_vertex = false);
 
@@ -98,27 +96,6 @@ namespace sst::native
     std::unique_ptr<Queue> queue_;
   };
 
-  // Float constant registers the shader's ALU instructions read (bit per register in used[4]); false if it uses relative constant addressing (then any register may be read)
-  bool FloatConstantsRead(const uint32_t *ucode, uint32_t dwords, uint64_t used[4]);
-
-  // Fetch constant slots (0-95) the shader's vertex fetches read
-  uint32_t VertexFetchSlots(const uint32_t *ucode, uint32_t dwords, uint32_t *slots, uint32_t max);
-
-  // Texture fetch constants (0-31) the shader's texture fetches read, with the first fetch's dimension (xenos::FetchOpDimension + 1; 0 = unused) and filter overrides (xenos::TextureFilter / AnisoFilter values; kUseFetchConst = 3 / 7 when the fetch constant decides).
-  struct TextureFetchUse
-  {
-    uint8_t dimension = 0;
-    uint8_t mag_filter = 3, min_filter = 3, mip_filter = 3, aniso_filter = 7;
-    bool unnormalized = false, mixed_dimensions = false;
-    uint16_t count = 0;
-    float lod_bias = 0;
-  };
-
-  uint32_t TextureFetchUsage(const uint32_t *ucode, uint32_t dwords, TextureFetchUse uses[32]);
-
   // Element size in bytes of a memexport stream format (xenos::ColorFormat), 0 if unsupported
   uint32_t MemexportElementSize(uint32_t format);
-
-  // Disassembly-lite of the control flow / instructions (for logs)
-  std::string DescribeMicrocode(const uint32_t *ucode, uint32_t dwords);
 }

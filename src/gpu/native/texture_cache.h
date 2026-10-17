@@ -1,4 +1,4 @@
-// sst_rematch - native renderer: textures and samplers
+// Ntive renderer: textures and samplers
 
 #pragma once
 
@@ -9,53 +9,13 @@
 #include <unordered_map>
 #include <vector>
 
-#include "gpu/native/memexport.h" // TextureFetchUse
+#include "gpu/native/ucode_analysis.h" // TextureFetchUse
 
 #include <d3d12.h>
 #include <wrl/client.h>
 
 namespace sst::native
 {
-  // Guest data the game rewrites while the game runs. With the render thread a frame behind, the game may already have written the
-  // next frame's data when the renderer reads it, so the game thread copies it when it captures a draw (native.cpp) and the renderer
-  // reads the copies. The render thread records what it has seen; the game thread reads a copy of the set when it changes.
-  //  - textures: every texture the renderer knows gets flagged `changing` once its data changed (unflagged a minute later).
-  //    The game thread copies changing textures for every draw, and all known textures for UI-sized draws (where a one-frame
-  //    mismatch is most visible: portraits, court previews, text pages reloaded as screens change).
-  //  - vertex buffers: start addresses whose data changed between frames, with the bytes draws read from them.
-  namespace guest_watch
-  {
-    struct TextureRange
-    {
-      uint32_t base_addr = 0, base_size = 0; // physical
-      uint32_t mip_addr = 0, mip_size = 0;
-      bool changing = false;
-      bool external = false; // a render-target resolve destination: the renderer samples its own copy, never guest memory
-    };
-
-    struct Set
-    {
-      std::unordered_map<uint32_t, TextureRange> textures; // by base page (physical address >> 12)
-      std::unordered_map<uint32_t, uint32_t> vertices;     // physical start -> bytes read
-    };
-
-    void KnownTexture(uint32_t base_page, const TextureRange &range);    // render thread: texture created
-    void TextureChanged(uint32_t base_page, uint64_t frame);             // render thread: its data changed
-    void ExternalTexture(uint32_t base_page, bool external);             // render thread: became / stopped being a resolve destination
-    void VerticesChanged(uint32_t phys, uint32_t bytes, uint64_t frame); // render thread: vertex data changed between frames
-    void Prune(uint64_t frame);
-    uint64_t Version(); // changes whenever the set does
-    void Copy(Set &out);
-
-    // Float constant chunks a shader's draws read: bit i = c[16i .. 16i+15] (Renderer::ConstantChunkMask; memory-export shaders and
-    // shaders with relative constant addressing: all 16), keyed by shader object and microcode pointer (ShaderKey). The game thread
-    // compares only those constant chunks of the device block per draw. Only ever grows per key (bits are ORed in).
-    inline uint64_t ShaderKey(uint32_t object, uint32_t ucode) { return (uint64_t(object) << 32) | ucode; }
-    void ConstantUse(uint64_t key, uint32_t chunk_mask); // render thread
-    uint64_t ConstantUseVersion();
-    void CopyConstantUse(std::unordered_map<uint64_t, uint32_t> &out);
-  }
-
   class TextureCache
   {
   public:
@@ -78,6 +38,7 @@ namespace sst::native
 
     // fetch: the 6 fetch constant dwords (host endian). fetch_dimension: the xenos::FetchOpDimension the shader samples with. Records uploads on `list`. Returns the SRV heap index, or kNone (bind a placeholder)
     uint32_t GetTexture(ID3D12GraphicsCommandList *list, const AllocateFn &allocate, const uint32_t fetch[6], uint32_t fetch_dimension);
+
     // Render-target resolve destinations: textures the renderer draws itself. A fetch constant whose base address is a registered page samples this resource (when the size matches) instead of guest memory
     struct External
     {
@@ -95,11 +56,12 @@ namespace sst::native
 
     std::string StatusLine() const;
 
-    // Copies of guest texture data the game thread made when it captured this frame's draws (physical [begin, end)); valid until
-    // ClearSnapshots at the end of the frame
+    // Copies of guest texture data the game thread made when it captured this frame's draws (physical [begin, end)); valid until ClearSnapshots at the end of the frame
     void AddSnapshot(uint32_t begin, uint32_t end, const uint8_t *data);
+
     // The game thread hashed this texture (base page) at draw time instead of copying it: unchanged since its last copy
     void AddUnchanged(uint32_t base_page, uint64_t hash) { unchanged_.push_back({base_page, hash}); }
+
     void ClearSnapshots()
     {
       snapshots_.clear();
@@ -115,6 +77,7 @@ namespace sst::native
 
     std::vector<Snapshot> snapshots_;
     std::vector<std::pair<uint32_t, uint64_t>> unchanged_; // (base page, content hash) this frame
+
     // Where to read guest physical [addr, addr + size): `result + addr` is a frame snapshot covering it, else guest memory
     const uint8_t *Source(uint32_t addr, uint32_t size) const;
 
@@ -167,6 +130,7 @@ namespace sst::native
     std::unordered_map<uint64_t, uint32_t> samplers_;
 
     std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
+
     struct ExternalEntry
     {
       External info;

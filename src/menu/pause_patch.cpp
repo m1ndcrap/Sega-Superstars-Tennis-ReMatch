@@ -1,6 +1,8 @@
-// sst_rematch - adds a VIDEO row to the in-match pause menu
+// Adds a VIDEO row to the in-match pause menu
 
 #include "menu/pause_patch.h"
+#include "menu/scene_format.h"
+#include "menu/script_asm.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,60 +12,23 @@
 
 namespace sst::menu::pause
 {
+  using scene::Chunk;
+  using scene::FindChunk;
+  using scene::ReadChunks;
+  using scene::SplitBlobs;
+  using scene::WriteChunks;
+  using script::Asm;
+  using script::ModuleSize;
+
   namespace
   {
-    // big-endian helpers
-    uint32_t Rd32(const uint8_t *p)
-    {
-      return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
-    }
-
-    uint16_t Rd16(const uint8_t *p)
-    {
-      return uint16_t((p[0] << 8) | p[1]);
-    }
-
-    void Wr32(uint8_t *p, uint32_t v)
-    {
-      p[0] = uint8_t(v >> 24);
-      p[1] = uint8_t(v >> 16);
-      p[2] = uint8_t(v >> 8);
-      p[3] = uint8_t(v);
-    }
-
-    float RdF(const uint8_t *p)
-    {
-      const uint32_t u = Rd32(p);
-      float f;
-      std::memcpy(&f, &u, 4);
-      return f;
-    }
-
-    void WrF(uint8_t *p, float f)
-    {
-      uint32_t u;
-      std::memcpy(&u, &f, 4);
-      Wr32(p, u);
-    }
-
-    void Put32(Bytes &b, uint32_t v)
-    {
-      const size_t at = b.size();
-      b.resize(at + 4);
-      Wr32(b.data() + at, v);
-    }
-
-    constexpr uint32_t Tag(const char (&s)[5])
-    {
-      return (uint32_t(uint8_t(s[0])) << 24) | (uint32_t(uint8_t(s[1])) << 16) | (uint32_t(uint8_t(s[2])) << 8) | uint32_t(uint8_t(s[3]));
-    }
-
     // the scene's objects (PauseMenu, Xbox)
     constexpr std::array<uint32_t, 6> kRowGroups = {0x67D16D27, 0x8A139936, 0x8D0D485A, 0xF8A9F905, 0x29150F3E, 0x8DB964AC};
     constexpr std::array<uint32_t, 6> kRowLabels = {0x33FF8B92, 0x8F98A65B, 0x28150F7C, 0x2408EA3F, 0x112267F4, 0xEACC3DFA};
     constexpr uint32_t kRetryRow = 0x8A139936;                                       // template for the new row
     constexpr uint32_t kValueText = 0xA18E2471;                                      // CONTROLLER's value ("TYPE A")
     constexpr std::array<uint32_t, 3> kPanel = {0x30EF67A8, 0xC9A9E37B, 0xCE5A4A4D}; // edges, body
+
     // The confirmation dialog for the full panel (F73595A0): body, then the YES / NO bar group, cursor group and YES / NO texts
     constexpr uint32_t kDialogBody = 0x0944873D;
     constexpr std::array<uint32_t, 4> kDialogLower = {0xE8F65357, 0x20A4C7FB, 0x97B856AC, 0x778A36F5};
@@ -76,94 +41,9 @@ namespace sst::menu::pause
     constexpr uint32_t kSpareLabel = 0x53560020;  // + row
     constexpr uint32_t kSpareValue = 0x53560030;  // + row
     // The VIDEO page's scroll bar (pause_patch.h)
-    constexpr uint32_t kPanelGroup = 0x26F7E3DD;  // the panel (edges, body); its colour fades the menu in and out
-    constexpr uint32_t kDarkStrip = 0x0944873D;   // the confirmation dialog's body: a dark blue strip (texture 85FE4B82)
-    constexpr uint32_t kPlayerTag = 0x400E36C4;   // the "1P" tag (texture 71F80B5B); the scroll thumb uses the 3P tag's texture
-
-    struct Chunk
-    {
-      uint32_t tag, magic;
-      Bytes data;
-    };
-
-    std::optional<std::vector<Chunk>> ReadChunks(const uint8_t *d, size_t n, std::string &error)
-    {
-      std::vector<Chunk> out;
-      size_t o = 0;
-
-      while (o + 16 <= n)
-      {
-        const uint32_t tag = Rd32(d + o);
-
-        if (!tag)
-          break;
-
-        const uint32_t csize = Rd32(d + o + 4), dsize = Rd32(d + o + 8);
-
-        if (csize < 16 || o + 16 + dsize > n || dsize + 16 > csize)
-        {
-          error = "bad chunk header";
-          return std::nullopt;
-        }
-
-        out.push_back({tag, Rd32(d + o + 12), Bytes(d + o + 16, d + o + 16 + dsize)});
-        o += csize;
-      }
-
-      return out;
-    }
-
-    Bytes WriteChunks(const std::vector<Chunk> &chunks)
-    {
-      Bytes out;
-
-      for (const Chunk &c : chunks)
-      {
-        const uint32_t csize = (16 + uint32_t(c.data.size()) + 0x3F) & ~0x3Fu;
-        Put32(out, c.tag);
-        Put32(out, csize);
-        Put32(out, uint32_t(c.data.size()));
-        Put32(out, c.magic);
-        out.insert(out.end(), c.data.begin(), c.data.end());
-        out.resize(out.size() + (csize - 16 - c.data.size()), 0);
-      }
-
-      return out;
-    }
-
-    Chunk *Find(std::vector<Chunk> &chunks, uint32_t tag)
-    {
-      for (Chunk &c : chunks)
-        if (c.tag == tag)
-          return &c;
-
-      return nullptr;
-    }
-
-    // Splits a chunk's blob area into per-entry blobs (each runs to the next offset or the end of the chunk)
-    std::map<uint32_t, Bytes> SplitBlobs(const Bytes &data, const std::vector<uint32_t> &offsets, size_t start, bool &ok)
-    {
-      std::vector<uint32_t> sorted = offsets;
-      std::sort(sorted.begin(), sorted.end());
-      std::map<uint32_t, Bytes> out;
-      ok = true;
-
-      for (size_t i = 0; i < sorted.size(); ++i)
-      {
-        const uint32_t a = sorted[i];
-        const uint32_t b = i + 1 < sorted.size() ? sorted[i + 1] : uint32_t(data.size());
-
-        if (a < start || b < a || b > data.size())
-        {
-          ok = false;
-          return {};
-        }
-
-        out[a] = Bytes(data.begin() + a, data.begin() + b);
-      }
-
-      return out;
-    }
+    constexpr uint32_t kPanelGroup = 0x26F7E3DD; // the panel (edges, body); its colour fades the menu in and out
+    constexpr uint32_t kDarkStrip = 0x0944873D;  // the confirmation dialog's body: a dark blue strip (texture 85FE4B82)
+    constexpr uint32_t kPlayerTag = 0x400E36C4;  // the "1P" tag (texture 71F80B5B); the scroll thumb uses the 3P tag's texture
 
     struct Track
     {
@@ -191,9 +71,9 @@ namespace sst::menu::pause
       return std::nullopt;
 
     std::vector<Chunk> &chunks = *chunks_opt;
-    Chunk *kfrm = Find(chunks, Tag("KFRM"));
-    Chunk *objs = Find(chunks, Tag("OBJS"));
-    Chunk *scne = Find(chunks, Tag("SCNE"));
+    Chunk *kfrm = FindChunk(chunks, Tag("KFRM"));
+    Chunk *objs = FindChunk(chunks, Tag("OBJS"));
+    Chunk *scne = FindChunk(chunks, Tag("SCNE"));
 
     if (!kfrm || !objs || !scne)
     {
@@ -296,26 +176,34 @@ namespace sst::menu::pause
     };
 
     for (int r = 0; r < 6; ++r)
+    {
       if (!need(kRowGroups[r], Tag("GROP")) || !need(kRowLabels[r], Tag("TEXT")))
         return error = "pause rows not found", std::nullopt;
+    }
 
     if (!need(kValueText, Tag("TEXT")))
       return error = "value text not found", std::nullopt;
 
     for (uint32_t h : kPanel)
+    {
       if (!need(h, Tag("TXTR")))
         return error = "panel not found", std::nullopt;
+    }
 
     if (!need(kDialogBody, Tag("TXTR")) || !(tracks[kDialogBody].h > 0.1f))
       return error = "dialog not found", std::nullopt;
 
     for (uint32_t h : kDialogLower)
+    {
       if (!objects.count(h) || !tracks.count(h))
         return error = "dialog parts not found", std::nullopt;
+    }
 
     for (uint32_t h : objects[kRetryRow].children)
+    {
       if (!objects.count(h) || !tracks.count(h))
         return error = "RETRY row", std::nullopt;
+    }
 
     if (objects[kRetryRow].children.size() != 4 || objects.count(kNewRow))
       return error = "unexpected RETRY row / already patched", std::nullopt;
@@ -329,8 +217,10 @@ namespace sst::menu::pause
 
     if (!(dy > 0.03f && dy < 0.08f))
       return error = "row spacing", std::nullopt;
+
     // VIDEO goes where RETURN TO CHARACTER SELECT was; that row and RETURN TO MAIN MENU move down one spacing (kVisualOrder)
     const float new_y = key_y(kRowGroups[4]);
+
     auto move_y = [&](uint32_t h, float by)
     {
       Track &t = tracks[h];
@@ -343,10 +233,12 @@ namespace sst::menu::pause
     };
 
     uint32_t order = 0x7FFF0000;
+
     auto clone = [&](uint32_t from, uint32_t to)
     {
       Object o = objects[from];
       o.order = order++;
+
       // Own hash: +0 for GROP / GORD / SCIS, +8 for TEXT / TXTR
       const bool at8 = o.type == Tag("TEXT") || o.type == Tag("TXTR");
       Wr32(o.blob.data() + (at8 ? 8 : 0), to);
@@ -356,6 +248,7 @@ namespace sst::menu::pause
 
     // The new row: RETRY's group and children, one spacing below the last row
     clone(kRetryRow, kNewRow);
+
     objects[kNewRow].children.clear();
     {
       const std::vector<uint32_t> kids = objects[kRetryRow].children;
@@ -376,12 +269,15 @@ namespace sst::menu::pause
       for (uint16_t k = 0; k < t.count; ++k)
         WrF(t.keys.data() + k * t.KeySize() + 0x10, new_y);
     }
+
     // The new row's label is its TEXT child
     uint32_t new_label = 0;
 
     for (uint32_t h : objects[kNewRow].children)
+    {
       if (objects[h].type == Tag("TEXT"))
         new_label = h;
+    }
 
     if (new_label != kNewRowChild + 3)
       return error = "RETRY row layout", std::nullopt;
@@ -440,6 +336,7 @@ namespace sst::menu::pause
       {
         return Bytes(tracks[h].keys.begin(), tracks[h].keys.begin() + tracks[h].KeySize());
       };
+
       // In the panel group's space (the panel pieces are its children). The panel texture is 300 texels tall: the title bar and its white line take rows 0-42, the bottom bar's white line starts at row 286; the right edge piece's last 10 / 21 texels are its dark rim
       const float body_y = RdF(tracks[kPanel[1]].keys.data() + 0x10), body_h = tracks[kPanel[1]].h;
       const float edge_x = RdF(tracks[kPanel[2]].keys.data() + 0xC), edge_w = tracks[kPanel[2]].w;
@@ -457,6 +354,7 @@ namespace sst::menu::pause
       g.children = {kScrollTrack, kScrollThumb};
       objects[kScrollGroup] = std::move(g);
       objects[kPanelGroup].children.push_back(kScrollGroup);
+
       {
         Track t = tracks[kPanelGroup];
         Bytes key = first_key(kPanelGroup);
@@ -496,6 +394,7 @@ namespace sst::menu::pause
         {
           Wr32(key.data(), label);
           Wr32(key.data() + 4, frame);
+
           // The sprite is scaled about its pivot (blob +0x2C / +0x30, from the key's position): put the scaled box's top left at (x, y)
           const float sx = width / t.w, sy = h / t.h;
           const float px = RdF(objects[to].blob.data() + 0x2C), py = RdF(objects[to].blob.data() + 0x30);
@@ -552,6 +451,7 @@ namespace sst::menu::pause
     // rebuild OBJS (objects keep their order; new ones go last)
     {
       std::vector<std::pair<uint32_t, uint32_t>> by_order; // order, hash
+
       for (auto &[h, o] : objects)
         by_order.push_back({o.order, h});
 
@@ -682,120 +582,14 @@ namespace sst::menu::pause
     return WriteChunks(chunks);
   }
 
-  // script
-  size_t ModuleSize(const uint8_t *m, size_t max_size)
-  {
-    if (max_size < 0x20)
-      return 0;
-
-    const uint32_t code = Rd32(m), functab = Rd32(m + 4), t2 = Rd32(m + 8), t3 = Rd32(m + 12), debug = Rd32(m + 28);
-
-    if (code != 0x20 || !(code <= functab && functab <= t2 && t2 <= t3 && t3 <= debug) || debug + 4 > max_size)
-      return 0;
-
-    const uint32_t first = Rd32(m + debug);
-
-    if (first < debug + 4 || ((first - debug) & 3) || first - debug > 64)
-      return 0;
-
-    size_t end = first;
-
-    for (uint32_t p = debug; p < first; p += 4)
-    {
-      size_t s = Rd32(m + p);
-
-      while (s < max_size && m[s])
-        ++s;
-
-      if (s >= max_size)
-        return 0;
-
-      end = std::max(end, s + 1);
-    }
-
-    return (end + 3) & ~size_t(3);
-  }
-
   namespace
   {
-    // Tiny assembler for the trampoline (absolute module offsets)
-    class Asm
-    {
-    public:
-      explicit Asm(uint32_t base) : base_(base) {}
-      uint32_t pc() const { return base_ + uint32_t(b_.size()); }
-      void u8(uint8_t v) { b_.push_back(v); }
-      void u16(uint16_t v)
-      {
-        u8(uint8_t(v >> 8));
-        u8(uint8_t(v));
-      }
-
-      void u32(uint32_t v) { Put32(b_, v); }
-      void pushi(int32_t v) { u8(0x01), u32(uint32_t(v)); }
-      void pushh(uint32_t h) { u8(0x02), u32(h), op(6); }
-      void pushg(uint16_t g) { u8(0x09), u16(g); }
-      void op(uint8_t o) { u8(0x0D), u8(o); }
-      void native(uint8_t group, uint8_t index, uint8_t argc) { u8(0x12), u8(argc), u16(uint16_t(group << 8 | index)); }
-      void pop() { u8(0x18); }
-      void yield() { u8(0x1D); }
-      void index() { u8(0x23); }
-      void pushabs(int16_t s) { u8(0x29), u16(uint16_t(s)); }
-      // Jumps: 0x13 jt, 0x14 jf, 0x15 jmp; i16 relative to the next instruction
-      void jump(uint8_t opc, int label)
-      {
-        u8(opc);
-        fix_.push_back({b_.size(), label});
-        u16(0);
-      }
-
-      void jump_abs(uint8_t opc, uint32_t target)
-      {
-        u8(opc);
-        const int32_t rel = int32_t(target) - int32_t(pc() + 2);
-        u16(uint16_t(int16_t(rel)));
-      }
-
-      int label()
-      {
-        labels_.push_back(UINT32_MAX);
-        return int(labels_.size()) - 1;
-      }
-
-      void here(int l) { labels_[l] = pc(); }
-      bool finish(Bytes &out)
-      {
-        for (auto [at, l] : fix_)
-        {
-          if (labels_[l] == UINT32_MAX)
-            return false;
-
-          const int32_t rel = int32_t(labels_[l]) - int32_t(base_ + at + 2);
-
-          if (rel < -32768 || rel > 32767)
-            return false;
-
-          b_[at] = uint8_t(uint16_t(rel) >> 8);
-          b_[at + 1] = uint8_t(rel);
-        }
-
-        out = b_;
-        return true;
-      }
-
-    private:
-      uint32_t base_;
-      Bytes b_;
-      std::vector<uint32_t> labels_;
-      std::vector<std::pair<size_t, int>> fix_;
-    };
-
-    // pausemenu_match facts (Xbox): see claude/ingame-menu-re.md
     constexpr uint16_t kGlobalHighlight = 2; // keyframe labels: [0] intro, [1] off, [2] on
     constexpr uint16_t kGlobalRows = 3;      // row groups
     constexpr uint16_t kGlobalInput = 4;     // per-player input channels
     constexpr int16_t kSlotCursor = 4, kSlotConfirm = 9, kSlotPlayer = 13;
     constexpr uint32_t kTitle = 0x689DE25C, kTitleText = 0xF9A54306; // "PAUSE"
+
     // Hidden while the VIDEO page is up: row labels, CONTROLLER / VIBRATION values and arrows
     constexpr std::array<uint32_t, 13> kHide = {0x33FF8B92, 0x8F98A65B, 0x28150F7C, 0x2408EA3F, 0x112267F4, 0xEACC3DFA, kNewRowChild + 3 /* the VIDEO row's label */, 0xA18E2471, 0xAF864C0C, 0x8F3B2FFB, 0x2A449F8F, 0xCD44A386, 0xD7D8B275};
     constexpr uint32_t kSndMove = 0xFB699F5A, kSndSelect = 0x46987907, kSndBack = 0x9FB7A417;
@@ -833,8 +627,10 @@ namespace sst::menu::pause
     const uint32_t elems = arr + Rd32(m + arr + 0xC);
 
     for (int i = 0; i < 6; ++i)
+    {
       if (Rd32(m + elems + 8 * i) != kRowGroups[i] || Rd32(m + elems + 8 * i + 4) != 3)
         return error = "rows array contents", std::nullopt;
+    }
 
     // "Select pressed": pushabs 7; pushi 4; index; op eq; jf NEXT; then pushabs 9; pushabs 4; index (confirmation text for the row) - replaced by a jump to the trampoline
     static const uint8_t kSig[] = {0x29, 0x00, 0x07, 0x01, 0x00, 0x00, 0x00, 0x04, 0x23, 0x0D, 0x14, 0x14, 0xFF, 0xFF, 0x29, 0x00, 0x09, 0x29, 0x00, 0x04, 0x23};
@@ -873,6 +669,7 @@ namespace sst::menu::pause
                            0x29, 0, 4, 0x29, 0, 10, 0x29, 0, 11, 0x0D, 12, 0x0D, 19, 0x14, -1, -1, // >= end ?
                            0x29, 0, 4, 0x29, 0, 11, 0x0D, 13, 0x27, 0, 4},                         // -= abs11
                           1}};
+
     std::vector<std::pair<uint32_t, const Nav *>> nav_sites;
 
     for (const Nav &n : kNav)
@@ -900,6 +697,7 @@ namespace sst::menu::pause
     Asm a(functab);
     const uint32_t tramp = a.pc();
     const int back = a.label(), loop = a.label(), no_redraw = a.label(), same = a.label();
+
     auto call = [&](uint8_t g, uint8_t i, uint8_t argc, bool keep = false)
     {
       a.native(g, i, argc);
@@ -972,8 +770,10 @@ namespace sst::menu::pause
     auto line_of = [](int r)
     {
       for (int v = 0; v < kRows; ++v)
+      {
         if (kVisualOrder[v] == r)
           return v;
+      }
 
       return r;
     };
@@ -983,8 +783,10 @@ namespace sst::menu::pause
       for (int r = 0; r < kRows; ++r)
       {
         const int v = line_of(r);
+
         set_text(kSpareLabel + r, [&]
                  { a.pushi(v), call(0x53, kNativeLabel, 1, true); });
+
         set_text(kSpareValue + r, [&]
                  { a.pushi(v), call(0x53, kNativeValue, 1, true); });
       }
@@ -1005,6 +807,7 @@ namespace sst::menu::pause
 
     set_text(kTitle, [&]
              { a.pushh(kTextVideo); });
+
     highlight(fixed(kVideoRow), false);
     highlight(fixed(0), true);
     redraw();
@@ -1012,6 +815,7 @@ namespace sst::menu::pause
     a.here(loop);
     a.pushi(0);
     a.yield();
+
     // Input event, as the pause menu reads it: 3:18(input[9:193(player) * 3])
     a.pushg(kGlobalInput);
     a.pushabs(kSlotPlayer);
@@ -1060,6 +864,7 @@ namespace sst::menu::pause
     {
       set_text(kSpareLabel + r, [&]
                { a.pushh(kTextBlank); });
+
       set_text(kSpareValue + r, [&]
                { a.pushh(kTextBlank); });
     }
@@ -1072,6 +877,7 @@ namespace sst::menu::pause
 
     set_text(kTitle, [&]
              { a.pushh(kTitleText); });
+
     a.jump_abs(0x15, next);
 
     // Any other row: the game's own code
@@ -1088,10 +894,10 @@ namespace sst::menu::pause
 
     while (tcode.size() & 3)
       tcode.push_back(0x11); // nop
+
     const uint32_t d1 = uint32_t(tcode.size());
 
-    // new module
-    // [0, functab) code (patched) | trampoline | [functab, t3) function table and globals | new rows array | [t3, end) symbols and debug info
+    // new module; [0, functab) code (patched) | trampoline | [functab, t3) function table and globals | new rows array | [t3, end) symbols and debug info
     const uint32_t new_arr_elems = t3 + d1; // after the old globals block
     const uint32_t d2 = 7 * 8 + 0x14;
     Bytes out(m, m + functab);
@@ -1142,6 +948,7 @@ namespace sst::menu::pause
       code.resize(n->sig.size(), 0x11); // nop
       std::copy(code.begin(), code.end(), out.begin() + at_nav);
     }
+
     // Header and the rows global
     Wr32(out.data() + 4, functab + d1);
     Wr32(out.data() + 8, t2 + d1);
@@ -1149,6 +956,7 @@ namespace sst::menu::pause
     Wr32(out.data() + 28, debug + d1 + d2);
     const uint32_t new_slot = slot + d1;
     Wr32(out.data() + new_slot, new_arr - new_slot);
+
     // Debug info: pointers to the source names
     const uint32_t new_debug = debug + d1 + d2;
     const uint32_t first = Rd32(m + debug);

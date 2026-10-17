@@ -1,4 +1,4 @@
-// sst_rematch - adds a VIDEO row to the in-match pause menu
+// Adds a VIDEO row to the in-match pause menu
 
 #pragma once
 
@@ -16,8 +16,8 @@ namespace sst::menu::pause
 
   constexpr int kRows = 7;     // rows after the patch
   constexpr int kVideoRow = 6; // index of the new row (the game hard-codes 0-5)
-  // Rows top to bottom: VIDEO sits above RETURN TO CHARACTER SELECT / MAIN MENU
-  // (its index stays 6; the cursor and the VIDEO page follow this order).
+
+  // Rows top to bottom: VIDEO sits above RETURN TO CHARACTER SELECT / MAIN MENU (its index stays 6; the cursor and the VIDEO page follow this order).
   constexpr std::array<int, kRows> kVisualOrder = {0, 1, 2, 3, 6, 4, 5};
 
   // Text ids used by the patched scene; the port's text hook resolves them.
@@ -29,8 +29,8 @@ namespace sst::menu::pause
   constexpr uint32_t kScrollHide = 0x53560048, kScrollShow = 0x53560049, kScrollPos = 0x53560050;
   constexpr uint32_t kYellowTag = 0x2A3BDF69; // the yellow (3P) tag texture
   constexpr uint32_t kThumbTex = 0x53560060;  // its middle (a bright yellow strip: the whole tag, squeezed thin, samples a blurred mip level)
-  constexpr int kScrollCount = 12;  // settings on the pause menu's VIDEO page (no ASPECT RATIO)
-  constexpr int kScrollVisible = 7; // rows shown
+  constexpr int kScrollCount = 12;            // settings on the pause menu's VIDEO page (no ASPECT RATIO)
+  constexpr int kScrollVisible = 7;           // rows shown
 
   // Natives the trampoline calls (group 0x53).
   constexpr uint32_t kNativeResult = 4;    // (k) -> see graphics_menu.cpp
@@ -48,11 +48,8 @@ namespace sst::menu::pause
     std::vector<std::pair<uint32_t, std::vector<uint32_t>>> chunks;
   };
 
-  // thumb_tex: the scroll thumb's texture (kThumbTex once widen::AddSubTexture made it; else the whole yellow tag)
+  // thumb_tex: the scroll thumb's texture (kThumbTex once scenes::AddSubTexture made it; else the whole yellow tag)
   std::optional<Bytes> PatchDat(const uint8_t *data, size_t size, Relocs &relocs, std::string &error, uint32_t thumb_tex = kYellowTag);
   std::optional<Bytes> PatchRel(const uint8_t *data, size_t size, const Relocs &relocs, std::string &error);
   std::optional<Bytes> PatchScript(const uint8_t *module, size_t size, std::string &error);
-
-  // Size of a script module, from its header (end of the debug strings); 0 if the header does not look like a module.
-  size_t ModuleSize(const uint8_t *module, size_t max_size);
 }
