@@ -13,6 +13,7 @@ include(generated/rexglue.cmake)
 # Sources
 set(SSTREMATCH_SOURCES
   src/main.cpp
+  src/audio/silent_fallback.cpp
   src/gpu/d3d_trace.cpp
   src/menu/graphics_menu.cpp
   src/menu/video_settings.cpp

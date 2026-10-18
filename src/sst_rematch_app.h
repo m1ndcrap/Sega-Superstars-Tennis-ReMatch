@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "audio/silent_fallback.h"
 #include "debug/crash_log.h"
 #ifdef _WIN32
 #include "gpu/d3d12_setup.h"
@@ -59,6 +60,10 @@ public:
     sst::input::ApplyDefaults();
     config.input_factory = [](bool tool_mode)
     { return sst::input::CreateInputSystem(tool_mode); };
+
+    // Audio: the SDK's SDL backend, silent instead of crashing at boot when no audio device can be opened
+    config.audio_factory = [](rex::runtime::FunctionDispatcher *dispatcher)
+    { return sst::audio::CreateAudioSystem(dispatcher); };
   }
 
   // Video settings (sst_settings.ini, VIDEO page), then the native renderer: attaches to the "sst" GPU plugin when it is the one loaded (--gpu_plugin=sst), otherwise does nothing
