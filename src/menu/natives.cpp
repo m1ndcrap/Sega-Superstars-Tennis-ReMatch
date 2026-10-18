@@ -210,7 +210,7 @@ extern "C" REX_FUNC(sub_821DFBC0)
   {
     const NativeCall call(ctx, base);
 
-    if (!page::HandleNative(call, id & 0xFF))
+    if (!page::HandleNative(ctx, call, id & 0xFF))
       HandleOwnNative(call, id & 0xFF, id);
 
     ctx.r3.u32 = call.out;

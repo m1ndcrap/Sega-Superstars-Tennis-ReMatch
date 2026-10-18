@@ -6,6 +6,7 @@
 //
 
 #include "input/controls.h"
+#include "menu/port_text.h"
 #include "menu/menu_internal.h"
 
 #include <rex/logging.h>
@@ -155,7 +156,8 @@ namespace sst::menu::controls
       if (!g.navbar)
         g.navbar = GuestAlloc(0x80);
 
-      const uint32_t label = TextId(base, keys_page ? "Reset to Defaults" : "Key Bindings");
+      // (the button bar's font: Global's)
+      const uint32_t label = TextId(base, sst::text::Fit(base, sst::text::Tr(keys_page ? "Reset to Defaults" : "Key Bindings"), "global"));
 
       if (!g.navbar || !label)
         return;

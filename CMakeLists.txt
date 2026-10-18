@@ -24,6 +24,8 @@ set(SSTREMATCH_SOURCES
   src/menu/menu_texts.cpp
   src/menu/camera_aspect.cpp
   src/menu/achievements.cpp
+  src/menu/language.cpp
+  src/menu/port_text.cpp
   src/menu/pause_patch.cpp
   src/menu/restart.cpp
   src/menu/hud_anchor.cpp

@@ -2,16 +2,34 @@
 // each row, what an input event did (moved, changed a value, left, which sound), the title.
 
 #include "input/controls.h"
+#include "menu/language.h"
 #include "menu/menu_internal.h"
 #include "menu/pause_patch.h"
 #include "menu/restart.h"
 #include "menu/video_settings.h"
 
 #include <rex/logging.h>
+#include <rex/ppc/func.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <initializer_list>
+#include <string>
 #include <utility>
+
+#include <fmt/format.h>
+
+// The game's settings natives (group 9; r3 result {value, type}, r5 values) the GENERAL list uses, as the game's options_general script does
+extern "C" void sub_822809B0(PPCContext &__restrict, uint8_t *); // 9:209 difficulty -> 0-2
+extern "C" void sub_822809F8(PPCContext &__restrict, uint8_t *); // 9:210 (difficulty)
+extern "C" void sub_8227EC08(PPCContext &__restrict, uint8_t *); // 9:117 superstar mode on
+extern "C" void sub_8227EC58(PPCContext &__restrict, uint8_t *); // 9:118 superstar mode full
+extern "C" void sub_8227EA88(PPCContext &__restrict, uint8_t *); // 9:115 (superstar mode 0 off, 1 quick, 2 full)
+extern "C" void sub_8227DAF8(PPCContext &__restrict, uint8_t *); // 9:81 fix camera (0 on, 1 off)
+extern "C" void sub_8227DB28(PPCContext &__restrict, uint8_t *); // 9:82 (fix camera)
+extern "C" void sub_8227D8D0(PPCContext &__restrict, uint8_t *); // 9:74 speed units (0 KPH, 1 MPH)
+extern "C" void sub_8227D880(PPCContext &__restrict, uint8_t *); // 9:72 (speed units)
 
 namespace sst::menu::page
 {
@@ -56,6 +74,7 @@ namespace sst::menu::page
       int visible = kVisible; // rows on screen
       bool pause = false;     // the in-match page: no rows that need a restart
       bool keys = false;      // CONTROLS > KEY BINDINGS instead of VIDEO
+      bool general = false;   // Settings > GENERAL: the game's four settings and LANGUAGE
       int cursor = 0, top = 0;
 
       // The last event's result
@@ -64,8 +83,7 @@ namespace sst::menu::page
       int sound = kNoSound;
       bool dialog = false; // show the restart dialog
 
-      int Count() const { return keys ? sst::input::KeyBindingCount() : pause ? kPauseRowCount
-                                                                              : kRows; }
+      int Count() const;
 
       // List position -> settings Row
       int Row(int i) const { return !keys && pause ? kPauseRows[std::clamp(i, 0, kPauseRowCount - 1)] : i; }
@@ -78,12 +96,142 @@ namespace sst::menu::page
       }
     };
 
+    // Settings > GENERAL (the game's options_general script is replaced by this page): DIFFICULTY, SUPERSTAR MODE, FIX CAMERA and SPEED (the game's settings, changed live through its natives as its script does; Back puts them back) and LANGUAGE (the port's, menu/language.h: saved on Select, a
+    // restart when the language changes). Labels and the game rows' values are the game's own text ids (so they follow the language); LANGUAGE's are the port's.
+    namespace general
+    {
+      enum Row : int
+      {
+        kDifficulty = 0,
+        kSuperstar,
+        kFixCamera,
+        kSpeed,
+        kLanguage,
+        kCount
+      };
+
+      constexpr int kStates[kCount] = {3, 3, 2, 2, sst::lang::kChoices};
+      constexpr uint32_t kTitle = 0x6A94D0C1;                                                    // "GENERAL"
+      constexpr uint32_t kLabels[kSpeed + 1] = {0x17E129F2, 0x6DD403F0, 0x8302CC03, 0x0880BE5D}; // DIFFICULTY, SUPERSTAR MODE, FIX CAMERA, SPEED
+
+      constexpr uint32_t kValues[kSpeed + 1][3] = {
+          {0x7F0D720B, 0x2C5C0EEF, 0x62F200D4}, // EASY, NORMAL, HARD
+          {0x1D2E9662, 0x6DD0FF6D, 0xF1674504}, // OFF, QUICK, FULL
+          {0x30A031AF, 0xD667AC41, 0},          // 0 ON, 1 OFF (the game's fix camera value)
+          {0xE253D66D, 0xF491294E, 0},          // 0 KPH, 1 MPH
+      };
+
+      constexpr int kSettingsItem = 1; // GENERAL is the Settings list's first item (cursor + 1)
+      constexpr int kRows = 5;         // on screen when the scene has the fifth row (GeneralRowOk)
+
+      struct State
+      {
+        int v[kCount] = {};
+        int snapshot[kCount] = {};
+      };
+
+      State g_state;
+      bool g_next = false;         // the next page start is GENERAL
+      PPCContext *g_ctx = nullptr; // the native call being handled (for the game's natives)
+      uint8_t *g_base = nullptr;
+      uint32_t g_scratch = 0;
+
+      // Calls one of the game's natives with integer arguments -> its result value (0 if it can't be called)
+      int GameNative(void (*native)(PPCContext &__restrict, uint8_t *), std::initializer_list<int> args)
+      {
+        if (!g_ctx || !g_base)
+          return 0;
+
+        if (!g_scratch)
+          g_scratch = GuestAlloc(64);
+
+        if (!g_scratch)
+          return 0;
+
+        std::memset(GuestPtr(g_base, g_scratch), 0, 48);
+        uint32_t n = 0;
+
+        for (int a : args)
+        {
+          Store32(g_base, g_scratch + 8 + 4 * n, uint32_t(a));
+          *GuestPtr(g_base, g_scratch + 40 + n) = uint8_t(kInt);
+          ++n;
+        }
+
+        PPCContext c = *g_ctx;
+        c.r3.u64 = g_scratch;
+        c.r5.u64 = g_scratch + 8;
+        c.r6.u64 = g_scratch + 40;
+        c.r7.u64 = n;
+        native(c, g_base);
+        return int32_t(Load32(g_base, g_scratch));
+      }
+
+      void Read(State &s)
+      {
+        s.v[kDifficulty] = std::clamp(GameNative(sub_822809B0, {}), 0, 2);
+        s.v[kSuperstar] = GameNative(sub_8227EC08, {}) ? (GameNative(sub_8227EC58, {}) ? 2 : 1) : 0;
+        s.v[kFixCamera] = GameNative(sub_8227DAF8, {}) ? 1 : 0;
+        s.v[kSpeed] = GameNative(sub_8227D8D0, {}) ? 1 : 0;
+        s.v[kLanguage] = sst::lang::Choice();
+      }
+
+      // A game setting to the game (LANGUAGE is only saved on Select)
+      void Write(int row, int value)
+      {
+        switch (row)
+        {
+        case kDifficulty:
+          GameNative(sub_822809F8, {value});
+          break;
+
+        case kSuperstar:
+          GameNative(sub_8227EA88, {value});
+          break;
+
+        case kFixCamera:
+          GameNative(sub_8227DB28, {value});
+          break;
+
+        case kSpeed:
+          GameNative(sub_8227D880, {value});
+          break;
+
+        default:
+          break;
+        }
+      }
+
+      std::string Describe(const State &s)
+      {
+        return fmt::format("difficulty {}, superstar mode {}, fix camera {}, speed {}, language {}", s.v[kDifficulty], s.v[kSuperstar], s.v[kFixCamera] ? "off" : "on", s.v[kSpeed] ? "MPH" : "KPH", sst::lang::ChoiceLabel(s.v[kLanguage]));
+      }
+
+      uint32_t Label(uint8_t *base, int row)
+      {
+        return row < kLanguage ? kLabels[row] : TextId(base, "LANGUAGE");
+      }
+
+      uint32_t Value(uint8_t *base, int row)
+      {
+        const int v = g_state.v[row];
+        return row < kLanguage ? kValues[row][std::clamp(v, 0, kStates[row] - 1)] : TextId(base, sst::lang::ChoiceLabel(v));
+      }
+    }
+
     // What the "more rows" markers show (-1: not set on this page yet)
     struct Markers
     {
       int up = -1, down = -1;   // Settings page: arrows above / below the four rows
       int shown = -1, pos = -1; // pause page: scroll bar shown, thumb position
     };
+
+    int List::Count() const
+    {
+      return keys ? sst::input::KeyBindingCount() : general ? general::kCount
+                                                : pause     ? kPauseRowCount
+                                                            : kRows;
+    }
 
     // Under MenuMutex
     List g_list;
@@ -154,7 +302,7 @@ namespace sst::menu::page
     // The restart dialog was confirmed: start the new copy, then close this one (forced after a few seconds if the normal shutdown stalls)
     void Restart()
     {
-      REXLOG_INFO("[sst-menu] restarting for the aspect ratio / shader precision change");
+      REXLOG_INFO("[sst-menu] restarting to apply the new settings");
 
       if (!RestartGame())
       {
@@ -265,6 +413,72 @@ namespace sst::menu::page
       }
     }
 
+    void GeneralEvent(int event)
+    {
+      using namespace general;
+      List &l = g_list;
+      State &s = g_state;
+
+      switch (event)
+      {
+      case kLeft:
+
+      case kRight:
+      {
+        const int row = l.cursor, n = kStates[row];
+        s.v[row] = (s.v[row] + (event == kRight ? 1 : n - 1)) % n; // (wraps, as the game's page)
+        Write(row, s.v[row]);
+        l.redraw = true;
+        l.sound = kMoveSound;
+        REXLOG_INFO("[sst-menu] GENERAL: {}", Describe(s));
+        break;
+      }
+
+      case kUp:
+
+      case kDown:
+        MoveCursor(event);
+        break;
+
+      case kSelect:
+      {
+        l.sound = kSelectSound;
+        const int choice = s.v[kLanguage];
+
+        if (choice != s.snapshot[kLanguage])
+        {
+          sst::lang::SaveChoice(choice);
+
+          // A restart when the language this boot would pick changes
+          if (sst::lang::ChoiceLanguage(choice) != sst::lang::Current())
+          {
+            REXLOG_INFO("[sst-menu] GENERAL saved: {} (restart for the language)", Describe(s));
+            l.dialog = true;
+            SetRestartDialogUp(true);
+            break;
+          }
+        }
+
+        REXLOG_INFO("[sst-menu] GENERAL saved: {}", Describe(s));
+        l.leave = true;
+        break;
+      }
+
+      case kBack:
+        for (int row = 0; row < kLanguage; ++row)
+        {
+          if (s.v[row] != s.snapshot[row])
+            Write(row, s.snapshot[row]);
+        }
+
+        std::copy(std::begin(s.snapshot), std::end(s.snapshot), std::begin(s.v));
+        REXLOG_INFO("[sst-menu] GENERAL cancelled: {}", Describe(s));
+        l.leave = true;
+        l.sound = kBackSound;
+        break;
+      }
+    }
+
     void HandleEvent(int event)
     {
       List &l = g_list;
@@ -275,6 +489,8 @@ namespace sst::menu::page
 
       if (l.keys && event != kUp && event != kDown)
         KeyBindingsEvent(event);
+      else if (l.general)
+        GeneralEvent(event);
       else
         SettingsEvent(event);
 
@@ -288,11 +504,22 @@ namespace sst::menu::page
       g_list.visible = pause ? kPauseVisible : kVisible;
       g_list.pause = pause;
       g_list.keys = !pause && g_keys_next;
+      g_list.general = !pause && !g_list.keys && general::g_next;
       g_keys_next = false;
+      general::g_next = false;
       g_keys_y_seen = sst::input::YPresses();
       g_markers = {};
 
-      if (g_list.keys)
+      if (g_list.general)
+      {
+        if (GeneralRowOk())
+          g_list.visible = general::kRows;
+
+        general::Read(general::g_state);
+        std::copy(std::begin(general::g_state.v), std::end(general::g_state.v), std::begin(general::g_state.snapshot));
+        REXLOG_INFO("[sst-menu] GENERAL page opened: {}", general::Describe(general::g_state));
+      }
+      else if (g_list.keys)
         REXLOG_INFO("[sst-menu] KEY BINDINGS page opened");
       else
         REXLOG_INFO("[sst-menu] VIDEO page opened{}: {}", pause ? " (pause menu)" : "", Describe(Current()));
@@ -319,6 +546,64 @@ namespace sst::menu::page
       g_keys_y_seen = y;
       sst::input::ResetKeyBindings();
       return true;
+    }
+
+    // The restart dialog was answered NO: what needed the restart goes back to this run's (and is saved so), the page stays open
+    void CancelRestart()
+    {
+      List &l = g_list;
+
+      if (l.general)
+      {
+        general::State &s = general::g_state;
+
+        if (s.v[general::kLanguage] != s.snapshot[general::kLanguage])
+        {
+          s.v[general::kLanguage] = s.snapshot[general::kLanguage];
+          sst::lang::SaveChoice(s.v[general::kLanguage]);
+        }
+
+        REXLOG_INFO("[sst-menu] restart cancelled: GENERAL {}", general::Describe(s));
+      }
+      else
+      {
+        Settings &current = Current();
+        current.v[kAspect] = Boot().aspect;
+        current.v[kShaderPrecision] = Boot().precision;
+        Apply(current);
+        Save(current);
+        g_snapshot = current;
+        REXLOG_INFO("[sst-menu] restart cancelled: VIDEO {}", Describe(current));
+      }
+
+      l.NothingHappened();
+      l.redraw = true;
+    }
+
+    // The cursor's animation keys (the GENERAL layout's cursor group): rows 0-3 as the game's page; the fifth row has its own stretch from row 3 (kGeneralCursorFrom -> kGeneralCursorTo); jumps to and from it otherwise (wrapping)
+    uint32_t CursorKey(int k)
+    {
+      constexpr uint32_t kKeys[4] = {0xAFF91553, 0x417E03CC, 0xFFB6C545, 0x4318364C};
+      const List &l = g_list;
+
+      auto key = [&](int line)
+      { return line >= 4 ? kGeneralCursorTo : kKeys[std::clamp(line, 0, 3)]; };
+
+      const int from = l.old_visible, to = l.new_visible;
+
+      if (k >= 2)
+        return key(to);
+
+      if (from < 4 && to < 4)
+        return key(k == 0 ? from : to);
+
+      if (from == 3 && to == 4)
+        return k == 0 ? kGeneralCursorFrom : kGeneralCursorTo;
+
+      if (from == 4 && to == 3)
+        return k == 0 ? kGeneralCursorTo : kGeneralCursorFrom;
+
+      return key(to); // (wrapping to / from the fifth row: no animation)
     }
 
     // kResult k: 0 the cursor's old line, 1 its new line, 2 redraw, 3 leave, 4 sound, 5 show the restart dialog
@@ -378,10 +663,17 @@ namespace sst::menu::page
     }
   }
 
-  bool HandleNative(const NativeCall &call, uint32_t index)
+  bool HandleNative(PPCContext &ctx, const NativeCall &call, uint32_t index)
   {
     uint8_t *base = call.base;
     std::lock_guard lock(MenuMutex());
+    general::g_ctx = &ctx;
+    general::g_base = base;
+
+    struct ClearContext
+    {
+      ~ClearContext() { general::g_ctx = nullptr; }
+    } clear_context;
 
     switch (index)
     {
@@ -393,7 +685,8 @@ namespace sst::menu::page
       return true;
 
     case kPageTitle:
-      call.ReturnHash(g_list.keys ? TextId(base, "KEY BINDINGS") : kTextVideoGame);
+      call.ReturnHash(g_list.keys ? TextId(base, "KEY BINDINGS") : g_list.general ? general::kTitle
+                                                                                  : kTextVideoGame);
       return true;
 
     case kPageFrame:
@@ -401,12 +694,14 @@ namespace sst::menu::page
       return true;
 
     case kPageReturnCursor:
-      call.ReturnInt(g_list.keys ? kControlsItem : kVideoItem);
+      call.ReturnInt(g_list.keys ? kControlsItem : g_list.general ? general::kSettingsItem
+                                                                  : kVideoItem);
       return true;
 
     case kPageReturnScript:
       call.ReturnHash(g_list.keys ? kControllerScript : kSettingsScript);
       g_list.keys = false; // (the page is closing)
+      g_list.general = false;
       return true;
 
     case kEvent:
@@ -436,7 +731,30 @@ namespace sst::menu::page
     case kPauseValue:
     {
       const bool label = index == kLabel || index == kPauseLabel;
-      call.ReturnHash(TextId(base, RowText(call.Int(0), label, index == kPauseLabel || index == kPauseValue)));
+      const bool pause_row = index == kPauseLabel || index == kPauseValue;
+
+      if (g_list.general && !pause_row)
+      {
+        const int line = call.Int(0);
+
+        if (line < 0 || line >= g_list.visible)
+        {
+          call.ReturnHash(TextId(base, " "));
+        }
+        else
+        {
+          const int row = std::clamp(g_list.top + line, 0, general::kCount - 1);
+          call.ReturnHash(label ? general::Label(base, row) : general::Value(base, row));
+        }
+      }
+      else if (!pause_row && call.Int(0) >= g_list.visible)
+      {
+        call.ReturnHash(TextId(base, " ")); // (the fifth row's texts on the four-row lists: hidden anyway)
+      }
+      else
+      {
+        call.ReturnHash(TextId(base, RowText(call.Int(0), label, pause_row)));
+      }
 
       if (label)
         UpdateMarkers();
@@ -448,9 +766,23 @@ namespace sst::menu::page
       call.ReturnInt(Result(call.Int(0)));
       return true;
 
+    case kPageRows:
+      call.ReturnInt(g_list.visible);
+      return true;
+
+    case kPageCursorKey:
+      call.ReturnHash(CursorKey(call.Int(0)));
+      return true;
+
     case kRestart:
       SetRestartDialogUp(false);
       Restart();
+      call.ReturnInt(0);
+      return true;
+
+    case kRestartCancel:
+      SetRestartDialogUp(false);
+      CancelRestart();
       call.ReturnInt(0);
       return true;
     }
@@ -470,6 +802,12 @@ namespace sst::menu::page
   {
     std::lock_guard lock(MenuMutex());
     return g_list.keys;
+  }
+
+  void OpenGeneralNext()
+  {
+    std::lock_guard lock(MenuMutex());
+    general::g_next = true;
   }
 
   void OpenKeyBindingsNext()

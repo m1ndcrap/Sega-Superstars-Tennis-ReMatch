@@ -26,6 +26,7 @@ REXCVAR_DECLARE(bool, sst_graphics_menu);
 REXCVAR_DECLARE(bool, sst_skip_intro);
 REXCVAR_DECLARE(bool, sst_online_play_name);
 REXCVAR_DECLARE(bool, sst_quit_item);
+REXCVAR_DECLARE(bool, sst_language_menu);
 REXCVAR_DECLARE(bool, sst_controls_name);
 REXCVAR_DECLARE(bool, sst_controller_diagram);
 REXCVAR_DECLARE(bool, sst_wide_layouts);
@@ -45,6 +46,11 @@ namespace sst::menu
   constexpr uint32_t kControllerScript = 0x5ABCAE69;  // "controller": Settings > CONTROLLER
   constexpr uint32_t kSplashScript = 0x0ED21739;      // "splash": the boot intro
   constexpr uint32_t kStartScreenScript = 0x1187AE2B; // "startscreen": the title screen
+  constexpr uint32_t kGeneralScript = 0x0EF38D57;     // "options_general": Settings > GENERAL (the port's list page replaces it)
+
+  // Settings > GENERAL's fifth row (scene_rows.cpp AddGeneralRow; added to SSTMainMenu by scene_files.cpp, used by the page script and video_page.cpp): its bar and value row (shown on GENERAL, hidden on the four-row lists), label and value texts, cursor keys (row 3 -> 4)
+  constexpr uint32_t kGeneralBar = 0x53474E01, kGeneralValues = 0x53474E02, kGeneralLabel = 0x53474E03, kGeneralValue = 0x53474E04;
+  constexpr uint32_t kGeneralCursorFrom = 0x53474E10, kGeneralCursorTo = 0x53474E11;
 
   // The Settings page's list arrows (added to the SSTMainMenu scene by scene_files.cpp, shown by video_page.cpp): objects, their keys
   constexpr uint32_t kCaretUp = 0x53564301, kCaretDown = 0x53564302, kCaretHide = 0x53564310, kCaretShow = 0x53564311;
@@ -85,6 +91,9 @@ namespace sst::menu
     kPageFrame = 19,        // every frame -> 1: redraw
     kPageReturnCursor = 20, // -> Settings list cursor + 1 to leave behind
     kPageReturnScript = 21, // -> script to start on leaving
+    kPageRows = 22,         // -> rows on screen (4, or 5 on GENERAL when its fifth row is in the scene)
+    kPageCursorKey = 23,    // (k) cursor animation after an event: 0 from key, 1 to key; 2 the key of the cursor's row (page start)
+    kRestartCancel = 24,    // the restart dialog was answered NO: the settings that need a restart go back to this run's, the page stays
   };
 
   // graphics_menu.cpp:
@@ -107,7 +116,7 @@ namespace sst::menu
   namespace page
   {
     // A page native (kBegin .. kResult, kPause*, kPage*, kRestart): true if it was one
-    bool HandleNative(const NativeCall &call, uint32_t index);
+    bool HandleNative(PPCContext &ctx, const NativeCall &call, uint32_t index);
 
     // Scene animations the page asked for (played once the native has returned): show / hide an object, or animate it to a key
     struct Anim
@@ -126,6 +135,9 @@ namespace sst::menu
 
     // CONTROLS left with Y: the next page start is KEY BINDINGS. And: the page it returns to has started
     void OpenKeyBindingsNext();
+
+    // Settings > GENERAL is starting: the next page start (the VIDEO page script) is the GENERAL list
+    void OpenGeneralNext();
     void KeyBindingsClosed();
   }
 
@@ -150,6 +162,9 @@ namespace sst::menu
   // The patched PauseMenu / main menu scene loaded (or not): the patched scripts need it
   void SetPauseSceneOk(bool ok);
   void SetQuitSceneOk(bool ok);
+
+  // scene_files.cpp: GENERAL's fifth row is in the main menu scene (else the GENERAL list scrolls on four rows)
+  bool GeneralRowOk();
 
   // camera_aspect.cpp:
   // The cameras' aspect (16:9 in the game's 4:3 mode: its cameras are already 4:3)

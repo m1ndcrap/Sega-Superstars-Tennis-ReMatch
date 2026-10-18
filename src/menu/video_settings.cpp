@@ -1,6 +1,7 @@
 // VIDEO settings
 
 #include "menu/video_settings.h"
+#include "menu/port_text.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -9,6 +10,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <string>
+#include <vector>
 
 REXCVAR_DEFINE_INT32(sst_resolution, 720, "SST", "Internal resolution in lines: 480, 720, 1080, 1440, 2160 (VIDEO page)");
 REXCVAR_DEFINE_INT32(sst_render_scale, 100, "SST", "3D render scale in percent of the internal resolution, 50-100 (the UI stays at the internal resolution; VIDEO page)");
@@ -179,6 +182,30 @@ namespace sst::menu::video
 
   void Save(const Settings &s)
   {
+    // Lines this page does not own (e.g. "language = french", read by menu/language.cpp) are kept
+    std::vector<std::string> others;
+    {
+      std::ifstream in(SettingsPath());
+      std::string line;
+
+      while (in && std::getline(in, line))
+      {
+        const size_t eq = line.find('=');
+
+        if (eq == std::string::npos || line.empty() || line[0] == '#' || line[0] == ';')
+          continue;
+
+        const std::string key = Trim(line.substr(0, eq));
+        bool ours = false;
+
+        for (int r = 0; r < kRows; ++r)
+          ours = ours || key == kRowInfo[r].key;
+
+        if (!ours)
+          others.push_back(Trim(line));
+      }
+    }
+
     std::ofstream f(SettingsPath(), std::ios::trunc);
 
     if (!f)
@@ -191,10 +218,22 @@ namespace sst::menu::video
          "# positions: preset 0 low 1 medium 2 high 3 custom; shadows 0 off, 1-5 = 128-2048;\n"
          "# bloom 0 off 1 on; shader_precision 0 accurate 1 fast; resolution 0-4 = 480p 720p 1080p 1440p 2160p; aspect_ratio 0-4 = 4:3 16:9 16:10\n"
          "# 21:9 32:9; render_scale 0-10 = 50-100%; aa_type 0 off 1 FXAA 2 MSAA; aa_level\n"
-         "# 0-2 = 2x 4x 8x; fps_limit 0 = 30, 1 = 60; brightness 0-20 = 0-100.\n";
+         "# 0-2 = 2x 4x 8x; fps_limit 0 = 30, 1 = 60; brightness 0-20 = 0-100.\n"
+         "# language: auto (Windows display language), english, french, german, spanish, italian (restart to apply).\n";
 
     for (int r = 0; r < kRows; ++r)
       f << kRowInfo[r].key << " = " << s.v[r] << "\n";
+
+    bool language = false;
+
+    for (const std::string &line : others)
+    {
+      f << line << "\n";
+      language = language || Trim(line.substr(0, line.find('='))) == "language";
+    }
+
+    if (!language)
+      f << "language = auto\n";
   }
 
   void Apply(const Settings &s)
@@ -333,20 +372,47 @@ namespace sst::menu::video
     return out;
   }
 
+  // The pause menu's fonts (PauseMenu's language file): rows 0x54291604, values 0x2207B8BE. In the game's language when the fonts are known (port_text.h: missing letters simplified or dropped); else the English font's letters (PauseText).
+  namespace
+  {
+    constexpr uint32_t kPauseLabelFont = 0x54291604, kPauseValueFont = 0x2207B8BE;
+
+    std::string PauseFit(std::string text, uint32_t font, bool digits)
+    {
+      if (!sst::text::FontKnown(nullptr, "pausemenu", font))
+        return PauseText(text, digits);
+
+      for (char &c : text)
+      {
+        if (c >= 'a' && c <= 'z')
+          c = char(c - 'a' + 'A');
+      }
+
+      // As PauseText: 16:9 -> 16X9, ANTI-ALIASING -> ANTI ALIASING when the font has no ':' / '-'
+      if (!sst::text::HasChar(nullptr, "pausemenu", font, ':'))
+        std::replace(text.begin(), text.end(), ':', 'X');
+
+      if (!sst::text::HasChar(nullptr, "pausemenu", font, '-'))
+        std::replace(text.begin(), text.end(), '-', ' ');
+
+      return sst::text::Fit(nullptr, text, "pausemenu", font);
+    }
+  }
+
   std::string PauseLabel(int row)
   {
     if (row == kPreset)
-      return "PRESET"; // no Q in the font
+      return PauseFit(sst::text::Tr("PRESET"), kPauseLabelFont, false); // (English: no Q in the font)
 
-    return PauseText(kRowInfo[row].label, false);
+    return PauseFit(sst::text::Tr(kRowInfo[row].label), kPauseLabelFont, false);
   }
 
   std::string PauseValue(const Settings &s, int row)
   {
     if (row == kAaLevel && s.v[kAaType] != kMsaa)
-      return "NONE";
+      return PauseFit(sst::text::Tr("NONE"), kPauseValueFont, true);
 
-    return PauseText(ValueText(s, row), true);
+    return PauseFit(sst::text::Tr(ValueText(s, row)), kPauseValueFont, true);
   }
 
   // A new aspect ratio needs a restart: 4:3 is the game's own mode, and the wide layouts are made as scenes load (the main menu's at boot). So does a new shader precision: the renderer picks its shader pack once, at startup

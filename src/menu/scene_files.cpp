@@ -7,6 +7,7 @@
 // Scenes that grow are read into a bigger buffer (sub_82594618 / sub_825946B0), then rewritten once both files are in (sub_82595158).
 
 #include "menu/achievements.h"
+#include "menu/port_text.h"
 #include "menu/hud_anchor.h"
 #include "menu/main_menu_quit.h"
 #include "menu/menu_internal.h"
@@ -191,7 +192,11 @@ namespace sst::menu
       const FileKind kind = KindOf(base, path, name);
 
       if (kind != FileKind::kAsUsual)
-        return ReadWithRoom(ctx, base, kind, async, name);
+      {
+        ReadWithRoom(ctx, base, kind, async, name);
+        sst::text::OnSceneFile(name, Load32(base, out_buf));
+        return;
+      }
 
       Original(ctx, base);
 
@@ -202,6 +207,7 @@ namespace sst::menu
       }
 
       sst::ach::OnSceneFile(base, name, Load32(base, out_buf));
+      sst::text::OnSceneFile(name, Load32(base, out_buf)); // (language files: the fonts the port's texts are fitted to)
     }
 
     // A scene being set up: its two files in guest memory and, when read with room to grow, how much room they have
@@ -300,6 +306,23 @@ namespace sst::menu
         REXLOG_WARN("[sst-menu] sstmainmenu.dat: list arrows not added ({})", error.empty() ? std::string("too large") : error);
     }
 
+    // Settings > GENERAL: a fifth row (LANGUAGE; video_page.cpp)
+    std::atomic<bool> g_general_row{false};
+
+    void AddGeneralRow(Scene &s)
+    {
+      const scenes::GeneralRow row{kGeneralBar, kGeneralValues, kGeneralLabel, kGeneralValue, kGeneralCursorFrom, kGeneralCursorTo};
+      Bytes d, r;
+      std::string error;
+      const bool ok = s.ReplaceIfFits(scenes::AddGeneralRow(s.Dat(), s.dat_size, s.Rel(), s.rel_size, row, d, r, error), d, r, error);
+      g_general_row = ok;
+
+      if (ok)
+        REXLOG_INFO("[sst-menu] sstmainmenu.dat: GENERAL fifth row added");
+      else
+        REXLOG_WARN("[sst-menu] sstmainmenu.dat: GENERAL fifth row not added ({}); the list scrolls", error.empty() ? std::string("too large") : error);
+    }
+
     // Achievements: the list on the RECORDS page (main menu), the unlock popup (MsgBox)
     void AddAchievements(Scene &s)
     {
@@ -393,6 +416,8 @@ namespace sst::menu
     }
   }
 
+  bool GeneralRowOk() { return g_general_row; }
+
   // Ultrawide layouts (scene_widen.cpp): when the game started with an aspect ratio wider than 16:9
   bool WideLayouts()
   {
@@ -454,6 +479,9 @@ extern "C" REX_FUNC(sub_82595158)
 
     if (s.name == "sstmainmenu.dat" && REXCVAR_GET(sst_graphics_menu))
       AddListArrows(s);
+
+    if (s.name == "sstmainmenu.dat" && REXCVAR_GET(sst_graphics_menu) && REXCVAR_GET(sst_language_menu))
+      AddGeneralRow(s);
 
     if (s.name == "sstmainmenu.dat" || s.name == "msgbox.dat")
       AddAchievements(s);

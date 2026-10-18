@@ -3,6 +3,7 @@
 //   - "splash": a skippable boot intro (tools/gen_intro_script.py)
 //   - "pausemenu_match": the game's module patched with a VIDEO row (pause_patch.cpp); needs the patched PauseMenu scene
 //   - "mainmenu": the game's module patched with a QUIT row (main_menu_quit.cpp); needs the patched main menu scene
+//   - "options_general": the same list page with the GENERAL list (the game's four settings and LANGUAGE)
 //
 // It also tells the input code where the game is (title screen, menus, a match)
 
@@ -230,6 +231,13 @@ extern "C" REX_FUNC(sub_821CCA28)
   if (ctx.r4.u32 == kSettingsScript && controls::TakeOpenKeyBindings())
   {
     page::OpenKeyBindingsNext();
+    ctx.r4.u64 = kVideoScript;
+  }
+
+  // Settings > GENERAL: the port's list page (the VIDEO page's script with the GENERAL list: the game's settings and LANGUAGE)
+  if (ctx.r4.u32 == kGeneralScript && REXCVAR_GET(sst_graphics_menu) && REXCVAR_GET(sst_language_menu))
+  {
+    page::OpenGeneralNext();
     ctx.r4.u64 = kVideoScript;
   }
 

@@ -10,6 +10,7 @@
 REXCVAR_DEFINE_BOOL(sst_skip_intro, true, "SST", "The boot intro (SEGA movie, logo cards) can be skipped with Start / A (Enter on the keyboard)");
 REXCVAR_DEFINE_BOOL(sst_online_play_name, true, "SST", "Main menu: the Xbox LIVE item is called ONLINE PLAY");
 REXCVAR_DEFINE_BOOL(sst_quit_item, true, "SST", "Main menu: a QUIT item below OPTIONS (asks, then closes the game; Esc on the main menu asks too)");
+REXCVAR_DEFINE_BOOL(sst_language_menu, true, "SST", "Settings > GENERAL: the port's list with the game's four settings and LANGUAGE (instead of the game's own page)");
 REXCVAR_DEFINE_BOOL(sst_controls_name, true, "SST", "Settings: the CONTROLLER page is called CONTROLS");
 REXCVAR_DEFINE_BOOL(sst_controller_diagram, true, "SST", "Settings > CONTROLLER shows the DualShock 3 diagram while a PlayStation pad is in use");
 REXCVAR_DEFINE_BOOL(sst_wide_layouts, true, "SST", "Ultrawide aspect ratios: menus, loading screens and backgrounds get layouts that fill the extra width (generated from the 16:9 ones)");

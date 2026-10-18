@@ -1,9 +1,11 @@
 // Texts the port adds or renames. The game looks texts up by id (SumoTool's text tables, sub_82594AD0); the hook answers for the port's own ids (strings kept in a guest pool) and swaps a few of the game's while one of the port's dialogs borrows a message box.
 
+#include "input/controls.h"
 #include "menu/main_menu_quit.h"
 #include "menu/achievements.h"
 #include "menu/menu_internal.h"
 #include "menu/pause_patch.h"
+#include "menu/port_text.h"
 
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
@@ -110,6 +112,12 @@ namespace sst::menu
       return it != g_pool.texts.end() ? it->second : 0;
     }
 
+    // `english` in the game's language and in the characters of the fonts of scene `stem` (port_text.h). Under g_pool.mutex
+    uint32_t Localized(uint8_t *base, const char *english, std::string_view stem)
+    {
+      return Find(base, MakeId(base, sst::text::Fit(base, sst::text::Tr(english), stem)));
+    }
+
     // What the port shows instead of the game's text `id` (0: the game's)
     uint32_t Replacement(uint8_t *base, uint32_t id)
     {
@@ -118,18 +126,30 @@ namespace sst::menu
 
       std::lock_guard lock(g_pool.mutex);
 
-      if (g_restart_dialog && (id == kRestartBody || id == kRestartTitle))
-        return Find(base, MakeId(base, id == kRestartBody ? "The game will now restart to apply the new settings." : "RESTART REQUIRED"));
+      // (the message box's texts: MsgBox's fonts). The restart dialog borrows the YES / NO message the QUIT dialog uses
+      if (g_restart_dialog && (id == quit::kMessageBody || id == kRestartBody))
+        return Localized(base, "The game needs to restart to apply the new settings. Restart now?", "msgbox");
+
+      if (g_restart_dialog && (id == quit::kMessageTitle || id == kRestartTitle))
+        return Localized(base, "RESTART REQUIRED", "msgbox");
 
       // QUIT dialog: the game's "RETURN TO ONLINE MENU" YES / NO message
       if (g_quit_dialog && (id == quit::kMessageBody || id == quit::kMessageTitle))
-        return Find(base, id == quit::kMessageBody ? kTextQuitQuestion : quit::kTextLabel);
+        return Localized(base, id == quit::kMessageBody ? "Are you sure you want to quit to the desktop?" : "QUIT", "msgbox");
 
+      // The main menu's QUIT row and its description
+      if (id == quit::kTextLabel)
+        return Localized(base, "QUIT", "sstmainmenu");
+
+      if (id == quit::kTextDescription)
+        return Localized(base, "Close the game and return to the desktop.", "sstmainmenu");
+
+      // (the pause menu's CONTROLLER row: its fonts have few letters)
       if (in(kTextController) && REXCVAR_GET(sst_controls_name))
-        return Find(base, MakeId(base, "CONTROLS"));
+        return Localized(base, "CONTROLS", id == kTextController[2] ? "pausemenu" : "sstmainmenu");
 
       if (in(kTextXboxLive) && REXCVAR_GET(sst_online_play_name))
-        return Find(base, MakeId(base, "ONLINE PLAY"));
+        return Localized(base, "ONLINE PLAY", "sstmainmenu");
 
       if ((id & 0xFFFF0000u) == kTextIdBase)
         return Find(base, id);
@@ -141,10 +161,14 @@ namespace sst::menu
   uint32_t TextId(uint8_t *base, const std::string &text)
   {
     std::lock_guard lock(g_pool.mutex);
-    return MakeId(base, text);
+    return MakeId(base, sst::text::Tr(text)); // (the port's menu texts: translations in plain A-Z, port_text.cpp)
   }
 
-  void SetRestartDialogUp(bool up) { g_restart_dialog = up; }
+  void SetRestartDialogUp(bool up)
+  {
+    g_restart_dialog = up;
+    sst::input::SetDialogUp(up); // (a YES / NO box: Esc = B = NO)
+  }
   void SetQuitDialogUp(bool up) { g_quit_dialog = up; }
   bool QuitDialogUp() { return g_quit_dialog; }
 }

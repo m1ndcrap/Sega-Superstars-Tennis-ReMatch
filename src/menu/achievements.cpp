@@ -2,6 +2,8 @@
 
 #include "menu/achievements.h"
 #include "menu/guest.h"
+#include "menu/language.h"
+#include "menu/port_text.h"
 #include "menu/scene_patches.h"
 
 #include <rex/cvar.h>
@@ -129,7 +131,7 @@ namespace sst::ach
       bool menu_up = false; // the main menu has started once
       bool frames_seen = false;
       uint32_t front_end = 0; // the script front end (its directory holds the modules)
-      uint32_t font_file = 0; // msgbox_en.dat in guest memory (the popup's font)
+      uint32_t font_file = 0; // msgbox_<language>.dat in guest memory (the popup's font)
       std::vector<uint16_t> advances;
       uint32_t menu_module = 0, menu_site = 0; // the main menu module, its ACHIEVEMENTS action's 15:82 call
     };
@@ -232,20 +234,67 @@ namespace sst::ach
       return REXCVAR_GET(sst_achievements_ui);
     }
 
-    // ASCII only (the game's fonts): other characters become '?'; line breaks become spaces; trimmed
+    // Next UTF-8 code point of s at i (advances i); malformed bytes -> 0xFFFD
+    uint32_t NextCodePoint(const std::string &s, size_t &i)
+    {
+      const uint8_t c = uint8_t(s[i++]);
+
+      if (c < 0x80)
+        return c;
+
+      const int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2
+                                    : c >= 0xC0   ? 1
+                                                  : -1;
+
+      if (extra < 0)
+        return 0xFFFD;
+
+      uint32_t cp = c & (0x3F >> extra);
+
+      for (int k = 0; k < extra; ++k)
+      {
+        if (i >= s.size() || (uint8_t(s[i]) & 0xC0) != 0x80)
+          return 0xFFFD;
+
+        cp = (cp << 6) | (uint8_t(s[i++]) & 0x3F);
+      }
+
+      return cp;
+    }
+
+    void AppendUtf8(std::string &out, uint32_t cp)
+    {
+      if (cp < 0x80)
+        out += char(cp);
+      else if (cp < 0x800)
+      {
+        out += char(0xC0 | (cp >> 6));
+        out += char(0x80 | (cp & 0x3F));
+      }
+      else
+      {
+        out += char(0xE0 | (cp >> 12));
+        out += char(0x80 | ((cp >> 6) & 0x3F));
+        out += char(0x80 | (cp & 0x3F));
+      }
+    }
+
+    // The game's texts are UTF-8 and its fonts are keyed by code point (Latin-1 and more, as the language files need): Latin letters and common punctuation are kept, other characters become '?'; line breaks become spaces; trimmed
     std::string Clean(const std::string &s)
     {
       std::string out;
 
-      for (size_t i = 0; i < s.size(); ++i)
+      for (size_t i = 0; i < s.size();)
       {
-        const uint8_t c = uint8_t(s[i]);
+        const uint32_t cp = NextCodePoint(s, i);
 
-        if (c == '\n' || c == '\r' || c == '\t')
+        if (cp == '\n' || cp == '\r' || cp == '\t' || cp == 0xA0)
           out += ' ';
-        else if (c < 0x80)
-          out += char(c);
-        else if ((c & 0xC0) != 0x80) // first byte of a UTF-8 sequence
+        else if (cp >= 0x20 && cp < 0x7F)
+          out += char(cp);
+        else if ((cp >= 0xA1 && cp < 0x250) || (cp >= 0x2010 && cp <= 0x2026) || cp == 0x2122)
+          AppendUtf8(out, cp);
+        else if (cp >= 0x80)
           out += '?';
       }
 
@@ -322,12 +371,39 @@ namespace sst::ach
       std::map<uint32_t, int> slots; // XDBF image id -> slot
       const auto xdbf = ks->title_xdbf();
 
+      // The title data has the achievements in English, German, French, Spanish and Italian: the game's language (menu/language.cpp) when it has it, else the catalog's (English)
+      const auto language = rex::system::XLanguage(sst::lang::Current());
+      std::map<uint32_t, std::pair<std::string, std::string>> local; // id -> name, description
+
+      if (xdbf.is_valid() && language != rex::system::XLanguage::kEnglish)
+      {
+        for (const auto &x : xdbf.GetAchievements())
+        {
+          const std::string name = xdbf.GetStringTableEntry(language, uint16_t(x.label_id));
+          std::string desc = xdbf.GetStringTableEntry(language, uint16_t(x.description_id));
+
+          if (desc.empty())
+            desc = xdbf.GetStringTableEntry(language, uint16_t(x.unachieved_id));
+
+          if (!name.empty() && !desc.empty())
+            local[uint32_t(x.id)] = {name, desc};
+        }
+
+        REXLOG_INFO("[sst-ach] {} of the achievements in {}", local.size(), sst::lang::Name(uint32_t(language)));
+      }
+
       for (const auto &a : infos)
       {
         Entry e;
         e.id = a.id;
         e.name = Clean(a.label);
         e.desc = Clean(a.description.empty() ? a.unachieved_description : a.description);
+
+        if (auto l = local.find(a.id); l != local.end())
+        {
+          e.name = Clean(l->second.first);
+          e.desc = Clean(l->second.second);
+        }
         e.gamerscore = a.gamerscore;
         e.score = fmt::format("{}G", a.gamerscore);
 
@@ -383,7 +459,7 @@ namespace sst::ach
         return;
 
       PutText(base, kTextBlank, " ");
-      PutText(base, kTextPopupHeader, "ACHIEVEMENT UNLOCKED");
+      PutText(base, kTextPopupHeader, sst::text::Fit(base, sst::text::Tr("ACHIEVEMENT UNLOCKED"), "msgbox"));
 
       for (size_t i = 0; i < g.list.size(); ++i)
       {
@@ -447,26 +523,32 @@ namespace sst::ach
       return g.manager ? g.manager->IsUnlocked(id) : false;
     }
 
-    // "10/14/2026  12:49 PM" (local time) from the unlock's FILETIME; "UNLOCKED" when the time is unknown
+    // "10/14/2026  12:49 PM" (local time, in the game's language's form) from the unlock's FILETIME; "UNLOCKED" when the time is unknown
+    std::string UnlockDateText(uint32_t id);
+
     std::string UnlockDate(uint32_t id)
+    {
+      return sst::text::Fit(nullptr, UnlockDateText(id), "sstmainmenu");
+    }
+
+    std::string UnlockDateText(uint32_t id)
     {
       const uint64_t ft = g.manager ? g.manager->GetUnlockTime(id) : 0;
       constexpr uint64_t kUnixEpoch = 116444736000000000ull; // 1970-01-01 in FILETIME units (100 ns since 1601)
 
       if (ft <= kUnixEpoch)
-        return "UNLOCKED";
+        return sst::text::Tr("UNLOCKED");
 
       const std::time_t t = std::time_t((ft - kUnixEpoch) / 10000000ull);
       std::tm tm{};
 #if defined(_WIN32)
       if (localtime_s(&tm, &t) != 0)
-        return "UNLOCKED";
+        return sst::text::Tr("UNLOCKED");
 #else
       if (!localtime_r(&t, &tm))
-        return "UNLOCKED";
+        return sst::text::Tr("UNLOCKED");
 #endif
-      const int hour = tm.tm_hour % 12 == 0 ? 12 : tm.tm_hour % 12;
-      return fmt::format("{:02}/{:02}/{}  {}:{:02} {}", tm.tm_mon + 1, tm.tm_mday, tm.tm_year + 1900, hour, tm.tm_min, tm.tm_hour < 12 ? "AM" : "PM");
+      return sst::text::DateTime(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
     }
 
     // The MsgBox body font's advances (from the language file's FONT chunk: 0x20-byte fonts {hash, glyph count, 0, glyphs offset, ...}, 0x18-byte glyphs {texture, char, x, y, w, h, x offset, advance, ...}). Under g.mutex
@@ -504,7 +586,7 @@ namespace sst::ach
             if (glyphs > 0x400 || (go < g.font_file && go + 0x18 * glyphs > data))
               return;
 
-            g.advances.assign(256, 0);
+            g.advances.assign(0x2200, 0);
 
             for (uint32_t i = 0; i < glyphs; ++i)
             {
@@ -512,7 +594,7 @@ namespace sst::ach
               const uint32_t ch = Load32(base, gl + 4) >> 16;
               const uint32_t adv = Load32(base, gl + 16) >> 16;
 
-              if (ch < 256)
+              if (ch < g.advances.size())
                 g.advances[ch] = uint16_t(adv);
             }
 
@@ -531,9 +613,9 @@ namespace sst::ach
     {
       float w = 0;
 
-      for (const char c : s)
+      for (size_t i = 0; i < s.size();)
       {
-        const uint8_t u = uint8_t(c);
+        const uint32_t u = NextCodePoint(s, i);
         w += (u < g.advances.size() && g.advances[u]) ? float(g.advances[u]) : 16.0f;
       }
 
@@ -582,7 +664,14 @@ namespace sst::ach
           std::string last = lines.back();
 
           while (!last.empty() && TextWidth(last + "...") > width)
-            last.pop_back();
+          {
+            // (a whole UTF-8 character at a time)
+            while (!last.empty() && (uint8_t(last.back()) & 0xC0) == 0x80)
+              last.pop_back();
+
+            if (!last.empty())
+              last.pop_back();
+          }
 
           lines.back() = last + "...";
           return lines;
@@ -612,7 +701,8 @@ namespace sst::ach
 
   void OnSceneFile(uint8_t *base, const std::string &name, uint32_t buffer)
   {
-    if (name != "msgbox_en.dat" || !buffer)
+    // msgbox_<language>.dat (_en, _us, _fr, _ge, _sp, _it): the one the game loads
+    if (!buffer || name.size() != 13 || name.compare(0, 7, "msgbox_") != 0 || name.compare(9, 4, ".dat") != 0)
       return;
 
     std::lock_guard<std::recursive_mutex> lock(g.mutex);
@@ -962,7 +1052,7 @@ namespace sst::ach
       }
 
       const uint32_t text = kTextSummary + (g.summary_alt ? 1 : 0);
-      PutText(base, text, fmt::format("{} / {} UNLOCKED", unlocked, g.list.size()), 64);
+      PutText(base, text, sst::text::Fit(base, fmt::format("{} / {} {}", unlocked, g.list.size(), sst::text::Tr("UNLOCKED")), "sstmainmenu"), 64);
       SetText(ctx, base, kSummary, text);
       const int steps = std::max(0, int(g.list.size()) - kVisibleRows);
       SetResult(base, out, uint32_t(steps), 2);
@@ -1033,10 +1123,11 @@ namespace sst::ach
 
       g.popup_alt = !g.popup_alt;
       const uint32_t alt = g.popup_alt ? 1 : 0;
-      PutText(base, kTextPopupName + alt, it->name, kPopupText);
+      // (in MsgBox's fonts: the game's language file has the characters its own texts use)
+      PutText(base, kTextPopupName + alt, sst::text::Fit(base, it->name, "msgbox"), kPopupText);
 
       // The description wrapped to the popup's width (up to three lines; the panel picture of that height)
-      const std::vector<std::string> lines = Wrap(base, it->desc, sst::menu::scenes::kPopupDescWidth, 3);
+      const std::vector<std::string> lines = Wrap(base, sst::text::Fit(base, it->desc, "msgbox"), sst::menu::scenes::kPopupDescWidth, 3);
 
       for (uint32_t k = 0; k < 3; ++k)
         PutText(base, kTextPopupDesc + k * 2 + alt, k < lines.size() ? lines[k] : std::string(" "), kPopupText);

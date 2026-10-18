@@ -47,6 +47,17 @@ namespace sst::menu::scenes
 
   bool AddListCarets(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, const ListCarets &carets, Bytes &out_dat, Bytes &out_rel, std::string &error);
 
+  // Settings > GENERAL (the GENERAL page layout): a fifth row, a copy of the fourth (SPEED) one row spacing lower: its bar (in the cursor group AF90E2C8, with the label) and its value row (a page-level group with the value texts). The cursor group's timeline gets a new stretch: frame 400 (key
+  // cursor_from: row 3 highlighted, as at frame 70) to frame 409 (key cursor_to: row 4 highlighted). The new objects are shown on every page that uses the layout until a page script hides them (the four-row VIDEO / KEY BINDINGS lists do).
+  struct GeneralRow
+  {
+    uint32_t bar, values;            // new groups: the row's bar (cursor group child) and its value row (page level)
+    uint32_t label, value;           // their label text and the text shown at value 0 (the page script sets their texts)
+    uint32_t cursor_from, cursor_to; // cursor group keys (frames 400 and 409)
+  };
+
+  bool AddGeneralRow(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, const GeneralRow &row, Bytes &out_dat, Bytes &out_rel, std::string &error);
+
   // A new texture entry `to`: the part [u0, u1] x [v0, v1] (fractions) of texture `from`
   bool AddSubTexture(const uint8_t *dat, size_t dat_size, const uint8_t *rel, size_t rel_size, uint32_t from, uint32_t to, float u0, float u1, float v0, float v1, Bytes &out_dat, Bytes &out_rel, std::string &error);
 
