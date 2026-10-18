@@ -99,7 +99,7 @@ target_include_directories(sst_rematch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # src/input/lightbar.cpp writes the PlayStation pads' HID output reports
 if(WIN32)
-  target_link_libraries(sst_rematch PRIVATE hid setupapi)
+  target_link_libraries(sst_rematch PRIVATE hid setupapi ole32)
 endif()
 
 # Linker map next to the exe: turns the "sst_rematch.exe+0x..." frames of a crash report (sst_crash.txt) into function names
