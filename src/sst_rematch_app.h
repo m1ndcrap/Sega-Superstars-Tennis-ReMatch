@@ -41,12 +41,12 @@ public:
     }
   }
 
-  // The GPU is a runtime-loaded plugin; the gpu_plugin cvar defaults to empty (no GPU). On Windows it is always the port's native renderer ("sst", rexgpu-sst.dll next to the exe)
+  // The GPU is a runtime-loaded plugin; the gpu_plugin cvar defaults to empty (no GPU). It is the port's native renderer ("sst", rexgpu-sst next to the exe) on Windows and on Linux builds with Vulkan (SST_NATIVE_RENDERER)
   void OnPreSetup(rex::RuntimeConfig &config) override
   {
     if (config.gpu_plugin.empty())
     {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SST_NATIVE_RENDERER)
       config.gpu_plugin = "sst";
 #else
       config.gpu_plugin = "xenos";

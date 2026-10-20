@@ -15,7 +15,7 @@ index e505a5e..efbd4d0 100644
      target_compile_definitions(XenosRecomp PRIVATE XENOS_RECOMP_DXIL)
      target_link_libraries(XenosRecomp PRIVATE Microsoft::DXIL)
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..36a3d7e 100644
+index 1c74034..9a61606 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
 @@ -30,6 +30,9 @@ struct PushConstants
@@ -74,7 +74,7 @@ index 1c74034..36a3d7e 100644
  
  struct CubeMapData
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..86f1729 100644
+index 698a418..1ffadb5 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -115,7 +115,14 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
@@ -307,7 +307,28 @@ index 698a418..86f1729 100644
      println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
      out += "{\n";
  
-@@ -1346,6 +1461,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1324,6 +1439,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             out += '\t';
+ 
++#ifdef SST_RECOMP
++            // SST: the input's location is its index in the shader's vertex element list (sst::xenos::GetVertexInputs order). The fixed
++            // table below misses inputs this game uses (POSITION2-4, ...), and Vulkan rejects a shader that locates only some of its inputs;
++            // the native renderer builds each draw's vertex layout from the same list, so it knows every location
++            print("[[vk::location({})]] ", i);
++#else
+             for (auto& usageLocation : USAGE_LOCATIONS)
+             {
+                 if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
+@@ -1332,6 +1453,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     break;
+                 }
+             }
++#endif
+ 
+             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
+                 uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
+@@ -1346,6 +1468,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
      #endif
@@ -319,7 +340,7 @@ index 698a418..86f1729 100644
  
          out += "\tout float4 oPos : SV_Position";
  
-@@ -1464,13 +1584,25 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1464,13 +1591,25 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
@@ -345,7 +366,7 @@ index 698a418..86f1729 100644
          #endif
              else
              {
-@@ -1479,6 +1611,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1479,6 +1618,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  
@@ -355,7 +376,7 @@ index 698a418..86f1729 100644
      out += "\tint a0 = 0;\n";
      out += "\tint aL = 0;\n";
      out += "\tbool p0 = false;\n";
-@@ -1832,6 +1967,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1832,6 +1974,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      if (!hasMtxProjection)
                  #endif
                      {

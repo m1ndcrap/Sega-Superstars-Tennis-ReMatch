@@ -20,9 +20,11 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
 #include <windows.h>
 
 #include <psapi.h> // K32EnumProcessModules (kernel32, no psapi.lib needed)
+#endif
 
 REXCVAR_DEFINE_BOOL(sst_hitch_profiler, false, "SST",
                     "Debug: sample the game thread ~1000x/s and log where slow game frames (and "
@@ -33,6 +35,14 @@ REXCVAR_DEFINE_INT32(sst_hitch_threshold_ms, 20, "SST",
 
 REXCVAR_DECLARE(int32_t, sst_native_log_every);
 
+#if !defined(_WIN32)
+// (The sampler suspends the game thread and walks its stack with Windows APIs; elsewhere the profiler is off)
+namespace sst::native::hitch
+{
+  void OnGameFrame() {}
+  void Shutdown() {}
+}
+#else
 namespace sst::native::hitch
 {
   namespace
@@ -631,3 +641,4 @@ namespace sst::native::hitch
       p->sampler.join();
   }
 }
+#endif

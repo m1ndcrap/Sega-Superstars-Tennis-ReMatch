@@ -58,7 +58,7 @@ namespace sst::native
     const TextureCache::AllocateFn allocate = [this](size_t size)
     {
       const Upload u = Allocate(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-      return TextureCache::UploadSpace{u.cpu, u.resource, u.offset};
+      return TextureCache::UploadSpace{u.cpu, u.buffer, u.offset};
     };
 
     bool textured = false, placeholder = false;
@@ -89,7 +89,7 @@ namespace sst::native
         if (capture_active_ || trace_draw_)
           draw_textures_ += fmt::format(" t{}={:08X}:{}x{} fmt {} dim {} fetchdim {}{}", i, fetch[1] & ~0xFFFu, (fetch[2] & 0x1FFF) + 1, ((fetch[2] >> 13) & 0x1FFF) + 1, fetch[1] & 0x3F, (fetch[5] >> 9) & 3, dimension, composite_pages_.count((fetch[1] >> 12) & 0x1FFFF) ? "c" : "");
 
-        const uint32_t slot = textures_->GetTexture(list_.Get(), allocate, fetch, dimension);
+        const uint32_t slot = textures_->GetTexture(*list_, allocate, fetch, dimension);
 
         if (slot != TextureCache::kNone)
         {

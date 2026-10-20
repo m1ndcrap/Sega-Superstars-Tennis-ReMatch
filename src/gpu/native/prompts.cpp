@@ -20,7 +20,9 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(sst_native_prompts, true, "SST/Native", "Button prompt icons follow the device in use (PlayStation icons for PlayStation pads, keys for the keyboard)");
 

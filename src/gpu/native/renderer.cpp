@@ -4,6 +4,12 @@
 #include "gpu/native/pipeline_workers.h"
 #include "gpu/native/renderer_debug.h"
 
+#include "gpu/native/dxc.h"
+
+#if defined(_WIN32)
+#include "gpu/native/gfx/d3d12/d3d12_gfx.h"
+#endif
+
 REXCVAR_DEFINE_BOOL(sst_native_quads, true, "SST", "Native renderer: draw QUADLIST / TRIFAN primitives (converted to triangle lists). Off until textures work: full-screen passes would cover the scene");
 REXCVAR_DEFINE_BOOL(sst_native_debug_shading, false, "SST", "Native renderer: replace the game's pixel shaders with distance bands (checks geometry independently of lighting / textures)");
 REXCVAR_DEFINE_BOOL(sst_native_half_pixel, true, "SST", "Native renderer: shift geometry by half a pixel (D3D9 pixel centres)");
@@ -48,10 +54,13 @@ namespace sst::native
   }
 
   // setup
-  bool Renderer::Initialize(const D3D12Provider &provider, ShaderCache *shaders, const uint8_t *physical_membase, uint32_t width, uint32_t height)
+  bool Renderer::Initialize(std::unique_ptr<gfx::Device> device, ShaderCache *shaders, const uint8_t *physical_membase, uint32_t width, uint32_t height)
   {
-    provider_ = &provider;
+    gfx_ = std::move(device);
     physical_membase_ = physical_membase;
+
+    if (!gfx_)
+      return false;
 
     // Guest physical memory is writable host memory; memexport writes into it
     {
@@ -64,92 +73,67 @@ namespace sst::native
       REXLOG_INFO("[sst-native] memexport: {} worker threads", memexport_->worker_threads());
     }
 
-    device_ = provider.GetDevice();
-
+#if defined(_WIN32)
+    if (ID3D12Device *d3d = gfx::d3d12::NativeDevice(*gfx_))
     {
       static Renderer *diagnostics = nullptr;
       diagnostics = this;
 
-      sst::gpu::SetDiagnosticsDevice(device_, [](uint64_t frame, uint32_t draw)
+      sst::gpu::SetDiagnosticsDevice(d3d, [](uint64_t frame, uint32_t draw)
                                      { return diagnostics ? diagnostics->DrawLabel(frame, draw) : std::string(); });
     }
+#endif
 
     shaders_ = shaders;
     width_ = width;
     height_ = height;
 
-    // Outputs + RTVs
-    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = kOutputs;
-
-    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_))))
+    // View tables: shader-visible SRVs / samplers (bindless), RTVs (the outputs, then render targets), DSVs (the output depth, then depth targets)
+    if (!gfx_->CreateTables({kSrvHeapSize, kSamplerHeapSize, kOutputs + kRtRtvCount, 1 + kRtDsvCount}) || !gfx_->CreateLayouts())
+    {
+      REXLOG_ERROR("[sst-native] failed to create the descriptor tables / root signatures");
       return false;
+    }
 
-    rtv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-
+    // Outputs + RTVs
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width;
     desc.Height = height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = D3D12Presenter::kGuestOutputFormat;
+    desc.Format = kOutputFormat;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
     for (uint32_t i = 0; i < kOutputs; ++i)
     {
-      if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&outputs_[i]))))
+      outputs_[i] = gfx_->CreateTexture(desc, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+      if (!outputs_[i])
         return false;
 
-      device_->CreateRenderTargetView(outputs_[i].Get(), nullptr, Rtv(i));
+      gfx_->WriteRtv(Rtv(i), *outputs_[i], nullptr);
       output_scale_[i] = Scale2{};
     }
 
-    for (uint32_t i = 0; i < kSlots; ++i)
-    {
-      if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frames_[i].allocator))))
-        return false;
-    }
+    list_ = gfx_->CreateCommandList(kSlots);
 
-    // Depth
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    hd.NumDescriptors = 1;
-
-    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap_))))
+    if (!list_)
       return false;
 
+    // Depth
     desc.Format = kDepthFormat;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear = {};
     clear.Format = kDepthFormat;
     clear.DepthStencil.Depth = 1.0f;
+    depth_ = gfx_->CreateTexture(desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear);
 
-    if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&depth_))))
+    if (!depth_)
       return false;
 
-    device_->CreateDepthStencilView(depth_.Get(), nullptr, dsv_heap_->GetCPUDescriptorHandleForHeapStart());
-
-    if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frames_[0].allocator.Get(), nullptr, IID_PPV_ARGS(&list_))))
-      return false;
-
-    list_->Close();
-
-    if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_))))
-      return false;
-
-    event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-
-    if (!event_)
-      return false;
-
-    if (!CreateRootSignature())
-    {
-      REXLOG_ERROR("[sst-native] failed to create the root signature");
-      return false;
-    }
-
+    gfx_->WriteDsv(kOutputDsv, *depth_, nullptr);
     CreateDebugPixelShader();
     CreateTimestampQueries();
 
@@ -163,75 +147,12 @@ namespace sst::native
     }
 
     textures_ = std::make_unique<TextureCache>();
-    textures_->Initialize(device_, physical_membase, srv_heap_.Get(), kSrvReserved, kSrvHeapSize - kSrvReserved, sampler_heap_.Get(), kSamplerReserved, kSamplerHeapSize - kSamplerReserved);
+    textures_->Initialize(*gfx_, physical_membase, kSrvReserved, kSrvHeapSize - kSrvReserved, kSamplerReserved, kSamplerHeapSize - kSamplerReserved);
     return true;
-  }
-
-  bool Renderer::CreateRootSignature()
-  {
-    D3D12_ROOT_PARAMETER params[kRootCount] = {};
-    const UINT cbv_registers[] = {0, 1, 2, 3, 4};
-
-    for (UINT i = 0; i < 5; ++i)
-    {
-      params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-      params[i].Descriptor.ShaderRegister = cbv_registers[i];
-      params[i].Descriptor.RegisterSpace = 4;
-      params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-
-    D3D12_DESCRIPTOR_RANGE ranges[4] = {};
-
-    for (UINT i = 0; i < 4; ++i)
-    {
-      ranges[i].RangeType = i < 3 ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-      ranges[i].NumDescriptors = UINT_MAX; // unbounded (resource binding tier 2+)
-      ranges[i].BaseShaderRegister = 0;
-      ranges[i].RegisterSpace = i;
-      ranges[i].OffsetInDescriptorsFromTableStart = 0;
-      D3D12_ROOT_PARAMETER &p = params[kRootTextures2D + i];
-      p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      p.DescriptorTable.NumDescriptorRanges = 1;
-      p.DescriptorTable.pDescriptorRanges = &ranges[i];
-      p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-
-    D3D12_ROOT_SIGNATURE_DESC rs = {};
-    rs.NumParameters = kRootCount;
-    rs.pParameters = params;
-    rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT; // F9 capture
-    ComPtr<ID3DBlob> blob, error;
-
-    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
-    {
-      if (error)
-        REXLOG_ERROR("[sst-native] root signature: {}", std::string(static_cast<const char *>(error->GetBufferPointer()), error->GetBufferSize()));
-
-      return false;
-    }
-
-    return SUCCEEDED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_signature_)));
   }
 
   bool Renderer::CreateDescriptorsAndPlaceholders()
   {
-    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kSrvHeapSize;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-
-    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_))))
-      return false;
-
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    hd.NumDescriptors = kSamplerHeapSize;
-
-    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&sampler_heap_))))
-      return false;
-
-    const UINT srv_size = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const UINT sampler_size = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-
     // White 1x1 placeholders: 2D, 3D, cube (6 faces)
     struct Placeholder
     {
@@ -247,38 +168,22 @@ namespace sst::native
     };
 
     // One upload buffer: 9 subresources, 512 bytes each (aligned for copies); the last one is black
-    D3D12_HEAP_PROPERTIES upload_heap = {D3D12_HEAP_TYPE_UPLOAD};
-    D3D12_RESOURCE_DESC bd = {};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = 9 * 512;
-    bd.Height = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels = 1;
-    bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ComPtr<ID3D12Resource> staging;
+    gfx::BufferRef staging = gfx_->CreateBuffer(9 * 512, gfx::HeapType::kUpload, D3D12_RESOURCE_STATE_GENERIC_READ);
 
-    if (FAILED(device_->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging))))
+    if (!staging)
       return false;
 
-    uint8_t *mapped = nullptr;
-    staging->Map(0, nullptr, reinterpret_cast<void **>(&mapped));
-    std::memset(mapped, 0xFF, 8 * 512);
-    std::memset(mapped + 8 * 512, 0, 512);
+    std::memset(staging->cpu, 0xFF, 8 * 512);
+    std::memset(staging->cpu + 8 * 512, 0, 512);
 
     // Zero buffer for missing vertex inputs (also upload heap; never written)
-    bd.Width = 256;
+    zero_buffer_ = gfx_->CreateBuffer(256, gfx::HeapType::kUpload, D3D12_RESOURCE_STATE_GENERIC_READ);
 
-    if (FAILED(device_->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&zero_buffer_))))
+    if (!zero_buffer_)
       return false;
 
-    uint8_t *zero = nullptr;
-    zero_buffer_->Map(0, nullptr, reinterpret_cast<void **>(&zero));
-    std::memset(zero, 0, 256);
-    zero_buffer_->Unmap(0, nullptr);
-
-    frames_[0].allocator->Reset();
-    list_->Reset(frames_[0].allocator.Get(), nullptr);
+    std::memset(zero_buffer_->cpu, 0, 256);
+    list_->Begin(0, "sst placeholders");
     uint32_t staging_index = 0;
 
     for (const Placeholder &k : kinds)
@@ -291,29 +196,22 @@ namespace sst::native
       td.MipLevels = 1;
       td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
       td.SampleDesc.Count = 1;
-      ComPtr<ID3D12Resource> tex;
+      gfx::TextureRef tex = gfx_->CreateTexture(td, D3D12_RESOURCE_STATE_COPY_DEST);
 
-      if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex))))
+      if (!tex)
         return false;
 
       const UINT subresources = k.dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : k.depth_or_array;
 
       for (UINT s = 0; s < subresources; ++s)
       {
-        D3D12_TEXTURE_COPY_LOCATION dst = {};
-        dst.pResource = tex.Get();
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.SubresourceIndex = s;
-        D3D12_TEXTURE_COPY_LOCATION src = {};
-        src.pResource = staging.Get();
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Offset = 512 * staging_index++;
-        src.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 256};
-        list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        fp.Offset = 512 * staging_index++;
+        fp.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 256};
+        list_->CopyBufferToTexture(*tex, s, *staging, fp);
       }
 
-      auto barrier = Transition(tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-      list_->ResourceBarrier(1, &barrier);
+      list_->Barrier(*tex, D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead);
 
       D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
       sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -329,13 +227,11 @@ namespace sst::native
       if (k.view == D3D12_SRV_DIMENSION_TEXTURECUBE)
         sd.TextureCube.MipLevels = 1;
 
-      D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
-      h.ptr += size_t(k.heap_index) * srv_size;
-      device_->CreateShaderResourceView(tex.Get(), &sd, h);
+      gfx_->WriteSrv(k.heap_index, *tex, sd);
       placeholder_textures_.push_back(tex);
     }
 
-    // Fill the rest of the heap with the 2D placeholder so any index is valid
+    // Fill the rest of the reserved slots with the 2D placeholder so any index is valid
     {
       D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
       sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -344,11 +240,7 @@ namespace sst::native
       sd.Texture2D.MipLevels = 1;
 
       for (uint32_t i = 4; i < kSrvReserved; ++i)
-      {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += size_t(i) * srv_size;
-        device_->CreateShaderResourceView(placeholder_textures_[0].Get(), &sd, h);
-      }
+        gfx_->WriteSrv(i, *placeholder_textures_[0], sd);
     }
 
     // Samplers: linear wrap everywhere
@@ -358,18 +250,10 @@ namespace sst::native
     smp.MaxLOD = D3D12_FLOAT32_MAX;
 
     for (uint32_t i = 0; i < kSamplerReserved; ++i)
-    {
-      D3D12_CPU_DESCRIPTOR_HANDLE h = sampler_heap_->GetCPUDescriptorHandleForHeapStart();
-      h.ptr += size_t(i) * sampler_size;
-      device_->CreateSampler(&smp, h);
-    }
+      gfx_->WriteSampler(i, smp);
 
-    list_->Close();
-    ID3D12CommandList *lists[] = {list_.Get()};
-    provider_->GetDirectQueue()->ExecuteCommandLists(1, lists);
-    provider_->GetDirectQueue()->Signal(fence_.Get(), ++fence_value_);
-    WaitFence(fence_value_);
-    staging->Unmap(0, nullptr);
+    list_->End();
+    gfx_->WaitFence(gfx_->Submit(*list_));
     return true;
   }
 
@@ -378,13 +262,8 @@ namespace sst::native
     if (memexport_)
       CollectMemexports(true);
 
-    if (fence_)
-      WaitFence(fence_value_);
-
-    if (event_)
-      CloseHandle(event_);
-
-    event_ = nullptr;
+    if (gfx_)
+      gfx_->WaitFence(gfx_->LastSubmitted());
 
     // finishes compiles, saves the pipeline cache
     pipeline_workers_.reset();
@@ -394,7 +273,7 @@ namespace sst::native
     if (textures_)
       textures_->Shutdown();
 
-    geo_pool_.Reset();
+    geo_pool_.reset();
     geo_entries_.clear();
     color_rts_.clear();
     depth_rts_.clear();
@@ -402,42 +281,61 @@ namespace sst::native
     retired_rts_.clear();
     blit_pipelines_.clear();
     textures_.reset();
-    list_.Reset();
+    list_.reset();
 
     for (auto &f : frames_)
-    {
-      f.allocator.Reset();
       f.pages.clear();
-    }
 
     for (auto &o : outputs_)
-      o.Reset();
+      o.reset();
 
     placeholder_textures_.clear();
-    zero_buffer_.Reset();
-    depth_.Reset();
-    srv_heap_.Reset();
-    sampler_heap_.Reset();
-    rtv_heap_.Reset();
-    dsv_heap_.Reset();
-    root_signature_.Reset();
-    fence_.Reset();
+    zero_buffer_.reset();
+    depth_.reset();
+    so_pipelines_.clear();
+    so_buffer_.reset();
+    so_readback_.reset();
+    so_zero_.reset();
+    timestamps_.reset();
+    timestamp_readback_.reset();
+    pass_ts_.reset();
+    pass_readback_.reset();
+    debug_ps_.reset();
+    gfx_.reset();
   }
 
-  D3D12_CPU_DESCRIPTOR_HANDLE Renderer::Rtv(uint32_t slot) const
+  bool Renderer::CompileRendererShader(const char *source, const wchar_t *profile, std::vector<uint8_t> &out)
   {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += size_t(slot) * rtv_size_;
-    return h;
-  }
+    const gfx::ShaderFormat format = gfx_->shader_format();
+    dxc::Ref<IDxcCompiler3> compiler;
 
-  void Renderer::WaitFence(uint64_t value)
-  {
-    if (!value || fence_->GetCompletedValue() >= value)
-      return;
+    if (FAILED(dxc::CreateInstance(format, CLSID_DxcCompiler, __uuidof(IDxcCompiler3), compiler.put())))
+      return false;
 
-    if (SUCCEEDED(fence_->SetEventOnCompletion(value, event_)))
-      WaitForSingleObject(event_, INFINITE);
+    // SPIR-V: the source picks its Vulkan bindings under __spirv__ (renderer_present.cpp); vertex shaders flip y like the translated ones
+    std::vector<const wchar_t *> args = {L"-T", profile, L"-E", L"main", L"-Qstrip_debug"};
+
+    if (format == gfx::ShaderFormat::kSpirv)
+    {
+      args.insert(args.end(), {L"-spirv", L"-fvk-use-dx-layout", L"-fspv-target-env=vulkan1.2"});
+
+      if (profile[0] == L'v')
+        args.push_back(pack::kDxcSpirvVsArg);
+    }
+    else
+    {
+      args.push_back(L"-Qstrip_reflect");
+    }
+
+    std::string errors;
+
+    if (!dxc::Compile(compiler.get(), source, args.data(), uint32_t(args.size()), out, &errors))
+    {
+      REXLOG_ERROR("[sst-native] renderer shader ({}): {}", format == gfx::ShaderFormat::kSpirv ? "SPIR-V" : "DXIL", errors);
+      return false;
+    }
+
+    return true;
   }
 
   Renderer::Upload Renderer::Allocate(size_t size, size_t alignment)
@@ -455,7 +353,7 @@ namespace sst::native
         {
           f.offset = start + size;
           stats_.upload_bytes += size;
-          return {p.cpu + start, p.gpu + start, p.resource.Get(), start};
+          return {p.cpu + start, p.gpu + start, p.buffer.get(), start};
         }
 
         ++f.page;
@@ -465,24 +363,14 @@ namespace sst::native
 
       UploadPage p;
       p.size = std::max(kUploadPageSize, (size + 0xFFFF) & ~size_t(0xFFFF));
-      D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_UPLOAD};
-      D3D12_RESOURCE_DESC bd = {};
-      bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      bd.Width = p.size;
-      bd.Height = 1;
-      bd.DepthOrArraySize = 1;
-      bd.MipLevels = 1;
-      bd.SampleDesc.Count = 1;
-      bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      p.buffer = gfx_->CreateBuffer(p.size, gfx::HeapType::kUpload, D3D12_RESOURCE_STATE_GENERIC_READ);
 
-      if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&p.resource))))
-      {
+      if (!p.buffer)
         return {};
-      }
 
-      p.resource->SetName(L"sst upload page");
-      p.resource->Map(0, nullptr, reinterpret_cast<void **>(&p.cpu));
-      p.gpu = p.resource->GetGPUVirtualAddress();
+      p.buffer->SetName("sst upload page");
+      p.cpu = p.buffer->cpu;
+      p.gpu = p.buffer->gpu;
       f.pages.push_back(std::move(p));
       f.page = f.pages.size() - 1;
       f.offset = 0;
@@ -586,7 +474,7 @@ namespace sst::native
 
     {
       const uint64_t t0 = Tick();
-      WaitFence(f.fence_value);
+      gfx_->WaitFence(f.fence_value);
       prof_.ticks[kPhFenceWait] += Tick() - t0;
     }
 
@@ -595,7 +483,7 @@ namespace sst::native
     bound_targets_ = 0;
 
     {
-      const uint64_t done = fence_->GetCompletedValue();
+      const uint64_t done = gfx_->CompletedFence();
 
       std::erase_if(retired_rts_, [&](const auto &r)
                     { return r.first <= done; });
@@ -612,36 +500,30 @@ namespace sst::native
       geo_offset_ = 0;
     }
 
-    f.allocator->Reset();
     f.page = 0;
     f.offset = 0;
-    list_->Reset(f.allocator.Get(), nullptr);
 
     {
       DrawLabels &labels = draw_labels_[(submitted_ + 1) % std::size(draw_labels_)];
       labels.frame = submitted_ + 1;
       labels.draws.clear();
-      const std::wstring name = L"sst frame " + std::to_wstring(labels.frame);
-      list_->SetName(name.c_str());
+      list_->Begin(frame_res_, "sst frame " + std::to_string(labels.frame));
     }
 
     if (timestamps_)
-      list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * frame_res_);
+      list_->WriteTimestamp(*timestamps_, 2 * frame_res_);
 
     pass_marks_[frame_res_].clear();
     pass_pair_ = 0;
     MarkPass(0, 0, 0, 3);
 
-    auto to_rt = Transition(outputs_[target_].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    list_->ResourceBarrier(1, &to_rt);
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(target_);
-    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
-    list_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    list_->Barrier(*outputs_[target_], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    list_->SetTargets(Rtv(target_), kOutputDsv);
 
     // Start each frame defined (the game clears explicitly too)
     static constexpr float kBlack[4] = {0, 0, 0, 1};
-    list_->ClearRenderTargetView(rtv, kBlack, 0, nullptr);
-    list_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, last_depth_clear_, 0, 0, nullptr);
+    list_->ClearRtv(Rtv(target_), kBlack);
+    list_->ClearDsv(kOutputDsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, last_depth_clear_, 0);
 
     if (capture_requested_ && EnsureCaptureResources())
     {
@@ -649,25 +531,17 @@ namespace sst::native
       capture_active_ = true;
       captured_.clear();
       so_used_ = 0;
-      list_->CopyBufferRegion(so_buffer_.Get(), kSoDataBytes, so_zero_.Get(), 0, kSoCounterBytes);
-      auto to_so = Transition(so_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
-      list_->ResourceBarrier(1, &to_so);
+      list_->CopyBuffer(*so_buffer_, kSoDataBytes, *so_zero_, 0, kSoCounterBytes);
+      list_->Barrier(*so_buffer_, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
 
       if (!capture_quiet_)
         REXLOG_INFO("[sst-native] capture: recording frame {}", submitted_ + 1);
     }
 
-    textures_->BeginFrame(submitted_ + 1, fence_->GetCompletedValue(), fence_value_ + 1);
-    ID3D12DescriptorHeap *heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
-    list_->SetDescriptorHeaps(2, heaps);
-    list_->SetGraphicsRootSignature(root_signature_.Get());
-
-    for (UINT i = 0; i < 3; ++i)
-      list_->SetGraphicsRootDescriptorTable(kRootTextures2D + i, srv_heap_->GetGPUDescriptorHandleForHeapStart());
-
-    list_->SetGraphicsRootDescriptorTable(kRootSamplers, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
+    textures_->BeginFrame(submitted_ + 1, gfx_->CompletedFence(), gfx_->LastSubmitted() + 1);
+    list_->SetLayout(gfx::Layout::kDraw);
     const D3D12_RECT scissor = Scaled({0, 0, LONG(width_), LONG(height_)}, output_scale_[target_]);
-    list_->RSSetScissorRects(1, &scissor);
+    list_->SetScissor(scissor);
     recording_ = true;
   }
 
@@ -723,44 +597,39 @@ namespace sst::native
     if (RenderTargetsEnabled())
       PresentRenderTargets();
 
-    auto to_src = Transition(outputs_[target_].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list_->ResourceBarrier(1, &to_src);
+    list_->Barrier(*outputs_[target_], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     const bool capturing = capture_active_;
 
     if (capturing)
     {
-      D3D12_RESOURCE_BARRIER b[2] = {Transition(so_buffer_.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE), {}};
-      list_->ResourceBarrier(1, b);
-      list_->CopyResource(so_readback_.Get(), so_buffer_.Get());
-      b[0] = Transition(so_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-      list_->ResourceBarrier(1, b);
+      list_->Barrier(*so_buffer_, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list_->CopyBufferAll(*so_readback_, *so_buffer_);
+      list_->Barrier(*so_buffer_, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
       capture_active_ = false;
     }
 
     if (timestamps_)
     {
-      list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * frame_res_ + 1);
-      list_->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * frame_res_, 2, timestamp_readback_.Get(), 16 * frame_res_);
+      list_->WriteTimestamp(*timestamps_, 2 * frame_res_ + 1);
+      list_->ResolveTimestamps(*timestamps_, 2 * frame_res_, 2, *timestamp_readback_, 16 * frame_res_);
       timestamp_pending_[frame_res_] = true;
 
       if (pass_ts_)
       {
         std::vector<PassMark> &marks = pass_marks_[frame_res_];
-        list_->EndQuery(pass_ts_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_res_ * kPassMarks + uint32_t(marks.size()));
+        list_->WriteTimestamp(*pass_ts_, frame_res_ * kPassMarks + uint32_t(marks.size()));
         marks.push_back({0, 0, 0, 4}); // end (closes the last segment; not counted itself)
-        list_->ResolveQueryData(pass_ts_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_res_ * kPassMarks, uint32_t(marks.size()), pass_readback_.Get(), 8 * uint64_t(frame_res_) * kPassMarks);
+        list_->ResolveTimestamps(*pass_ts_, frame_res_ * kPassMarks, uint32_t(marks.size()), *pass_readback_, 8 * uint64_t(frame_res_) * kPassMarks);
       }
     }
 
-    list_->Close();
-    ID3D12CommandQueue *queue = provider_->GetDirectQueue();
-    ID3D12CommandList *lists[] = {list_.Get()};
-    queue->ExecuteCommandLists(1, lists);
-    queue->Signal(fence_.Get(), ++fence_value_);
-    frames_[frame_res_].fence_value = fence_value_;
+    list_->End();
+    frames_[frame_res_].fence_value = gfx_->Submit(*list_);
 
+#if defined(_WIN32)
     if (sst::gpu::DumpDeviceRemoved())
       REXLOG_ERROR("[sst-native] the graphics device was lost at frame {} (see the [sst-gpu] lines above)", submitted_ + 1);
+#endif
 
     ++submitted_;
     recording_ = false;
@@ -768,7 +637,7 @@ namespace sst::native
 
     if (capturing)
     {
-      WaitFence(fence_value_);
+      gfx_->WaitFence(gfx_->LastSubmitted());
       FinishCapture();
       captured_.clear();
     }
@@ -778,7 +647,7 @@ namespace sst::native
     // F9 (or --sst_native_capture_frame) captures the next frame
     capture_quiet_ = REXCVAR_GET(sst_native_capture_frame) == -1;
 
-    if ((GetAsyncKeyState(VK_F9) & 1))
+    if (DebugKeyPressed(0x78)) // F9
     {
       capture_requested_ = true;
       capture_quiet_ = false;
@@ -802,7 +671,7 @@ namespace sst::native
       rt_trace_.lines.clear();
     }
 
-    if ((GetAsyncKeyState(VK_F10) & 1) || (REXCVAR_GET(sst_native_rt_trace) > 0 && submitted_ + 1 == uint64_t(REXCVAR_GET(sst_native_rt_trace))))
+    if (DebugKeyPressed(0x79) || (REXCVAR_GET(sst_native_rt_trace) > 0 && submitted_ + 1 == uint64_t(REXCVAR_GET(sst_native_rt_trace))))
     {
       rt_trace_.active = true;
       rt_trace_.frame = submitted_ + 1;

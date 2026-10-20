@@ -1,4 +1,4 @@
-// Native renderer: the keyboard's prompt pictures (key caps with the bound keys' names, drawn with GDI at 4x and filtered down)
+// Native renderer: the keyboard's prompt pictures (key caps with the bound keys' names, drawn with GDI on Windows, rasterized here elsewhere, at 4x and filtered down)
 
 #include "gpu/native/prompt_art.h"
 
@@ -13,7 +13,19 @@
 #include <map>
 #include <string>
 
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <cstdio>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <vector>
+
+#define STB_TRUETYPE_IMPLEMENTATION
+#define STBTT_STATIC
+#include <imstb_truetype.h>
+#endif
 
 namespace sst::native::prompts
 {
@@ -25,6 +37,7 @@ namespace sst::native::prompts
       std::vector<uint8_t> v; // coverage at 1x
     };
 
+#if defined(_WIN32)
     template <typename DrawFn>
     Mask Coverage(uint32_t w, uint32_t h, DrawFn draw)
     {
@@ -153,6 +166,221 @@ namespace sst::native::prompts
       SelectObject(dc, op);
       DeleteObject(br);
     }
+
+#else
+    // Without GDI: the same shapes rasterized here (an 8-bit coverage canvas at 4x), the legends with stb_truetype and a system font (Liberation Sans Bold first: Arial's metrics)
+    struct Canvas
+    {
+      int w = 0, h = 0;
+      std::vector<uint8_t> v;
+
+      void Plot(int x, int y, uint8_t c)
+      {
+        if (x >= 0 && y >= 0 && x < w && y < h)
+          v[size_t(y) * w + x] = std::max(v[size_t(y) * w + x], c);
+      }
+    };
+
+    using HDC = Canvas *;
+
+    template <typename DrawFn>
+    Mask Coverage(uint32_t w, uint32_t h, DrawFn draw)
+    {
+      constexpr int kS = 4;
+      Mask m;
+      m.w = w, m.h = h;
+      m.v.assign(size_t(w) * h, 0);
+      Canvas c;
+      c.w = int(w) * kS, c.h = int(h) * kS;
+      c.v.assign(size_t(c.w) * c.h, 0);
+      draw(&c, c.w, c.h, kS);
+
+      for (uint32_t y = 0; y < h; ++y)
+      {
+        for (uint32_t x = 0; x < w; ++x)
+        {
+          uint32_t sum = 0;
+
+          for (int sy = 0; sy < kS; ++sy)
+          {
+            for (int sx = 0; sx < kS; ++sx)
+              sum += c.v[size_t(y * kS + sy) * c.w + (x * kS + sx)];
+          }
+
+          m.v[size_t(y) * w + x] = uint8_t(sum / (kS * kS));
+        }
+      }
+
+      return m;
+    }
+
+    // As GDI's RoundRect(x0, y0, x1 + 1, y1 + 1, r, r): corner ellipses r wide
+    void WhiteRoundRect(HDC dc, int x0, int y0, int x1, int y1, int r)
+    {
+      const float rr = std::max(0.0f, r * 0.5f);
+
+      for (int y = std::max(y0, 0); y <= std::min(y1, dc->h - 1); ++y)
+      {
+        for (int x = std::max(x0, 0); x <= std::min(x1, dc->w - 1); ++x)
+        {
+          const float px = x + 0.5f, py = y + 0.5f;
+          const float cx = std::clamp(px, x0 + rr, x1 + 1 - rr), cy = std::clamp(py, y0 + rr, y1 + 1 - rr);
+
+          if ((px - cx) * (px - cx) + (py - cy) * (py - cy) <= rr * rr)
+            dc->Plot(x, y, 255);
+        }
+      }
+    }
+
+    const stbtt_fontinfo *Font()
+    {
+      static std::once_flag once;
+      static std::vector<unsigned char> data;
+      static stbtt_fontinfo info;
+      static bool ok = false;
+
+      std::call_once(once, []
+                     {
+        static const char *const kFonts[] = {
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/TTF/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        };
+
+        for (const char *path : kFonts)
+        {
+          std::ifstream in(path, std::ios::binary);
+
+          if (!in)
+            continue;
+
+          data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+
+          if (!data.empty() && stbtt_InitFont(&info, data.data(), stbtt_GetFontOffsetForIndex(data.data(), 0)))
+          {
+            ok = true;
+            return;
+          }
+        } });
+
+      return ok ? &info : nullptr;
+    }
+
+    // White text centred in the box, shrunk to fit (as the GDI version: em size = 62% / 72% of the box height, then 88% steps until
+    // it fits in 86% of the width)
+    void WhiteText(HDC dc, const std::wstring &text, int x0, int y0, int x1, int y1)
+    {
+      const stbtt_fontinfo *font = Font();
+
+      if (!font || text.empty())
+        return;
+
+      int size = int((y1 - y0) * (text.size() > 1 ? 0.62f : 0.72f));
+      float scale = 0;
+      float width = 0;
+
+      for (int tries = 0; tries < 12; ++tries)
+      {
+        scale = stbtt_ScaleForMappingEmToPixels(font, float(size));
+        width = 0;
+
+        for (size_t i = 0; i < text.size(); ++i)
+        {
+          int advance = 0, lsb = 0;
+          stbtt_GetCodepointHMetrics(font, int(text[i]), &advance, &lsb);
+          width += advance * scale;
+
+          if (i + 1 < text.size())
+            width += stbtt_GetCodepointKernAdvance(font, int(text[i]), int(text[i + 1])) * scale;
+        }
+
+        if (width <= (x1 - x0) * 86 / 100 || size < 8)
+          break;
+
+        size = size * 88 / 100;
+      }
+
+      int ascent = 0, descent = 0, gap = 0;
+      stbtt_GetFontVMetrics(font, &ascent, &descent, &gap);
+      const float line = (ascent - descent) * scale;
+      const float baseline = y0 + ((y1 - y0) - line) * 0.5f + ascent * scale;
+      float pen = x0 + ((x1 - x0) - width) * 0.5f;
+
+      for (size_t i = 0; i < text.size(); ++i)
+      {
+        const int cp = int(text[i]);
+        int gw = 0, gh = 0, gx = 0, gy = 0;
+        unsigned char *bitmap = stbtt_GetCodepointBitmapSubpixel(font, scale, scale, pen - std::floor(pen), 0, cp, &gw, &gh, &gx, &gy);
+
+        if (bitmap)
+        {
+          for (int y = 0; y < gh; ++y)
+          {
+            for (int x = 0; x < gw; ++x)
+              dc->Plot(int(std::floor(pen)) + gx + x, int(std::lround(baseline)) + gy + y, bitmap[y * gw + x]);
+          }
+
+          stbtt_FreeBitmap(bitmap, nullptr);
+        }
+
+        int advance = 0, lsb = 0;
+        stbtt_GetCodepointHMetrics(font, cp, &advance, &lsb);
+        pen += advance * scale;
+
+        if (i + 1 < text.size())
+          pen += stbtt_GetCodepointKernAdvance(font, cp, int(text[i + 1])) * scale;
+      }
+    }
+
+    void WhiteTriangle(HDC dc, int cx, int cy, int r, int dir) // 0 up, 1 down, 2 left, 3 right
+    {
+      float p[3][2];
+
+      switch (dir)
+      {
+      case 0:
+        p[0][0] = cx, p[0][1] = cy - r, p[1][0] = cx - r, p[1][1] = cy + r * 2 / 3, p[2][0] = cx + r, p[2][1] = cy + r * 2 / 3;
+        break;
+
+      case 1:
+        p[0][0] = cx, p[0][1] = cy + r, p[1][0] = cx - r, p[1][1] = cy - r * 2 / 3, p[2][0] = cx + r, p[2][1] = cy - r * 2 / 3;
+        break;
+
+      case 2:
+        p[0][0] = cx - r, p[0][1] = cy, p[1][0] = cx + r * 2 / 3, p[1][1] = cy - r, p[2][0] = cx + r * 2 / 3, p[2][1] = cy + r;
+        break;
+
+      default:
+        p[0][0] = cx + r, p[0][1] = cy, p[1][0] = cx - r * 2 / 3, p[1][1] = cy - r, p[2][0] = cx - r * 2 / 3, p[2][1] = cy + r;
+        break;
+      }
+
+      auto edge = [](const float *a, const float *b, float x, float y)
+      { return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]); };
+
+      for (int y = std::max(cy - r, 0); y <= std::min(cy + r, dc->h - 1); ++y)
+      {
+        for (int x = std::max(cx - r, 0); x <= std::min(cx + r, dc->w - 1); ++x)
+        {
+          const float px = x + 0.5f, py = y + 0.5f;
+          const float e0 = edge(p[0], p[1], px, py), e1 = edge(p[1], p[2], px, py), e2 = edge(p[2], p[0], px, py);
+
+          if ((e0 >= 0 && e1 >= 0 && e2 >= 0) || (e0 <= 0 && e1 <= 0 && e2 <= 0))
+            dc->Plot(x, y, 255);
+        }
+      }
+    }
+
+#endif
 
     struct KeyBox
     {

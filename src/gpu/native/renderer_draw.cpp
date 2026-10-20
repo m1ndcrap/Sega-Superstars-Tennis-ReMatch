@@ -645,7 +645,7 @@ namespace sst::native
       cap_half_x = half_x;
       cap_half_y = half_y;
       std::memcpy(shared.cpu, sc, sizeof(sc));
-      list_->RSSetViewports(1, &vp);
+      list_->SetViewport(vp);
 
       // Scissor: SetScissorRect (sub_822FD8D8) keeps PA_SC_WINDOW_SCISSOR_TL/BR at dev+0x28C4/+0x28C8 (x | y << 16): the viewport rectangle, intersected with the scissor rectangle when scissor testing is on (dev+0x2E50)
       {
@@ -694,7 +694,7 @@ namespace sst::native
         }
 
         rect = Scaled(rect, draw_scale);
-        list_->RSSetScissorRects(1, &rect);
+        list_->SetScissor(rect);
       }
     }
 
@@ -711,7 +711,7 @@ namespace sst::native
     HostRT *color_rt = d.color_rt, *depth_rt = d.depth_rt;
     d.clk.Switch(kPhRecord);
     const float blend_factor[4] = {RegF(base, dev, RB_BLEND_RED), RegF(base, dev, RB_BLEND_RED + 1), RegF(base, dev, RB_BLEND_RED + 2), RegF(base, dev, RB_BLEND_RED + 3)};
-    list_->OMSetBlendFactor(blend_factor);
+    list_->SetBlendFactor(blend_factor);
 
     if (rt_mode)
     {
@@ -732,29 +732,23 @@ namespace sst::native
 
       if (pair != bound_targets_)
       {
-        const D3D12_CPU_DESCRIPTOR_HANDLE rtv = RtRtv(color_rt->view);
-        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = depth_rt ? RtDsv(depth_rt->view) : rtv;
-        list_->OMSetRenderTargets(1, &rtv, FALSE, depth_rt ? &dsv : nullptr);
+        list_->SetTargets(RtRtv(color_rt->view), depth_rt ? RtDsv(depth_rt->view) : gfx::CommandList::kNoView);
         bound_targets_ = pair;
       }
 
       last_color_rt_ = color_rt;
     }
 
-    list_->SetPipelineState(d.pso);
-    list_->SetGraphicsRootConstantBufferView(kRootVSConstants, d.vsc_gpu);
-    list_->SetGraphicsRootConstantBufferView(kRootVSConstantsRaw, d.vsc_gpu);
-    list_->SetGraphicsRootConstantBufferView(kRootPSConstants, d.psc_gpu);
-    list_->SetGraphicsRootConstantBufferView(kRootPSConstantsRaw, d.psc_gpu);
-    list_->SetGraphicsRootConstantBufferView(kRootShared, d.shared_gpu);
-    list_->IASetPrimitiveTopology(d.topology);
+    list_->SetPipeline(*d.pso);
+    list_->SetDrawConstants(d.vsc_gpu, d.psc_gpu, d.shared_gpu);
+    list_->SetTopology(d.topology);
     DebugMarkDraw(d);
     NoteDraw(d.vs_entry ? d.vs_entry->hash : 0, d.ps_entry ? d.ps_entry->hash : 0);
 
     if (d.draw_indexed)
-      list_->DrawIndexedInstanced(d.draw_count, 1, 0, d.convert || d.rect_list ? 0 : -int32_t(d.vmin), 0);
+      list_->DrawIndexed(d.draw_count, 0, d.convert || d.rect_list ? 0 : -int32_t(d.vmin));
     else
-      list_->DrawInstanced(d.draw_count, 1, 0, 0);
+      list_->Draw(d.draw_count, 0);
 
     ++stats_.drawn;
 

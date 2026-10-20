@@ -3,6 +3,10 @@
 #include "gpu/native/draw_context.h"
 #include "gpu/native/renderer_debug.h"
 
+#if defined(_WIN32)
+#include "gpu/native/gfx/d3d12/d3d12_gfx.h"
+#endif
+
 namespace sst::native
 {
   using namespace renderer_detail;
@@ -17,27 +21,13 @@ namespace sst::native
   {
     // Colour by view distance (SV_Position.w) in bands, slightly darker on steep depth slopes so shapes read without lighting or textures
     static const char kSource[] = "float4 main(float4 p : SV_Position) : SV_Target0 {\n  float d = p.w;\n  float band = frac(d * 0.1);\n  float edge = saturate(1.0 - 40.0 * (abs(ddx(p.z)) + abs(ddy(p.z))));\n  float3 c = float3(0.35 + 0.65 * band, 0.5 + 0.5 * sin(d * 0.37), 1.0 - 0.6 * band);\n  return float4(c * (0.4 + 0.6 * edge), 1.0);\n}\n";
-    Microsoft::WRL::ComPtr<IDxcCompiler3> compiler;
+    std::vector<uint8_t> code;
 
-    if (FAILED(provider_->DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
+    if (!CompileRendererShader(kSource, L"ps_6_0", code))
       return;
 
-    const wchar_t *args[] = {L"-T", L"ps_6_0", L"-E", L"main", L"-Qstrip_reflect", L"-Qstrip_debug"};
-    DxcBuffer buffer = {kSource, sizeof(kSource) - 1, DXC_CP_UTF8};
-    Microsoft::WRL::ComPtr<IDxcResult> result;
-    HRESULT status = E_FAIL;
-
-    if (FAILED(compiler->Compile(&buffer, args, UINT32(std::size(args)), nullptr, IID_PPV_ARGS(&result))) || FAILED(result->GetStatus(&status)) || FAILED(status))
-      return;
-
-    Microsoft::WRL::ComPtr<IDxcBlob> object;
-
-    if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) || !object)
-      return;
-
-    const auto *b = static_cast<const uint8_t *>(object->GetBufferPointer());
     debug_ps_ = std::make_unique<ShaderVariant>();
-    debug_ps_->dxil.assign(b, b + object->GetBufferSize());
+    debug_ps_->dxil.assign(code.begin(), code.end());
     debug_ps_->state.store(ShaderVariant::State::kReady);
   }
 
@@ -407,7 +397,7 @@ namespace sst::native
   }
 
   // Morph consumers (faces): compare each vertex position with the same draw's previous frame. Faces move a little per frame; a vertex that suddenly jumps far compared with the mesh size is a spike. Logs what it jumped to and when the morph output it reads was last written
-  void Renderer::CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0)
+  void Renderer::CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<gfx::InputElement> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0)
   {
     // Was the morph output changed between the morph and this draw?
     if (auto it = morph_writes_.find(stream0); it != morph_writes_.end() && it->second.hash && it->second.frame == submitted_)
@@ -425,8 +415,10 @@ namespace sst::native
 
     int pos = -1;
 
-    for (const auto &d : layout)
+    for (const auto &e : layout)
     {
+      const D3D12_INPUT_ELEMENT_DESC &d = e.d3d;
+
       if (d.InputSlot == 0 && d.SemanticName && std::strcmp(d.SemanticName, "POSITION") == 0 && d.SemanticIndex == 0)
         pos = int(d.AlignedByteOffset / 16);
     }
@@ -510,52 +502,49 @@ namespace sst::native
   // end of the frame both are compared. Disagreeing draws are translation (or GPU input) bugs; agreeing draws with vertices far outside the view are data
   bool Renderer::EnsureCaptureResources()
   {
+    // Stream output: D3D12 only
+    if (gfx_->backend() != gfx::Backend::kD3D12)
+      return false;
+
     if (so_buffer_)
       return true;
 
     const size_t total = kSoDataBytes + kSoCounterBytes;
-    D3D12_RESOURCE_DESC bd = {};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = total;
-    bd.Height = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels = 1;
-    bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES def = {D3D12_HEAP_TYPE_DEFAULT}, up = {D3D12_HEAP_TYPE_UPLOAD}, rb = {D3D12_HEAP_TYPE_READBACK};
+    so_buffer_ = gfx_->CreateBuffer(total, gfx::HeapType::kDefault, D3D12_RESOURCE_STATE_COPY_DEST);
+    so_readback_ = so_buffer_ ? gfx_->CreateBuffer(total, gfx::HeapType::kReadback, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
+    so_zero_ = so_readback_ ? gfx_->CreateBuffer(kSoCounterBytes, gfx::HeapType::kUpload, D3D12_RESOURCE_STATE_GENERIC_READ) : nullptr;
 
-    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&so_buffer_))) || FAILED(device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&so_readback_))))
+    if (!so_zero_)
     {
-      so_buffer_.Reset();
+      so_buffer_.reset();
+      so_readback_.reset();
       return false;
     }
 
-    bd.Width = kSoCounterBytes;
-
-    if (FAILED(device_->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&so_zero_))))
-    {
-      so_buffer_.Reset();
-      return false;
-    }
-
-    void *p = nullptr;
-    so_zero_->Map(0, nullptr, &p);
-    std::memset(p, 0, kSoCounterBytes);
-    so_zero_->Unmap(0, nullptr);
+    std::memset(so_zero_->cpu, 0, kSoCounterBytes);
     return true;
   }
 
-  ID3D12PipelineState *Renderer::GetSoPipeline(const ShaderVariant *vs, uint64_t layout_hash, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout)
+  void *Renderer::GetSoPipeline(const ShaderVariant *vs, uint64_t layout_hash, const std::vector<gfx::InputElement> &layout)
   {
+#if defined(_WIN32)
+    if (gfx_->backend() != gfx::Backend::kD3D12)
+      return nullptr; // (stream output: D3D12 only)
+
     const uint64_t key = XXH3_64bits(&vs, sizeof(vs)) ^ layout_hash;
 
     if (auto it = so_pipelines_.find(key); it != so_pipelines_.end())
-      return it->second.Get();
+      return it->second.get();
+
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+
+    for (const gfx::InputElement &e : layout)
+      elements.push_back(e.d3d);
 
     static const D3D12_SO_DECLARATION_ENTRY kEntry = {0, "SV_Position", 0, 0, 4, 0};
     static const UINT kStride = 16;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
-    d.pRootSignature = root_signature_.Get();
+    d.pRootSignature = gfx::d3d12::NativeRootSignature(*gfx_, gfx::Layout::kDraw);
     d.VS = {vs->dxil.data(), vs->dxil.size()};
     d.StreamOutput.pSODeclaration = &kEntry;
     d.StreamOutput.NumEntries = 1;
@@ -568,14 +557,14 @@ namespace sst::native
     d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     d.RasterizerState.DepthClipEnable = TRUE;
     d.DepthStencilState.DepthEnable = FALSE;
-    d.InputLayout = {layout.data(), UINT(layout.size())};
+    d.InputLayout = {elements.data(), UINT(elements.size())};
     d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
     d.NumRenderTargets = 1;
-    d.RTVFormats[0] = D3D12Presenter::kGuestOutputFormat;
+    d.RTVFormats[0] = kOutputFormat;
     d.DSVFormat = kDepthFormat;
     d.SampleDesc.Count = 1;
-    ComPtr<ID3D12PipelineState> pso;
-    const HRESULT hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
+    ID3D12PipelineState *pso = nullptr;
+    const HRESULT hr = gfx::d3d12::NativeDevice(*gfx_)->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
 
     if (FAILED(hr))
     {
@@ -586,15 +575,23 @@ namespace sst::native
       return nullptr;
     }
 
-    return so_pipelines_.emplace(key, std::move(pso)).first->second.Get();
+    std::shared_ptr<void> owned(pso, [](void *p)
+                                { static_cast<ID3D12PipelineState *>(p)->Release(); });
+    return so_pipelines_.emplace(key, std::move(owned)).first->second.get();
+#else
+    (void)vs;
+    (void)layout_hash;
+    (void)layout;
+    return nullptr;
+#endif
   }
 
-  void Renderer::CaptureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, const ShaderVariant *vs, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, uint64_t layout_hash, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, float half_x, float half_y)
+  void Renderer::CaptureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, const ShaderVariant *vs, const std::vector<gfx::InputElement> &layout, uint64_t layout_hash, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, float half_x, float half_y)
   {
     if (captured_.size() >= kSoMaxDraws || so_used_ + size_t(vertex_count) * 16 > kSoDataBytes)
       return;
 
-    ID3D12PipelineState *pso = GetSoPipeline(vs, layout_hash, layout);
+    void *pso = GetSoPipeline(vs, layout_hash, layout);
 
     if (!pso)
       return;
@@ -638,24 +635,26 @@ namespace sst::native
     }
 
     // GPU: same pipeline inputs, drawn as points into the stream-output buffer
-    const D3D12_GPU_VIRTUAL_ADDRESS so = so_buffer_->GetGPUVirtualAddress();
+#if defined(_WIN32)
+    ID3D12GraphicsCommandList *list = gfx::d3d12::NativeList(*list_);
+    const D3D12_GPU_VIRTUAL_ADDRESS so = so_buffer_->gpu;
     const D3D12_STREAM_OUTPUT_BUFFER_VIEW view = {so + c.so_offset, UINT64(vertex_count) * 16, so + kSoDataBytes + captured_.size() * 16};
-    list_->SOSetTargets(0, 1, &view);
-    list_->SetPipelineState(pso);
-    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    list->SOSetTargets(0, 1, &view);
+    list->SetPipelineState(static_cast<ID3D12PipelineState *>(pso));
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
     NoteDraw(0, 2);
-    list_->DrawInstanced(vertex_count, 1, 0, 0);
-    list_->SOSetTargets(0, 0, nullptr);
+    list->DrawInstanced(vertex_count, 1, 0, 0);
+    list->SOSetTargets(0, 0, nullptr);
+#endif
     so_used_ += size_t(vertex_count) * 16;
     captured_.push_back(std::move(c));
   }
 
   void Renderer::FinishCapture()
   {
-    const uint8_t *data = nullptr;
-    const D3D12_RANGE range = {0, kSoDataBytes + kSoCounterBytes};
+    const uint8_t *data = so_readback_->Map(0, kSoDataBytes + kSoCounterBytes);
 
-    if (FAILED(so_readback_->Map(0, &range, reinterpret_cast<void **>(const_cast<uint8_t **>(&data)))))
+    if (!data)
     {
       REXLOG_WARN("[sst-native] capture: readback failed");
       return;
@@ -757,8 +756,7 @@ namespace sst::native
       if (mismatched && capture_frames_logged_++ < 300)
         REXLOG_WARN("[sst-native] capture: frame {}: {} of {} draws differ between GPU and CPU", submitted_, mismatched, compared);
 
-      const D3D12_RANGE none = {0, 0};
-      so_readback_->Unmap(0, &none);
+      so_readback_->Unmap();
       return;
     }
 
@@ -773,8 +771,7 @@ namespace sst::native
       REXLOG_INFO("[sst-native]   {:.1f}: draw #{} VS {:016X} prim {} {} vertices from {} (buffer {:08X}{})", reach[i].extent, c.seq, c.vs_hash, c.prim, c.vertex_count, c.first_vertex, c.stream0, c.morph ? ", face" : "");
     }
 
-    const D3D12_RANGE none = {0, 0};
-    so_readback_->Unmap(0, &none);
+    so_readback_->Unmap();
   }
 
   // --sst_native_trace_vs / --sst_native_skip_vs: log the draws of one vertex shader, or skip them. False: skip this draw
@@ -1022,8 +1019,7 @@ namespace sst::native
       return;
 
     const std::string label = fmt::format("vs {:016X} ps {:016X} depth {:08X} colour {:08X} blend {:08X} bias {}", d.vs_entry ? d.vs_entry->hash : 0, d.ps_entry ? d.ps_entry->hash : 0, d.depthcontrol, d.colorcontrol, d.key.blend, d.key.depth_bias);
-    const std::wstring wide(label.begin(), label.end());
-    list_->SetMarker(0, wide.c_str(), UINT((wide.size() + 1) * sizeof(wchar_t)));
+    list_->Marker(label);
   }
 
   // F9 capture: the draw's inputs and its GPU-transformed vertices (stream output), compared with the CPU's at the frame's end

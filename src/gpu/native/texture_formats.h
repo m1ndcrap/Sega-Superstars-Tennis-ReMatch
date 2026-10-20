@@ -5,7 +5,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/xenos.h>
 
-#include <d3d12.h>
+#include "gpu/native/gfx/d3d_vocab.h"
 
 #include <cstdint>
 #include <cstring>

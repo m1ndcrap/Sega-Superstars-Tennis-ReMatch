@@ -9,10 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gpu/native/gfx/gfx.h"
 #include "gpu/native/ucode_analysis.h" // TextureFetchUse
-
-#include <d3d12.h>
-#include <wrl/client.h>
 
 namespace sst::native
 {
@@ -22,7 +20,7 @@ namespace sst::native
     struct UploadSpace
     {
       uint8_t *cpu = nullptr;
-      ID3D12Resource *resource = nullptr;
+      gfx::Buffer *buffer = nullptr;
       uint64_t offset = 0;
     };
 
@@ -30,19 +28,20 @@ namespace sst::native
 
     static constexpr uint32_t kNone = UINT32_MAX;
 
-    bool Initialize(ID3D12Device *device, const uint8_t *physical_membase, ID3D12DescriptorHeap *srv_heap, uint32_t srv_first, uint32_t srv_count, ID3D12DescriptorHeap *sampler_heap, uint32_t sampler_first, uint32_t sampler_count);
+    // SRV table slots [srv_first, srv_first + srv_count) and sampler slots [sampler_first, ...) belong to the cache
+    bool Initialize(gfx::Device &device, const uint8_t *physical_membase, uint32_t srv_first, uint32_t srv_count, uint32_t sampler_first, uint32_t sampler_count);
     void Shutdown();
 
     // frame: frame number; completed_fence: the renderer's completed fence value; frame_fence: the value signalled when this frame finishes
     void BeginFrame(uint64_t frame, uint64_t completed_fence, uint64_t frame_fence);
 
     // fetch: the 6 fetch constant dwords (host endian). fetch_dimension: the xenos::FetchOpDimension the shader samples with. Records uploads on `list`. Returns the SRV heap index, or kNone (bind a placeholder)
-    uint32_t GetTexture(ID3D12GraphicsCommandList *list, const AllocateFn &allocate, const uint32_t fetch[6], uint32_t fetch_dimension);
+    uint32_t GetTexture(gfx::CommandList &list, const AllocateFn &allocate, const uint32_t fetch[6], uint32_t fetch_dimension);
 
     // Render-target resolve destinations: textures the renderer draws itself. A fetch constant whose base address is a registered page samples this resource (when the size matches) instead of guest memory
     struct External
     {
-      ID3D12Resource *resource = nullptr;
+      gfx::Texture *resource = nullptr;
       uint32_t dxgi_format = 0;
       uint32_t width = 0, height = 0, slices = 1;
       bool volume = false; // Texture3D (stacked textures sampled with 3D fetches)
@@ -92,7 +91,7 @@ namespace sst::native
     struct Texture
     {
       Key key{};
-      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      gfx::TextureRef resource;
       uint32_t dxgi_format = 0;
       uint32_t host_width = 0, host_height = 0, levels = 0, array_size = 1, depth = 1;
       uint64_t content_hash = 0;
@@ -109,21 +108,18 @@ namespace sst::native
     struct Deferred
     {
       uint64_t fence;
-      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      gfx::TextureRef resource;
       std::vector<uint32_t> slots;
     };
 
     Texture *Create(const Key &key, uint64_t hash);
-    bool Upload(ID3D12GraphicsCommandList *list, const AllocateFn &allocate, Texture &t);
+    bool Upload(gfx::CommandList &list, const AllocateFn &allocate, Texture &t);
     uint64_t HashGuest(const Texture &t) const;
     uint32_t AllocateSrvSlot();
     void Evict();
 
-    ID3D12Device *device_ = nullptr;
+    gfx::Device *device_ = nullptr;
     const uint8_t *membase_ = nullptr;
-    ID3D12DescriptorHeap *srv_heap_ = nullptr;
-    ID3D12DescriptorHeap *sampler_heap_ = nullptr;
-    uint32_t srv_size_ = 0, sampler_size_ = 0;
     uint32_t srv_next_ = 0, srv_end_ = 0;
     std::vector<uint32_t> srv_free_;
     uint32_t sampler_first_ = 0, sampler_next_ = 0, sampler_end_ = 0;

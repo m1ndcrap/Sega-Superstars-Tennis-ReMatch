@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <vector>
 
 namespace sst::native::pack
 {
@@ -23,9 +24,19 @@ namespace sst::native::pack
   // (not the cause of the Intel hangs after all); 14: cube map directions in two named fields, not a dynamically indexed array (scratch
   // memory, which hung Intel GPUs in the loop-form character lighting shaders)
   inline constexpr uint32_t kCacheVersion = 14;
+
   // SHADER PRECISION: FAST (plain multiplies, see SST_FAST_MATH in shader_recompiler.cpp) has its own pack and version, so the two never mix
   inline constexpr uint32_t kCacheVersionFast = kCacheVersion + 1000;
   inline constexpr uint32_t CacheVersion(bool fast) { return fast ? kCacheVersionFast : kCacheVersion; }
+
+  // SPIR-V packs (Vulkan) and their disk cache: their own versions, so a DXIL pack is never read as SPIR-V
+  inline constexpr uint32_t kCacheVersionSpirv = kCacheVersion + 2000;
+  inline constexpr uint32_t kCacheVersionSpirvFast = kCacheVersion + 3000;
+  inline constexpr uint32_t CacheVersion(bool fast, bool spirv) { return spirv ? (fast ? kCacheVersionSpirvFast : kCacheVersionSpirv) : CacheVersion(fast); }
+
+  // SPIR-V packs are files next to the exe (not resources: they serve Vulkan only, and Linux has no resource section)
+  inline constexpr const char *kSpirvPackFile = "shaders/spirv.pack";
+  inline constexpr const char *kSpirvPackFileFast = "shaders/spirv_fast.pack";
 
   // DXC arguments for every translated shader (after "-T <profile>")
   inline constexpr const wchar_t *kDxcArgs[] = {
@@ -36,8 +47,25 @@ namespace sst::native::pack
       L"-Qstrip_reflect",
       L"-Qstrip_debug",
   };
+
+  // SPIR-V (Vulkan) instead of kDxcArgs: one module per shader, its variant is specialization constant 0 (XenosRecomp's __spirv__ layout: push-constant buffer addresses, descriptor sets = register spaces)
+  // Vertex shaders also get kDxcSpirvVsArg (Vulkan's clip space is y-down: flipping in the shader keeps viewports and winding as in D3D12)
+  inline constexpr const wchar_t *kDxcSpirvArgs[] = {
+      L"-HV",
+      L"2021",
+      L"-all-resources-bound",
+      L"-Wno-ignored-attributes",
+      L"-spirv",
+      L"-fvk-use-dx-layout",
+      L"-fspv-target-env=vulkan1.2",
+      L"-Qstrip_debug",
+  };
+
+  inline constexpr const wchar_t *kDxcSpirvVsArg = L"-fvk-invert-y";
+
   // Added after kDxcArgs for SHADER PRECISION: FAST
   inline constexpr const wchar_t *kFastMathArg = L"-DSST_FAST_MATH";
+
   // Embedded resource names (RCDATA)
   inline constexpr const wchar_t *kResourceName = L"SST_SHADER_PACK";
   inline constexpr const wchar_t *kResourceNameFast = L"SST_SHADER_PACK_FAST";
@@ -79,6 +107,7 @@ namespace sst::native::pack
   // CompressedHeader, then the compressed bytes of the whole pack above. A pack that starts with kMagic is uncompressed.
   inline constexpr uint32_t kCompressedMagic = 0x5A505353; // "SSPZ"
   inline constexpr uint32_t kAlgorithmXpressHuff = 4;      // COMPRESS_ALGORITHM_XPRESS_HUFF: fast to decompress at startup
+  inline constexpr uint32_t kAlgorithmLzPlanar = 0x504C;   // "LP": lz below over the 4 byte planes of the 32-bit words (portable; SPIR-V packs)
 
   struct CompressedHeader
   {
@@ -113,8 +142,10 @@ namespace sst::native::pack
       const auto *entries = reinterpret_cast<const Entry *>(static_cast<const uint8_t *>(data) + sizeof(Header));
 
       for (uint32_t i = 0; i < h.count; ++i)
+      {
         if (size_t(entries[i].offset) + entries[i].size > size)
           return false;
+      }
 
       data_ = static_cast<const uint8_t *>(data);
       size_ = size;
@@ -201,5 +232,175 @@ namespace sst::native::pack
 
       ++pos;
     }
+  }
+
+  // A small LZ77 codec with no dependencies so that packs can be unpacked on every platform.
+  // Stream of sequences: varint literal count, the literals, varint match length - 4 (all ones = end of stream), varint match offset - 1
+  namespace lz
+  {
+    inline void PutVarint(std::vector<uint8_t> &out, uint64_t v)
+    {
+      while (v >= 0x80)
+      {
+        out.push_back(uint8_t(v) | 0x80);
+        v >>= 7;
+      }
+
+      out.push_back(uint8_t(v));
+    }
+
+    inline bool GetVarint(const uint8_t *&p, const uint8_t *end, uint64_t &v)
+    {
+      v = 0;
+
+      for (int shift = 0; shift < 64; shift += 7)
+      {
+        if (p >= end)
+          return false;
+
+        const uint8_t b = *p++;
+        v |= uint64_t(b & 0x7F) << shift;
+
+        if (!(b & 0x80))
+          return true;
+      }
+
+      return false;
+    }
+
+    inline constexpr uint64_t kEnd = ~uint64_t(0) >> 1;
+
+    inline std::vector<uint8_t> Compress(const uint8_t *in, size_t size)
+    {
+      std::vector<uint8_t> out;
+      out.reserve(size / 3 + 16);
+      constexpr int kBits = 20;
+      std::vector<uint32_t> table(size_t(1) << kBits, 0xFFFFFFFFu);
+
+      auto hash = [&](size_t i)
+      {
+        uint32_t v;
+        std::memcpy(&v, in + i, 4);
+        return (v * 2654435761u) >> (32 - kBits);
+      };
+
+      size_t pos = 0, literal_start = 0;
+
+      while (pos + 4 <= size)
+      {
+        const uint32_t h = hash(pos);
+        const uint32_t candidate = table[h];
+        table[h] = uint32_t(pos);
+
+        if (candidate != 0xFFFFFFFFu && std::memcmp(in + candidate, in + pos, 4) == 0)
+        {
+          size_t len = 4;
+
+          while (pos + len < size && in[candidate + len] == in[pos + len])
+            ++len;
+
+          PutVarint(out, pos - literal_start);
+          out.insert(out.end(), in + literal_start, in + pos);
+          PutVarint(out, len - 4);
+          PutVarint(out, pos - candidate - 1);
+
+          // Index the matched bytes too (sparsely: every other position keeps it fast)
+          for (size_t i = pos + 1; i + 4 <= size && i < pos + len; i += 2)
+            table[hash(i)] = uint32_t(i);
+
+          pos += len;
+          literal_start = pos;
+        }
+        else
+        {
+          ++pos;
+        }
+      }
+
+      PutVarint(out, size - literal_start);
+      out.insert(out.end(), in + literal_start, in + size);
+      PutVarint(out, kEnd);
+      return out;
+    }
+
+    // Decodes into `out` (resized to raw_size); false on corrupt input
+    inline bool Decompress(const uint8_t *in, size_t size, std::vector<uint8_t> &out, size_t raw_size)
+    {
+      out.resize(raw_size);
+      const uint8_t *p = in, *end = in + size;
+      size_t pos = 0;
+
+      for (;;)
+      {
+        uint64_t literals, length, offset;
+
+        if (!GetVarint(p, end, literals) || literals > size_t(end - p) || pos + literals > raw_size)
+          return false;
+
+        std::memcpy(out.data() + pos, p, size_t(literals));
+        p += literals;
+        pos += size_t(literals);
+
+        if (!GetVarint(p, end, length))
+          return false;
+
+        if (length == kEnd)
+          return pos == raw_size;
+
+        length += 4;
+
+        if (!GetVarint(p, end, offset) || offset + 1 > pos || pos + length > raw_size)
+          return false;
+
+        const uint8_t *src = out.data() + pos - (offset + 1);
+        uint8_t *dst = out.data() + pos;
+
+        // Overlapping copies (offset < length) repeat the pattern, as LZ77 intends
+        for (uint64_t i = 0; i < length; ++i)
+          dst[i] = src[i];
+
+        pos += size_t(length);
+      }
+    }
+  }
+
+  // A pack compressed with lz over byte planes (SPIR-V is a stream of 32-bit words whose high bytes are mostly zero: split into planes of byte 0, 1, 2, 3 of each word it compresses ~3x, against ~1.4x as it is)
+  inline std::vector<uint8_t> CompressPlanar(const std::vector<uint8_t> &raw)
+  {
+    const size_t words = raw.size() / 4;
+    std::vector<uint8_t> planes(raw.size());
+
+    for (size_t i = 0; i < words; ++i)
+    {
+      for (size_t b = 0; b < 4; ++b)
+        planes[b * words + i] = raw[i * 4 + b];
+    }
+
+    std::memcpy(planes.data() + words * 4, raw.data() + words * 4, raw.size() - words * 4);
+    const std::vector<uint8_t> packed = lz::Compress(planes.data(), planes.size());
+    std::vector<uint8_t> out(sizeof(CompressedHeader));
+    const CompressedHeader ch = {kCompressedMagic, kAlgorithmLzPlanar, raw.size()};
+    std::memcpy(out.data(), &ch, sizeof(ch));
+    out.insert(out.end(), packed.begin(), packed.end());
+    return out;
+  }
+
+  // The inverse, for data after the CompressedHeader
+  inline bool DecompressPlanar(const uint8_t *data, size_t size, size_t raw_size, std::vector<uint8_t> &out)
+  {
+    std::vector<uint8_t> planes;
+
+    if (!lz::Decompress(data, size, planes, raw_size))
+      return false;
+
+    const size_t words = raw_size / 4;
+    out.resize(raw_size);
+
+    for (size_t i = 0; i < words; ++i)
+      for (size_t b = 0; b < 4; ++b)
+        out[i * 4 + b] = planes[b * words + i];
+
+    std::memcpy(out.data() + words * 4, planes.data() + words * 4, raw_size - words * 4);
+    return true;
   }
 }

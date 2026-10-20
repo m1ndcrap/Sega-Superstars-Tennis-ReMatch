@@ -4,6 +4,9 @@
 #include "gpu/native/native.h"
 
 #include "gpu/native/capture.h"
+#if defined(_WIN32)
+#include "gpu/native/gfx/d3d12/d3d12_gfx.h"
+#endif
 #include "gpu/native/hitch_profiler.h"
 #include "gpu/native/present_hook.h"
 #include "gpu/native/write_watch.h"
@@ -16,15 +19,27 @@
 #include <rex/runtime.h>
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/xmemory.h>
+#if defined(_WIN32)
 #include <rex/ui/d3d12/d3d12_provider.h>
+#endif
+#if REX_HAS_VULKAN
+#include <rex/ui/vulkan/provider.h>
 
+#include "gpu/native/gfx/vulkan/vulkan_gfx.h"
+#endif
+
+#if defined(_WIN32)
 #include <dxgi1_4.h>
 #include <wrl/client.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <string>
 
 REXCVAR_DECLARE(int32_t, sst_aspect);
 
+REXCVAR_DEFINE_STRING(sst_gpu_api, "d3d12", "SST", "Graphics API: d3d12 or vulkan (read at startup by the sst GPU plugin; Vulkan needs an SDK built with REXGLUE_USE_VULKAN)").lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(sst_native_log_every, 600, "SST", "Native renderer: print a status line every N frames (0 = never)");
 REXCVAR_DEFINE_BOOL(sst_native_game_thread_priority, true, "SST", "Native renderer: raise the game's rendering thread (the one calling Swap) to above-normal priority, so background work (morphs, shader / pipeline compiles) never delays its frame");
 REXCVAR_DEFINE_BOOL(sst_native_write_watch, true, "SST", "Native renderer: watch the game's writes to vertex buffers that many 3D draws read, so an unchanged buffer's copy is reused without comparing it (false = compare every time)");
@@ -34,12 +49,13 @@ REXCVAR_DEFINE_BOOL(sst_native_render_thread, true, "SST", "Native renderer: rec
 namespace sst::native
 {
   using namespace capture;
+
+#if defined(_WIN32)
   using rex::ui::d3d12::D3D12Provider;
+#endif
 
   namespace
   {
-    // The plugin's frame source
-
     // VIDEO > ASPECT RATIO (sst_aspect: 4:3, 16:9, 16:10, 21:9, 32:9)
     void DisplayAspectThunk(void *, uint32_t *x, uint32_t *y)
     {
@@ -57,9 +73,25 @@ namespace sst::native
       *y = kAspectXY[aspect][1];
     }
 
-    ID3D12Resource *AcquireThunk(void *user, uint32_t *slot, uint32_t *width, uint32_t *height)
+    // The frame for the plugin: an ID3D12Resource, or (Vulkan) a VkImage handle (see gpu/frame_source.h)
+    bool g_vulkan = false;
+
+    void *AcquireThunk(void *user, uint32_t *slot, uint32_t *width, uint32_t *height)
     {
-      return static_cast<Renderer *>(user)->Acquire(slot, width, height);
+      gfx::Texture *output = static_cast<Renderer *>(user)->Acquire(slot, width, height);
+
+      if (!output)
+        return nullptr;
+
+#if REX_HAS_VULKAN
+      if (g_vulkan)
+        return reinterpret_cast<void *>(uintptr_t(gfx::vulkan::NativeImage(*output)));
+#endif
+#if defined(_WIN32)
+      return gfx::d3d12::NativeResource(*output);
+#else
+      return nullptr;
+#endif
     }
 
     void ReleaseThunk(void *user, uint32_t slot)
@@ -67,9 +99,12 @@ namespace sst::native
       static_cast<Renderer *>(user)->Release(slot);
     }
 
-    HMODULE FindPlugin()
+    // The sst GPU plugin, if it is the one loaded (rex::system::LoadGpuPlugin's per-config names)
+#if defined(_WIN32)
+    using Plugin = HMODULE;
+
+    Plugin FindPlugin()
     {
-      // rex::system::LoadGpuPlugin's per-config names
       for (const wchar_t *name : {L"rexgpu-sst.dll", L"rexgpu-sstd.dll", L"rexgpu-sstrd.dll"})
         if (HMODULE h = GetModuleHandleW(name))
           return h;
@@ -77,7 +112,28 @@ namespace sst::native
       return nullptr;
     }
 
+    void *PluginSymbol(Plugin plugin, const char *name) { return reinterpret_cast<void *>(GetProcAddress(plugin, name)); }
+#else
+    using Plugin = void *;
+
+    Plugin FindPlugin()
+    {
+      for (const char *name : {"librexgpu-sst.so", "librexgpu-sstd.so", "librexgpu-sstrd.so"})
+      {
+        const std::string path = (rex::filesystem::GetExecutableFolder() / name).string();
+
+        if (void *h = dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD)) // only if already loaded (a reference we keep)
+          return h;
+      }
+
+      return nullptr;
+    }
+
+    void *PluginSymbol(Plugin plugin, const char *name) { return dlsym(plugin, name); }
+#endif
+
     // First boot: the VIDEO page's quality preset from the GPU's memory
+#if defined(_WIN32)
     void ReportGpu(const D3D12Provider &provider)
     {
       DXGI_ADAPTER_DESC1 desc = {};
@@ -91,6 +147,25 @@ namespace sst::native
       WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
       sst::menu::OnGpuDetected(uint64_t(desc.DedicatedVideoMemory) >> 20, name);
     }
+#endif
+
+#if REX_HAS_VULKAN
+    void ReportGpu(const rex::ui::vulkan::VulkanProvider &provider)
+    {
+      const auto *device = provider.vulkan_device();
+      VkPhysicalDeviceMemoryProperties mp = {};
+      device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties(device->physical_device(), &mp);
+      uint64_t local = 0;
+
+      for (uint32_t i = 0; i < mp.memoryHeapCount; ++i)
+      {
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+          local = std::max<uint64_t>(local, mp.memoryHeaps[i].size);
+      }
+
+      sst::menu::OnGpuDetected(local >> 20, device->properties().deviceName);
+    }
+#endif
 
     // Locks the renderer for a hook (no render thread); empty when inactive
     std::unique_lock<std::mutex> Enter()
@@ -237,27 +312,63 @@ namespace sst::native
 
   void Initialize(rex::Runtime *runtime)
   {
-    HMODULE plugin = FindPlugin();
+    Plugin plugin = FindPlugin();
 
     if (!plugin)
       return; // another GPU plugin: stay inactive
 
-    auto set_source = reinterpret_cast<SstSetFrameSourceFn>(reinterpret_cast<void *>(GetProcAddress(plugin, SST_SET_FRAME_SOURCE_EXPORT)));
+    auto set_source = reinterpret_cast<SstSetFrameSourceFn>(PluginSymbol(plugin, SST_SET_FRAME_SOURCE_EXPORT));
+    auto gpu_api = reinterpret_cast<SstGpuApiFn>(PluginSymbol(plugin, SST_GPU_API_EXPORT));
     auto *gs = runtime ? runtime->graphics_system() : nullptr;
-    auto *provider = gs ? static_cast<const D3D12Provider *>(gs->provider()) : nullptr;
 
-    if (!set_source || !provider || !provider->GetDevice())
+    if (!set_source || !gs || !gs->provider())
     {
-      REXLOG_ERROR("[sst-native] sst GPU plugin is loaded but {} - native renderer disabled", !set_source ? "has no frame-source export (old build?)" : "has no D3D12 device");
+      REXLOG_ERROR("[sst-native] sst GPU plugin is loaded but {} - native renderer disabled", !set_source ? "has no frame-source export (old build?)" : "has no graphics device");
       return;
     }
 
-    InstallPresentHook(*provider);
-    ReportGpu(*provider);
+    // The plugin's provider decides the backend (sst_gpu_api)
+    std::unique_ptr<gfx::Device> device;
+    g_vulkan = gpu_api && gpu_api() == kSstGpuApiVulkan;
+
+    if (g_vulkan)
+    {
+#if REX_HAS_VULKAN
+      const auto &provider = *static_cast<const rex::ui::vulkan::VulkanProvider *>(gs->provider());
+      ReportGpu(provider);
+      device = gfx::vulkan::CreateDevice(provider);
+#endif
+      if (!device)
+      {
+        REXLOG_ERROR("[sst-native] the Vulkan device can't run the native renderer - native renderer disabled");
+        return;
+      }
+
+      REXLOG_INFO("[sst-native] graphics API: Vulkan");
+    }
+    else
+    {
+#if !defined(_WIN32)
+      REXLOG_ERROR("[sst-native] the sst GPU plugin isn't on Vulkan - native renderer disabled");
+      return;
+#else
+      const auto *provider = static_cast<const D3D12Provider *>(gs->provider());
+
+      if (!provider->GetDevice())
+      {
+        REXLOG_ERROR("[sst-native] sst GPU plugin has no D3D12 device - native renderer disabled");
+        return;
+      }
+
+      InstallPresentHook(*provider);
+      ReportGpu(*provider);
+      device = gfx::d3d12::CreateDevice(*provider);
+#endif
+    }
 
     auto state = std::make_unique<State>();
     state->set_frame_source = set_source;
-    state->shaders.Initialize(*provider, rex::filesystem::GetExecutableFolder() / "cache" / "shaders");
+    state->shaders.Initialize(device ? device->shader_format() : gfx::ShaderFormat::kDxil, rex::filesystem::GetExecutableFolder() / "cache" / "shaders");
 
     // The game's frame: 1280x720, or 1280x1024 in its own 4:3 mode
     const uint32_t frame_h = sst::menu::NativeFourThree() ? 1024 : 720;
@@ -265,7 +376,7 @@ namespace sst::native
     if (REXCVAR_GET(sst_native_write_watch) && runtime->memory())
       write_watch::Install(runtime->memory());
 
-    if (!state->renderer.Initialize(*provider, &state->shaders, runtime->memory()->physical_membase(), 1280, frame_h))
+    if (!state->renderer.Initialize(std::move(device), &state->shaders, runtime->memory()->physical_membase(), 1280, frame_h))
     {
       REXLOG_ERROR("[sst-native] renderer setup failed - native renderer disabled");
       state->shaders.Shutdown();
@@ -508,7 +619,11 @@ namespace sst::native
 
       if (REXCVAR_GET(sst_native_game_thread_priority))
       {
-        const BOOL ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#if defined(_WIN32)
+        const bool ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) != 0;
+#else
+        const bool ok = false; // (raising a thread's priority needs privileges on Linux)
+#endif
         REXLOG_INFO("[sst-native] game rendering thread priority raised to above normal{}", ok ? "" : " (failed)");
       }
     }

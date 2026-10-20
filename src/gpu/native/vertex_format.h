@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include <dxgiformat.h>
+#include "gpu/native/gfx/d3d_vocab.h"
 
 namespace sst::native
 {

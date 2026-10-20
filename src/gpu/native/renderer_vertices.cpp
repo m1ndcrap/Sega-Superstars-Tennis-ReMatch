@@ -20,7 +20,7 @@ namespace sst::native
     FetchStream *fetch_streams = d.fetch_streams;
     uint32_t &fetch_stream_count = d.fetch_stream_count;
     std::vector<HostElement> &host_elements = d.host_elements;
-    std::vector<D3D12_INPUT_ELEMENT_DESC> &layout = d.layout;
+    std::vector<gfx::InputElement> &layout = d.layout;
     bool &computed_fetch = d.computed_fetch;
     int &position_element = d.position_element;
     std::string &capture_detail = d.capture_detail;
@@ -303,7 +303,21 @@ namespace sst::native
         element.AlignedByteOffset = 0;
       }
 
-      layout.push_back(element);
+      // Its shader input location: the input's index in the shader's own list (the translator numbers them so, for Vulkan)
+      uint32_t location = 0;
+
+      for (size_t i = 0; i < vs_entry->vertex_inputs.size(); ++i)
+      {
+        const auto &v = vs_entry->vertex_inputs[i];
+
+        if (v.address == in.address && v.usage == in.usage && v.usage_index == in.usage_index)
+        {
+          location = uint32_t(i);
+          break;
+        }
+      }
+
+      layout.push_back({element, location});
 
       if (layout_words + 1 < kLayoutHashWords)
         layout_hash_input[layout_words++] = (uint64_t(in.usage) << 56) | (uint64_t(in.usage_index) << 48) | (uint64_t(element.Format) << 40) | (uint64_t(element.InputSlot) << 32) | element.AlignedByteOffset;
@@ -772,8 +786,7 @@ namespace sst::native
       {
         ++stats_.geo_vertex_hits;
         capture_host_ = nullptr;
-        const D3D12_VERTEX_BUFFER_VIEW vbv = {GeoAddress(*ventry), vertex_count * host_stride, host_stride};
-        list_->IASetVertexBuffers(0, 1, &vbv);
+        list_->SetVertexBuffer(0, GeoAddress(*ventry), vertex_count * host_stride, host_stride);
       }
       else
       {
@@ -836,7 +849,8 @@ namespace sst::native
 
         DebugAfterVertexDecode(d, up.cpu);
         capture_host_ = capture_active_ ? reinterpret_cast<const float *>(up.cpu) : nullptr;
-        D3D12_VERTEX_BUFFER_VIEW vbv = {up.gpu, vertex_count * host_stride, host_stride};
+        gfx::GpuAddress vb_address = up.gpu;
+        uint32_t vb_size = vertex_count * host_stride;
 
         if (rect_list)
         {
@@ -894,10 +908,11 @@ namespace sst::native
           }
 
           ++stats_.rects_converted;
-          vbv = {ex.gpu, rects * 4 * host_stride, host_stride};
+          vb_address = ex.gpu;
+          vb_size = rects * 4 * host_stride;
         }
 
-        list_->IASetVertexBuffers(0, 1, &vbv);
+        list_->SetVertexBuffer(0, vb_address, vb_size, host_stride);
 
         if (ventry)
         {
@@ -907,8 +922,7 @@ namespace sst::native
       }
     }
 
-    const D3D12_VERTEX_BUFFER_VIEW zero_vbv = {zero_buffer_->GetGPUVirtualAddress(), 256, 0};
-    list_->IASetVertexBuffers(kZeroInputSlot, 1, &zero_vbv);
+    list_->SetVertexBuffer(kZeroInputSlot, zero_buffer_->gpu, 256, 0);
     return true;
   }
 
@@ -942,8 +956,7 @@ namespace sst::native
         return false;
 
       std::memcpy(up.cpu, rect_indices.data(), rect_indices.size() * 4);
-      const D3D12_INDEX_BUFFER_VIEW ibv = {up.gpu, UINT(rect_indices.size() * 4), DXGI_FORMAT_R32_UINT};
-      list_->IASetIndexBuffer(&ibv);
+      list_->SetIndexBuffer(up.gpu, uint32_t(rect_indices.size() * 4), DXGI_FORMAT_R32_UINT);
       draw_count = uint32_t(rect_indices.size());
       draw_indexed = true;
     }
@@ -975,16 +988,14 @@ namespace sst::native
         return false;
 
       std::memcpy(up.cpu, converted.data(), converted.size() * 4);
-      const D3D12_INDEX_BUFFER_VIEW ibv = {up.gpu, UINT(converted.size() * 4), DXGI_FORMAT_R32_UINT};
-      list_->IASetIndexBuffer(&ibv);
+      list_->SetIndexBuffer(up.gpu, uint32_t(converted.size() * 4), DXGI_FORMAT_R32_UINT);
       draw_count = uint32_t(converted.size());
       draw_indexed = true;
     }
     else if (call.indexed && index_hit)
     {
       ++stats_.geo_index_hits;
-      const D3D12_INDEX_BUFFER_VIEW ibv = {GeoAddress(*ientry), UINT(size_t(call.count) * (index32 ? 4 : 2)), index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
-      list_->IASetIndexBuffer(&ibv);
+      list_->SetIndexBuffer(GeoAddress(*ientry), uint32_t(size_t(call.count) * (index32 ? 4 : 2)), index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT);
     }
     else if (call.indexed)
     {
@@ -1007,8 +1018,7 @@ namespace sst::native
         }
       }
 
-      const D3D12_INDEX_BUFFER_VIEW ibv = {up.gpu, UINT(bytes), index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
-      list_->IASetIndexBuffer(&ibv);
+      list_->SetIndexBuffer(up.gpu, uint32_t(bytes), index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT);
 
       if (ientry)
       {

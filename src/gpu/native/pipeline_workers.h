@@ -1,4 +1,4 @@
-// Native renderer: background pipeline compiles and the on-disk pipeline library
+// Native renderer: background pipeline compiles and the on-disk pipeline cache (gfx::PipelineCache)
 
 #pragma once
 
@@ -12,10 +12,11 @@ namespace sst::native
   {
     using Job = PipelineJob;
 
-    PipelineWorkers(ID3D12Device *device, uint32_t threads, bool use_library, bool fast_shaders) : device(device)
+    PipelineWorkers(gfx::Device &device, uint32_t threads, bool use_library, bool fast_shaders) : device(device)
     {
+      // SHADER PRECISION: FAST pipelines hold other shader code under the same names: a file of their own
       if (use_library)
-        OpenLibrary(fast_shaders);
+        cache = device.OpenPipelineCache(rex::filesystem::GetExecutableFolder() / "cache" / (fast_shaders ? "pipelines_fast.bin" : "pipelines.bin"));
 
       for (uint32_t i = 0; i < threads; ++i)
         workers.emplace_back([this]
@@ -40,49 +41,6 @@ namespace sst::native
       Save();
     }
 
-    void OpenLibrary(bool fast_shaders)
-    {
-      ComPtr<ID3D12Device1> device1;
-
-      if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1))))
-        return;
-
-      // SHADER PRECISION: FAST pipelines hold other DXIL under the same names: a file of their own
-      path = rex::filesystem::GetExecutableFolder() / "cache" / (fast_shaders ? "pipelines_fast.bin" : "pipelines.bin");
-
-      {
-        std::ifstream in(path, std::ios::binary);
-
-        if (in)
-          blob.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-      }
-
-      HRESULT hr = E_FAIL;
-
-      if (!blob.empty())
-      {
-        hr = device1->CreatePipelineLibrary(blob.data(), blob.size(), IID_PPV_ARGS(&library));
-
-        if (FAILED(hr))
-          REXLOG_INFO("[sst-native] pipeline cache {} not usable ({:08X}: new driver?); starting a new one", path.string(), uint32_t(hr));
-      }
-
-      if (!library)
-      {
-        blob.clear();
-        hr = device1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&library));
-
-        if (FAILED(hr))
-        {
-          library.Reset();
-          REXLOG_WARN("[sst-native] pipeline cache unavailable ({:08X})", uint32_t(hr));
-          return;
-        }
-      }
-
-      REXLOG_INFO("[sst-native] pipeline cache: {} ({} KB)", path.string(), blob.size() >> 10);
-    }
-
     void Submit(std::shared_ptr<Job> job)
     {
       {
@@ -96,18 +54,14 @@ namespace sst::native
     // Pipelines already in the cache file load in well under a millisecond: done right away by the render thread, so the draw isn't skipped
     bool TryLoad(Job &job)
     {
-      if (!library)
+      if (!cache)
         return false;
 
       const auto t0 = std::chrono::steady_clock::now();
-      job.desc.InputLayout = {job.layout.data(), UINT(job.layout.size())};
+      job.pso = cache->Load(job.name, job.desc);
 
-      {
-        std::lock_guard lock(library_mutex);
-
-        if (FAILED(library->LoadGraphicsPipeline(job.name.c_str(), &job.desc, IID_PPV_ARGS(&job.pso))))
-          return false;
-      }
+      if (!job.pso)
+        return false;
 
       job.from_library = true;
       job.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -118,76 +72,38 @@ namespace sst::native
     void Build(Job &job)
     {
       const auto t0 = std::chrono::steady_clock::now();
-      job.desc.InputLayout = {job.layout.data(), UINT(job.layout.size())};
 
-      if (library)
+      if (cache)
       {
-        std::lock_guard lock(library_mutex);
+        job.pso = cache->Load(job.name, job.desc);
 
-        if (SUCCEEDED(library->LoadGraphicsPipeline(job.name.c_str(), &job.desc, IID_PPV_ARGS(&job.pso))))
+        if (job.pso)
           job.from_library = true;
+        else
+          job.pso = cache->Create(job.name, job.desc, &job.error);
       }
-
-      if (!job.pso)
+      else
       {
-        job.hr = device->CreateGraphicsPipelineState(&job.desc, IID_PPV_ARGS(&job.pso));
-
-        if (SUCCEEDED(job.hr) && library)
-        {
-          std::lock_guard lock(library_mutex);
-
-          if (SUCCEEDED(library->StorePipeline(job.name.c_str(), job.pso.Get())))
-            dirty = true;
-        }
+        job.pso = device.CreatePipeline(job.desc, &job.error);
       }
 
       job.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       job.state.store(job.pso ? 1 : 2, std::memory_order_release);
     }
 
-    // Writes the library if it gained pipelines (on a worker when `background`).
+    // Writes the cache file if it gained pipelines
     void Save()
     {
-      std::vector<uint8_t> data;
+      if (!cache)
+        return;
 
-      {
-        std::lock_guard lock(library_mutex);
-
-        if (!library || !dirty)
-          return;
-
-        dirty = false;
-        data.resize(library->GetSerializedSize());
-
-        if (data.empty() || FAILED(library->Serialize(data.data(), data.size())))
-          return;
-      }
-
-      std::error_code ec;
-      std::filesystem::create_directories(path.parent_path(), ec);
-      const auto tmp = std::filesystem::path(path).concat(".tmp");
-
-      {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-
-        if (!out)
-          return;
-
-        out.write(reinterpret_cast<const char *>(data.data()), std::streamsize(data.size()));
-
-        if (!out)
-          return;
-      }
-
-      std::filesystem::rename(tmp, path, ec);
-
-      if (!ec)
-        saved_bytes = data.size();
+      if (const size_t bytes = cache->Save())
+        saved_bytes = bytes;
     }
 
     void SaveInBackground()
     {
-      if (!library || !dirty || saving.exchange(true))
+      if (!cache || !cache->Dirty() || saving.exchange(true))
         return;
 
       std::thread(
@@ -201,7 +117,9 @@ namespace sst::native
 
     void Main()
     {
+#if defined(_WIN32)
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); // background
+#endif
 
       for (;;)
       {
@@ -223,15 +141,13 @@ namespace sst::native
       }
     }
 
-    ID3D12Device *device;
-    ComPtr<ID3D12PipelineLibrary> library;
-    std::vector<uint8_t> blob; // must outlive the library
-    std::filesystem::path path;
-    std::mutex mutex, library_mutex;
+    gfx::Device &device;
+    std::unique_ptr<gfx::PipelineCache> cache;
+    std::mutex mutex;
     std::condition_variable wake;
     std::deque<std::shared_ptr<Job>> queue;
     std::vector<std::thread> workers;
-    bool quit = false, dirty = false;
+    bool quit = false;
     std::atomic<bool> saving{false};
     size_t saved_bytes = 0;
   };

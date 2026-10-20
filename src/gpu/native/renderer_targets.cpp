@@ -8,28 +8,7 @@ namespace sst::native
 
   bool Renderer::RenderTargetsEnabled() const
   {
-    return REXCVAR_GET(sst_native_render_targets) && rt_rtv_heap_ && blit_root_;
-  }
-
-  D3D12_CPU_DESCRIPTOR_HANDLE Renderer::RtRtv(uint32_t index) const
-  {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = rt_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += size_t(index) * rtv_size_;
-    return h;
-  }
-
-  D3D12_CPU_DESCRIPTOR_HANDLE Renderer::RtDsv(uint32_t index) const
-  {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = rt_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += size_t(index) * dsv_size_;
-    return h;
-  }
-
-  D3D12_GPU_DESCRIPTOR_HANDLE Renderer::SrvGpu(uint32_t slot) const
-  {
-    D3D12_GPU_DESCRIPTOR_HANDLE h = srv_heap_->GetGPUDescriptorHandleForHeapStart();
-    h.ptr += size_t(slot) * srv_size_;
-    return h;
+    return REXCVAR_GET(sst_native_render_targets) && blit_ready_;
   }
 
   uint32_t Renderer::AllocateRtSrv()
@@ -45,8 +24,7 @@ namespace sst::native
     if (rt.state == state)
       return;
 
-    auto b = Transition(rt.resource.Get(), rt.state, state);
-    list_->ResourceBarrier(1, &b);
+    list_->Barrier(*rt.resource, rt.state, state);
     rt.state = state;
   }
 
@@ -77,7 +55,7 @@ namespace sst::native
       if (!depth && rt.guest_format != guest_format && LogOnce(0xA800000000000000ull ^ (uint64_t(surface) << 8) ^ guest_format))
         REXLOG_INFO("[sst-native] render target {:08X} changed format {} -> {}", surface, rt.guest_format, guest_format);
 
-      retired_rts_.push_back({fence_value_ + 1, rt.resource});
+      retired_rts_.push_back({gfx_->LastSubmitted() + 1, rt.resource});
     }
 
     HostRT rt;
@@ -100,8 +78,9 @@ namespace sst::native
     D3D12_CLEAR_VALUE clear = {};
     clear.Format = rt.format;
     rt.state = depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+    rt.resource = gfx_->CreateTexture(desc, rt.state, &clear);
 
-    if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, rt.state, &clear, IID_PPV_ARGS(&rt.resource))))
+    if (!rt.resource)
     {
       if (LogOnce(0xA900000000000000ull ^ surface))
         REXLOG_WARN("[sst-native] could not create the {}x{} {} target for surface {:08X}", rt.width, rt.height, depth ? "depth" : "colour", surface);
@@ -110,8 +89,7 @@ namespace sst::native
     }
 
     {
-      const std::string name = fmt::format("sst {} target {:08X} {}x{}", depth ? "depth" : "colour", surface, rt.width, rt.height);
-      rt.resource->SetName(std::wstring(name.begin(), name.end()).c_str());
+      rt.resource->SetName(fmt::format("sst {} target {:08X} {}x{}", depth ? "depth" : "colour", surface, rt.width, rt.height));
     }
 
     // Views: reuse the slots of the target being replaced
@@ -139,11 +117,11 @@ namespace sst::native
       D3D12_DEPTH_STENCIL_VIEW_DESC dd = {};
       dd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
       dd.ViewDimension = samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
-      device_->CreateDepthStencilView(rt.resource.Get(), &dd, RtDsv(rt.view));
+      gfx_->WriteDsv(RtDsv(rt.view), *rt.resource, &dd);
     }
     else
     {
-      device_->CreateRenderTargetView(rt.resource.Get(), nullptr, RtRtv(rt.view));
+      gfx_->WriteRtv(RtRtv(rt.view), *rt.resource, nullptr);
     }
 
     D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -151,9 +129,7 @@ namespace sst::native
     sd.ViewDimension = samples > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sd.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE srv_handle = srv_heap_->GetCPUDescriptorHandleForHeapStart();
-    srv_handle.ptr += size_t(rt.srv) * srv_size_;
-    device_->CreateShaderResourceView(rt.resource.Get(), &sd, srv_handle);
+    gfx_->WriteSrv(rt.srv, *rt.resource, sd);
     ++stats_.host_rts;
     REXLOG_INFO("[sst-native] render target {:08X}: {}x{} {}{} (surface {}x{}, guest format {}){}", surface, rt.width, rt.height, depth ? "depth D32S8" : "colour", samples > 1 ? fmt::format(" {}x MSAA", samples) : std::string(), sw, sh, guest_format, scale != Scale2{} ? fmt::format(", host {}x{}", PxU(rt.width, scale.x), PxU(rt.height, scale.y)) : std::string());
     bound_targets_ = 0;
@@ -165,12 +141,12 @@ namespace sst::native
     // New contents are undefined: start from zero like EDRAM after a clear
     if (depth)
     {
-      list_->ClearDepthStencilView(RtDsv(stored.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);
+      list_->ClearDsv(RtDsv(stored.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0);
     }
     else
     {
       static constexpr float kZero[4] = {};
-      list_->ClearRenderTargetView(RtRtv(stored.view), kZero, 0, nullptr);
+      list_->ClearRtv(RtRtv(stored.view), kZero);
     }
 
     return &stored;
@@ -189,7 +165,7 @@ namespace sst::native
         return &t;
 
       textures_->RemoveExternal(page);
-      retired_rts_.push_back({fence_value_ + 1, t.resource});
+      retired_rts_.push_back({gfx_->LastSubmitted() + 1, t.resource});
     }
 
     auto t = std::make_unique<ResolvedTexture>();
@@ -210,8 +186,9 @@ namespace sst::native
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     t->state = kShaderRead;
+    t->resource = gfx_->CreateTexture(desc, t->state);
 
-    if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, t->state, nullptr, IID_PPV_ARGS(&t->resource))))
+    if (!t->resource)
     {
       if (LogOnce(0xAB00000000000000ull ^ page))
         REXLOG_WARN("[sst-native] could not create the {}x{}x{} resolve texture at {:08X}", width, height, slices, page << 12);
@@ -221,8 +198,7 @@ namespace sst::native
     }
 
     {
-      const std::string name = fmt::format("sst resolve texture {:08X} {}x{}x{}", page << 12, width, height, slices);
-      t->resource->SetName(std::wstring(name.begin(), name.end()).c_str());
+      t->resource->SetName(fmt::format("sst resolve texture {:08X} {}x{}x{}", page << 12, width, height, slices));
     }
 
     // Views: one RTV per slice, an identity SRV (presenting). Reuse slots
@@ -259,7 +235,7 @@ namespace sst::native
         rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
       }
 
-      device_->CreateRenderTargetView(t->resource.Get(), &rd, RtRtv(t->rtvs[i]));
+      gfx_->WriteRtv(RtRtv(t->rtvs[i]), *t->resource, &rd);
     }
 
     if (t->srv)
@@ -279,13 +255,11 @@ namespace sst::native
         sd.Texture2D.MipLevels = 1;
       }
 
-      D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
-      h.ptr += size_t(t->srv) * srv_size_;
-      device_->CreateShaderResourceView(t->resource.Get(), &sd, h);
+      gfx_->WriteSrv(t->srv, *t->resource, sd);
     }
 
     TextureCache::External e;
-    e.resource = t->resource.Get();
+    e.resource = t->resource.get();
     e.dxgi_format = uint32_t(format);
     e.width = width;
     e.height = height;
@@ -418,8 +392,7 @@ namespace sst::native
 
     if (dst->state != D3D12_RESOURCE_STATE_RENDER_TARGET)
     {
-      auto b = Transition(dst->resource.Get(), dst->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-      list_->ResourceBarrier(1, &b);
+      list_->Barrier(*dst->resource, dst->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
       dst->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
 
@@ -438,8 +411,7 @@ namespace sst::native
     }
 
     {
-      auto b = Transition(dst->resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
-      list_->ResourceBarrier(1, &b);
+      list_->Barrier(*dst->resource, D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderRead);
       dst->state = kShaderRead;
     }
 
@@ -462,7 +434,7 @@ namespace sst::native
         }
 
         const D3D12_RECT host = Scaled(sr, src.scale);
-        list_->ClearRenderTargetView(RtRtv(src.view), col, 1, &host);
+        list_->ClearRtv(RtRtv(src.view), col, &host, 1);
       }
 
       if (c.flags & 0x200)
@@ -478,7 +450,7 @@ namespace sst::native
           const D3D12_RECT host = Scaled(dsr, d.scale);
 
           if (dsr.right > dsr.left && dsr.bottom > dsr.top)
-            list_->ClearDepthStencilView(RtDsv(d.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, std::clamp(c.clear_z, 0.0f, 1.0f), 0, 1, &host);
+            list_->ClearDsv(RtDsv(d.view), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, std::clamp(c.clear_z, 0.0f, 1.0f), 0, &host, 1);
         }
       }
     }
@@ -499,10 +471,7 @@ namespace sst::native
 
       if (it == msaa_support_.end())
       {
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {};
-        q.Format = format;
-        q.SampleCount = samples;
-        const bool ok = SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof(q))) && q.NumQualityLevels > 0;
+        const bool ok = gfx_->SupportsSamples(format, samples);
         it = msaa_support_.emplace(key, ok ? 1u : 0u).first;
 
         if (!ok)
@@ -565,20 +534,20 @@ namespace sst::native
 
     if (output_scale_[target_] != scale_)
     {
-      desc.Format = D3D12Presenter::kGuestOutputFormat;
+      desc.Format = kOutputFormat;
       desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-      Microsoft::WRL::ComPtr<ID3D12Resource> output;
+      gfx::TextureRef output = gfx_->CreateTexture(desc, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
-      if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&output))))
+      if (!output)
       {
         REXLOG_ERROR("[sst-native] could not create a {}x{} output", desc.Width, desc.Height);
         scale_ = output_scale_[target_];
         return false;
       }
 
-      retired_rts_.push_back({fence_value_ + 1, outputs_[target_]});
+      retired_rts_.push_back({gfx_->LastSubmitted() + 1, outputs_[target_]});
       outputs_[target_] = output;
-      device_->CreateRenderTargetView(output.Get(), nullptr, Rtv(target_));
+      gfx_->WriteRtv(Rtv(target_), *output, nullptr);
       output_scale_[target_] = scale_;
     }
 
@@ -589,13 +558,12 @@ namespace sst::native
       D3D12_CLEAR_VALUE clear = {};
       clear.Format = kDepthFormat;
       clear.DepthStencil.Depth = 1.0f;
-      Microsoft::WRL::ComPtr<ID3D12Resource> depth;
 
-      if (SUCCEEDED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&depth))))
+      if (gfx::TextureRef depth = gfx_->CreateTexture(desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear))
       {
-        retired_rts_.push_back({fence_value_ + 1, depth_});
+        retired_rts_.push_back({gfx_->LastSubmitted() + 1, depth_});
         depth_ = depth;
-        device_->CreateDepthStencilView(depth_.Get(), nullptr, dsv_heap_->GetCPUDescriptorHandleForHeapStart());
+        gfx_->WriteDsv(kOutputDsv, *depth_, nullptr);
         depth_scale_ = scale_;
       }
     }
@@ -672,7 +640,7 @@ namespace sst::native
           const D3D12_RECT r = area(*c);
 
           if (r.right > r.left && r.bottom > r.top)
-            list_->ClearRenderTargetView(RtRtv(c->view), col, 1, &r);
+            list_->ClearRtv(RtRtv(c->view), col, &r, 1);
         }
       }
 
@@ -694,7 +662,7 @@ namespace sst::native
           const D3D12_RECT r = area(*d);
 
           if (r.right > r.left && r.bottom > r.top)
-            list_->ClearDepthStencilView(RtDsv(d->view), cf, std::clamp(z, 0.0f, 1.0f), UINT8(stencil), 1, &r);
+            list_->ClearDsv(RtDsv(d->view), cf, std::clamp(z, 0.0f, 1.0f), uint8_t(stencil), &r, 1);
         }
       }
 
@@ -724,7 +692,7 @@ namespace sst::native
     if ((flags & 0xF0) && rt0)
     {
       const float c[4] = {float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f, float(color & 0xFF) / 255.0f, float((color >> 24) & 0xFF) / 255.0f};
-      list_->ClearRenderTargetView(Rtv(target_), c, 0, nullptr);
+      list_->ClearRtv(Rtv(target_), c);
     }
 
     D3D12_CLEAR_FLAGS ds = D3D12_CLEAR_FLAGS(0);
@@ -739,6 +707,6 @@ namespace sst::native
       last_depth_clear_ = std::clamp(z, 0.0f, 1.0f);
 
     if (ds)
-      list_->ClearDepthStencilView(dsv_heap_->GetCPUDescriptorHandleForHeapStart(), ds, std::clamp(z, 0.0f, 1.0f), UINT8(stencil), 0, nullptr);
+      list_->ClearDsv(kOutputDsv, ds, std::clamp(z, 0.0f, 1.0f), uint8_t(stencil));
   }
 }

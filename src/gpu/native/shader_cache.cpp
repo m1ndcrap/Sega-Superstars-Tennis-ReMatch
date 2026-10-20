@@ -8,7 +8,8 @@
 #include <fmt/format.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
-#include <rex/ui/d3d12/d3d12_provider.h>
+
+#include "gpu/native/dxc.h"
 
 #include <xxhash.h>
 
@@ -17,9 +18,9 @@
 #include <cstring>
 #include <fstream>
 
+#if defined(_WIN32)
 #include <compressapi.h>
-#include <dxcapi.h>
-#include <wrl/client.h>
+#endif
 
 REXCVAR_DEFINE_STRING(sst_shader_override, "", "SST",
                       "Native renderer debug: folder (next to the exe, or a full path) of replacement shaders. <HASH>.hlsl "
@@ -33,8 +34,6 @@ REXCVAR_DEFINE_BOOL(sst_fast_shaders, false, "SST",
 
 namespace sst::native
 {
-  using Microsoft::WRL::ComPtr;
-
   namespace
   {
     // Shared with the build-time baker (shader_pack.h): bump it there when the translator, the prelude or the compile options change.
@@ -107,6 +106,10 @@ namespace sst::native
     // used in place (resource memory stays mapped for the life of the process).
     bool LoadEmbeddedPack(pack::View &view, std::vector<uint8_t> &storage, const wchar_t *name, uint32_t version)
     {
+#if !defined(_WIN32)
+      (void)view, (void)storage, (void)name, (void)version;
+      return false; // (the pack is a Windows resource; other platforms compile at run time for now)
+#else
       HMODULE module = GetModuleHandleW(nullptr);
       HRSRC res = FindResourceW(module, name, MAKEINTRESOURCEW(10)); // RT_RCDATA
 
@@ -152,22 +155,92 @@ namespace sst::native
 
       REXLOG_INFO("[sst-native] shader pack: {:.1f} MB unpacked from {:.1f} MB in {:.0f} ms", double(storage.size()) / (1 << 20), double(size) / (1 << 20), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
       return view.Open(storage.data(), storage.size(), version);
+#endif
+    }
+
+    // A pack file next to the exe (the SPIR-V packs: shaders/spirv*.pack), compressed with pack::CompressPlanar or raw. Unpacked into `storage`, which lives as long as the cache
+    bool LoadPackFile(pack::View &view, std::vector<uint8_t> &storage, const std::filesystem::path &path, uint32_t version)
+    {
+      std::ifstream in(path, std::ios::binary);
+
+      if (!in)
+        return false;
+
+      const auto start = std::chrono::steady_clock::now();
+      const std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      pack::CompressedHeader ch = {};
+
+      if (file.size() >= sizeof(ch))
+        std::memcpy(&ch, file.data(), sizeof(ch));
+
+      if (ch.magic == pack::kCompressedMagic)
+      {
+        if (ch.algorithm != pack::kAlgorithmLzPlanar || ch.raw_size > (1ull << 31) || !pack::DecompressPlanar(file.data() + sizeof(ch), file.size() - sizeof(ch), size_t(ch.raw_size), storage))
+        {
+          REXLOG_ERROR("[sst-native] shader pack {}: can't unpack it", path.string());
+          storage.clear();
+          return false;
+        }
+      }
+      else
+      {
+        storage = file;
+      }
+
+      if (!view.Open(storage.data(), storage.size(), version))
+      {
+        REXLOG_WARN("[sst-native] shader pack {} is from another build (version): compiling shaders on first use instead", path.string());
+        storage.clear();
+        return false;
+      }
+
+      REXLOG_INFO("[sst-native] shader pack: {:.1f} MB unpacked from {} in {:.0f} ms", double(storage.size()) / (1 << 20), path.string(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+      return true;
+    }
+
+    // Compile threads run below normal priority, at normal priority while a draw waits for their shader
+    void SetCompilePriority(bool urgent)
+    {
+#if defined(_WIN32)
+      SetThreadPriority(GetCurrentThread(), urgent ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+#else
+      (void)urgent;
+#endif
     }
   }
 
   struct Worker
   {
-    ComPtr<IDxcCompiler3> compiler;
+    dxc::Ref<IDxcCompiler3> compiler;
   };
 
-  bool ShaderCache::Initialize(const rex::ui::d3d12::D3D12Provider &provider, const std::filesystem::path &cache_dir)
+  bool ShaderCache::Initialize(gfx::ShaderFormat format, const std::filesystem::path &cache_dir)
   {
-    provider_ = &provider;
+    format_ = format;
     fast_ = REXCVAR_GET(sst_fast_shaders);
+    const bool spirv = format == gfx::ShaderFormat::kSpirv;
 
     // SHADER PRECISION: FAST needs its own pack; without one (a build with SST_SHADER_BAKE_FAST off) every shader would compile at
     // run time, which is far slower than the accuracy is worth on the PCs that want FAST: use ACCURATE then
-    if (fast_ && !LoadEmbeddedPack(pack_, pack_storage_, pack::kResourceNameFast, pack::kCacheVersionFast))
+    if (spirv)
+    {
+      // Files next to the exe (the embedded packs hold DXIL). FAST without its pack: ACCURATE, as with DXIL
+      const auto exe = rex::filesystem::GetExecutableFolder();
+
+      if (fast_ && !LoadPackFile(pack_, pack_storage_, exe / pack::kSpirvPackFileFast, pack::kCacheVersionSpirvFast))
+      {
+        if (LoadPackFile(pack_, pack_storage_, exe / pack::kSpirvPackFile, pack::kCacheVersionSpirv))
+        {
+          REXLOG_WARN("[sst-native] shader precision FAST: no fast SPIR-V shader pack next to the exe; using ACCURATE");
+          fast_ = false;
+        }
+      }
+      else if (!fast_)
+      {
+        LoadPackFile(pack_, pack_storage_, exe / pack::kSpirvPackFile, pack::kCacheVersionSpirv);
+      }
+    }
+    else if (fast_ && !LoadEmbeddedPack(pack_, pack_storage_, pack::kResourceNameFast, pack::kCacheVersionFast))
     {
       if (LoadEmbeddedPack(pack_, pack_storage_, pack::kResourceName, pack::kCacheVersion))
       {
@@ -180,8 +253,9 @@ namespace sst::native
       LoadEmbeddedPack(pack_, pack_storage_, pack::kResourceName, pack::kCacheVersion);
     }
 
-    version_ = pack::CacheVersion(fast_);
-    cache_dir_ = fast_ ? cache_dir / "fast" : cache_dir; // FAST DXIL kept apart, so switching back and forth keeps both caches
+    version_ = pack::CacheVersion(fast_, spirv);
+    const std::filesystem::path base = spirv ? cache_dir / "spirv" : cache_dir;
+    cache_dir_ = fast_ ? base / "fast" : base; // FAST shaders kept apart, so switching back and forth keeps both caches
     std::error_code ec;
     std::filesystem::create_directories(cache_dir_, ec);
     std::filesystem::create_directories(cache_dir_ / "failed", ec);
@@ -191,7 +265,9 @@ namespace sst::native
     REXLOG_INFO("[sst-native] shader precision: {}", fast_ ? "FAST (plain multiplies)" : "ACCURATE (Xbox 360 multiply rule)");
 
     if (pack_.count())
-      REXLOG_INFO("[sst-native] shader pack: {} precompiled shader variants built into the exe", pack_.count());
+      REXLOG_INFO("[sst-native] shader pack: {} precompiled shader variants{}", pack_.count(), spirv ? " (SPIR-V)" : " built into the exe");
+    else if (spirv)
+      REXLOG_INFO("[sst-native] Vulkan: no SPIR-V shader pack next to the exe (shaders/spirv*.pack): shaders compile on first use (kept in {})", cache_dir_.string());
     else
       REXLOG_INFO("[sst-native] no shader pack in the exe (built without SST_SHADER_BAKE or game files): shaders compile on first use");
 
@@ -238,13 +314,14 @@ namespace sst::native
     }
 
     // Check DXC is usable before starting workers
-    ComPtr<IDxcCompiler3> probe;
+    dxc::Ref<IDxcCompiler3> probe;
 
-    if (FAILED(provider.DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&probe))))
+    if (FAILED(dxc::CreateInstance(format_, CLSID_DxcCompiler, __uuidof(IDxcCompiler3), probe.put())))
     {
-      REXLOG_ERROR("[sst-native] dxcompiler.dll not found: shaders can't be compiled. Copy dxcompiler.dll and "
-                   "dxil.dll from the Windows SDK (Windows Kits\\10\\bin\\<version>\\x64) next to the exe.");
-      // Cached shaders still load; new ones fail
+      if (spirv)
+        REXLOG_ERROR("[sst-native] {} not found: shaders can't be compiled for Vulkan. It comes from a DirectXShaderCompiler release (the build copies it next to the exe)", dxc::LibraryName(format_));
+      else
+        REXLOG_ERROR("[sst-native] dxcompiler.dll not found: shaders can't be compiled. Copy dxcompiler.dll and dxil.dll from the Windows SDK (Windows Kits\\10\\bin\\<version>\\x64) next to the exe.");
     }
 
     const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
@@ -421,6 +498,27 @@ namespace sst::native
       std::lock_guard lock(entry->variants_mutex);
       auto &slot = entry->variants[spec];
 
+      if (!slot && spec != 0 && format_ == gfx::ShaderFormat::kSpirv)
+      {
+        // SPIR-V: every variant is variant 0's module with another specialization constant
+        auto base = entry->variants.find(0);
+        const auto base_state = base != entry->variants.end() && base->second ? base->second->state.load(std::memory_order_acquire) : ShaderVariant::State::kQueued;
+
+        if (base_state == ShaderVariant::State::kQueued)
+        {
+          entry->variants.erase(spec);
+          return nullptr;
+        }
+
+        slot = std::make_unique<ShaderVariant>();
+        slot->spec = spec;
+
+        if (base_state == ShaderVariant::State::kReady)
+          slot->dxil.set_view(base->second->dxil.data(), base->second->dxil.size());
+
+        slot->state.store(base_state, std::memory_order_release);
+      }
+
       if (!slot)
       {
         slot = std::make_unique<ShaderVariant>();
@@ -455,9 +553,8 @@ namespace sst::native
 
   void ShaderCache::WorkerMain(unsigned index)
   {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); // background
+    SetCompilePriority(false); // background
 #ifdef _WIN32
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     // SetThreadDescription is Windows 10 1607+; look it up so older systems (and older SDK headers) still work
     using SetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PCWSTR);
 
@@ -494,7 +591,7 @@ namespace sst::native
       // A draw is waiting for this one: compete with the game at normal priority (low-core machines otherwise starve it for seconds)
       if (job.urgent != raised)
       {
-        SetThreadPriority(GetCurrentThread(), job.urgent ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+        SetCompilePriority(job.urgent);
         raised = job.urgent;
       }
 
@@ -589,18 +686,30 @@ namespace sst::native
     if (!tr.ok)
       return fail("translation failed: " + tr.error, {});
 
-    const std::string source = (over && !over->source.empty() ? over->source : tr.hlsl) + sst::xenos::SpecConstantsDefinition(job.spec);
+    // DXIL: the variant's spec constants are compiled in. SPIR-V: g_SpecConstants is specialization constant 0 (set per pipeline)
+    const bool spirv = format_ == gfx::ShaderFormat::kSpirv;
+    const std::string source = (over && !over->source.empty() ? over->source : tr.hlsl) + (spirv ? std::string() : sst::xenos::SpecConstantsDefinition(job.spec));
 
     if (over)
       REXLOG_INFO("[sst-native] shader override: compiling {:016X} variant {} from the override folder", entry.hash, job.spec);
 
-    // Compile to DXIL
-    if (!worker.compiler && FAILED(provider_->DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&worker.compiler))))
-      return fail("dxcompiler.dll not available", source);
+    if (!worker.compiler && FAILED(dxc::CreateInstance(format_, CLSID_DxcCompiler, __uuidof(IDxcCompiler3), worker.compiler.put())))
+      return fail(std::string(dxc::LibraryName(format_)) + " not available", source);
 
     // Same arguments as the build-time baker (shader_pack.h)
     std::vector<const wchar_t *> args = {L"-T", tr.pixel_shader ? L"ps_6_0" : L"vs_6_0"};
-    args.insert(args.end(), std::begin(pack::kDxcArgs), std::end(pack::kDxcArgs));
+
+    if (spirv)
+    {
+      args.insert(args.end(), std::begin(pack::kDxcSpirvArgs), std::end(pack::kDxcSpirvArgs));
+
+      if (!tr.pixel_shader)
+        args.push_back(pack::kDxcSpirvVsArg);
+    }
+    else
+    {
+      args.insert(args.end(), std::begin(pack::kDxcArgs), std::end(pack::kDxcArgs));
+    }
 
     if (fast_)
       args.push_back(pack::kFastMathArg);
@@ -612,30 +721,15 @@ namespace sst::native
       for (const auto &a : over->args)
         args.push_back(a.c_str());
 
-    DxcBuffer buffer = {source.data(), source.size(), DXC_CP_UTF8};
-    ComPtr<IDxcResult> result;
-    HRESULT status = E_FAIL;
+    std::vector<uint8_t> code;
+    std::string errors;
 
-    if (FAILED(worker.compiler->Compile(&buffer, args.data(), UINT32(args.size()), nullptr, IID_PPV_ARGS(&result))) || FAILED(result->GetStatus(&status)) || FAILED(status))
-    {
-      std::string errors = "DXC failed";
-      ComPtr<IDxcBlobUtf8> err;
-
-      if (result && SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&err), nullptr)) && err && err->GetStringLength())
-        errors += ":\n" + std::string(err->GetStringPointer(), err->GetStringLength());
-
+    if (!dxc::Compile(worker.compiler.get(), source, args.data(), uint32_t(args.size()), code, &errors))
       return fail(errors, source);
-    }
 
-    ComPtr<IDxcBlob> object;
+    variant.dxil.assign(code.begin(), code.end());
 
-    if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) || !object || !object->GetBufferSize())
-      return fail("DXC returned no object", source);
-
-    const auto *bytes = static_cast<const uint8_t *>(object->GetBufferPointer());
-    variant.dxil.assign(bytes, bytes + object->GetBufferSize());
-
-    if (!IsSigned(variant.dxil) && !stats_.unsigned_warned.exchange(true))
+    if (!spirv && !IsSigned(variant.dxil) && !stats_.unsigned_warned.exchange(true))
       REXLOG_WARN("[sst-native] DXIL is unsigned: dxil.dll was not found next to dxcompiler.dll. D3D12 will "
                   "reject these shaders; copy dxil.dll from the Windows SDK next to the exe.");
 
@@ -643,7 +737,7 @@ namespace sst::native
     stats_.compile_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
 
     // Store (write to a temp name, then rename, so a crash never leaves a truncated file under the real name). Overrides aren't stored.
-    if (IsSigned(variant.dxil) && !overridden)
+    if ((spirv || IsSigned(variant.dxil)) && !overridden)
     {
       const FileHeader header = {kFileMagic, version_, tr.spec_constants_mask, uint32_t(variant.dxil.size())};
       auto tmp = path;

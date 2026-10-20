@@ -15,12 +15,11 @@ namespace sst::native
     if (pass_ts_ && pass_marks_[slot].size() >= 2)
     {
       const std::vector<PassMark> &marks = pass_marks_[slot];
-      const D3D12_RANGE prange = {8 * size_t(slot) * kPassMarks, 8 * (size_t(slot) * kPassMarks + marks.size())};
-      void *pm = nullptr;
+      const size_t begin = 8 * size_t(slot) * kPassMarks, end = 8 * (size_t(slot) * kPassMarks + marks.size());
 
-      if (SUCCEEDED(pass_readback_->Map(0, &prange, &pm)) && pm)
+      if (const uint8_t *pm = pass_readback_->Map(begin, end))
       {
-        const uint64_t *t = reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(pm) + prange.Begin);
+        const uint64_t *t = reinterpret_cast<const uint64_t *>(pm + begin);
 
         for (size_t i = 0; i + 1 < marks.size(); ++i)
         {
@@ -35,24 +34,21 @@ namespace sst::native
         }
 
         ++pass_frames_;
-        const D3D12_RANGE none = {0, 0};
-        pass_readback_->Unmap(0, &none);
+        pass_readback_->Unmap();
       }
     }
 
     pass_marks_[slot].clear();
 
     timestamp_pending_[slot] = false;
-    const D3D12_RANGE range = {16 * size_t(slot), 16 * size_t(slot) + 16};
-    void *mapped = nullptr;
+    const uint8_t *mapped = timestamp_readback_->Map(16 * size_t(slot), 16 * size_t(slot) + 16);
 
-    if (FAILED(timestamp_readback_->Map(0, &range, &mapped)) || !mapped)
+    if (!mapped)
       return;
 
     uint64_t t[2];
-    std::memcpy(t, static_cast<const uint8_t *>(mapped) + 16 * slot, 16);
-    const D3D12_RANGE none = {0, 0};
-    timestamp_readback_->Unmap(0, &none);
+    std::memcpy(t, mapped + 16 * slot, 16);
+    timestamp_readback_->Unmap();
 
     if (t[1] <= t[0] || !timestamp_frequency_)
       return;
@@ -65,37 +61,29 @@ namespace sst::native
 
   void Renderer::CreateTimestampQueries()
   {
-    if (FAILED(provider_->GetDirectQueue()->GetTimestampFrequency(&timestamp_frequency_)))
+    timestamp_frequency_ = gfx_->TimestampFrequency();
+
+    if (!timestamp_frequency_)
       return;
 
-    D3D12_QUERY_HEAP_DESC qd = {};
-    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    qd.Count = 2 * kSlots;
+    timestamps_ = gfx_->CreateTimestampPool(2 * kSlots);
 
-    if (FAILED(device_->CreateQueryHeap(&qd, IID_PPV_ARGS(&timestamps_))))
+    if (!timestamps_)
       return;
 
-    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_READBACK};
-    D3D12_RESOURCE_DESC bd = {};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = 16 * kSlots;
-    bd.Height = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels = 1;
-    bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    timestamp_readback_ = gfx_->CreateBuffer(16 * kSlots, gfx::HeapType::kReadback, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&timestamp_readback_))))
-      timestamps_.Reset();
+    if (!timestamp_readback_)
+      timestamps_.reset();
 
     // Per-pass timestamps
-    qd.Count = kPassMarks * kSlots;
-    bd.Width = 8 * uint64_t(kPassMarks) * kSlots;
+    pass_ts_ = gfx_->CreateTimestampPool(kPassMarks * kSlots);
+    pass_readback_ = pass_ts_ ? gfx_->CreateBuffer(8 * uint64_t(kPassMarks) * kSlots, gfx::HeapType::kReadback, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
 
-    if (FAILED(device_->CreateQueryHeap(&qd, IID_PPV_ARGS(&pass_ts_))) || FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pass_readback_))))
+    if (!pass_ts_ || !pass_readback_)
     {
-      pass_ts_.Reset();
-      pass_readback_.Reset();
+      pass_ts_.reset();
+      pass_readback_.reset();
     }
   }
 
@@ -106,7 +94,7 @@ namespace sst::native
     if (!pass_ts_ || marks.size() >= kPassMarks - 1)
       return;
 
-    list_->EndQuery(pass_ts_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_res_ * kPassMarks + uint32_t(marks.size()));
+    list_->WriteTimestamp(*pass_ts_, frame_res_ * kPassMarks + uint32_t(marks.size()));
     marks.push_back({rt, uint16_t(std::min(w, 65535u)), uint16_t(std::min(h, 65535u)), kind});
   }
 

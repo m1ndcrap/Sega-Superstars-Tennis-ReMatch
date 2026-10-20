@@ -1429,6 +1429,10 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
 
             out += '\t';
 
+#ifdef SST_RECOMP
+            // SST: the input's location is its index in the shader's vertex element list (sst::xenos::GetVertexInputs order). The fixed table below misses inputs this game uses (POSITION2-4, ...), and Vulkan rejects a shader that locates only some of its inputs; the native renderer builds each draw's vertex layout from the same list, so it knows every location
+            print("[[vk::location({})]] ", i);
+#else
             for (auto &usageLocation : USAGE_LOCATIONS)
             {
                 if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
@@ -1437,6 +1441,7 @@ void ShaderRecompiler::recompile(const uint8_t *shaderData, const std::string_vi
                     break;
                 }
             }
+#endif
 
             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)], uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
 

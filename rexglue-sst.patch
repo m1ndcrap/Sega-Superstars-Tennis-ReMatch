@@ -1,0 +1,96 @@
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 947817f..7c7c8ef 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -155,6 +155,20 @@ class VulkanDevice {
+ 
+     bool dynamicRendering = false;
+ 
++    // sst_rematch native renderer (XenosRecomp SPIR-V: buffer device addresses in push constants, bindless descriptor arrays). Enabled whenever supported, also without GPU emulation
++
++    bool shaderInt64 = false;
++    bool bufferDeviceAddress = false;
++    bool descriptorIndexing = false;
++    bool runtimeDescriptorArray = false;
++    bool descriptorBindingPartiallyBound = false;
++    bool descriptorBindingVariableDescriptorCount = false;
++    bool descriptorBindingSampledImageUpdateAfterBind = false;
++    bool descriptorBindingUpdateUnusedWhilePending = false;
++    bool shaderSampledImageArrayNonUniformIndexing = false;
++    bool timelineSemaphore = false;
++    bool synchronization2 = false;
++
+     // VK_EXT_non_seamless_cube_map (#423)
+ 
+     bool nonSeamlessCubeMap = false;
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..2767f38 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -899,7 +899,11 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+     }
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    // (sst_rematch: once, not at every guest thread's CPU change - tens of thousands of lines on a 4-core machine)
++    static std::atomic<bool> warned{false};
++    if (!warned.exchange(true)) {
++      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    }
+   }
+ }
+ 
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..e7ba19e 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -645,7 +645,21 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
+   }
+ 
++  // sst_rematch native renderer: 64-bit integers (buffer device addresses in push constants), whenever supported
++  XE_UI_VULKAN_FEATURE(shaderInt64)
++
+   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
++    // sst_rematch native renderer (XenosRecomp SPIR-V): buffer device addresses, bindless descriptor arrays, timeline semaphores, whenever supported
++    XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
++    XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorIndexing);
++    XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
++    XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
++    XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingVariableDescriptorCount);
++    XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
++    XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingUpdateUnusedWhilePending);
++    XE_UI_VULKAN_FEATURE_2(features_1_2, shaderSampledImageArrayNonUniformIndexing);
++    XE_UI_VULKAN_FEATURE_2(features_1_2, timelineSemaphore);
++
+     if (with_gpu_emulation) {
+       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
+@@ -660,8 +674,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+     if (with_gpu_emulation) {
+       XE_UI_VULKAN_FEATURE_2(features_1_3, shaderDemoteToHelperInvocation);
+-      XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
+     }
++    // (sst_rematch: also without GPU emulation)
++    XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
++    XE_UI_VULKAN_FEATURE_2(features_1_3, synchronization2);
+   } else {
+     if (ext_1_3_KHR_dynamic_rendering) {
+       if (with_gpu_emulation) {
+diff --git a/src/ui/vulkan/vulkan_mem_alloc.cpp b/src/ui/vulkan/vulkan_mem_alloc.cpp
+index 9ffc2d1..1b2e4e7 100644
+--- a/src/ui/vulkan/vulkan_mem_alloc.cpp
++++ b/src/ui/vulkan/vulkan_mem_alloc.cpp
+@@ -77,6 +77,11 @@ VmaAllocator CreateVmaAllocator(const VulkanDevice* const vulkan_device,
+         dfn.vkGetDeviceImageMemoryRequirements;
+   }
+ 
++  // (sst_rematch native renderer: buffers it reads through device addresses)
++  if (vulkan_device->properties().bufferDeviceAddress) {
++    allocator_create_info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
++  }
++
+   if (externally_synchronized) {
+     allocator_create_info.flags |= VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+   }

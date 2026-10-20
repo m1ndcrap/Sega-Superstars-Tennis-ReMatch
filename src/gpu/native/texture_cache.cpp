@@ -3,6 +3,7 @@
 #include "gpu/native/texture_cache.h"
 #include "gpu/native/guest_watch.h"
 #include "gpu/native/texture_formats.h"
+#include "gpu/native/texture_rows.h"
 #include "gpu/native/guest_memory.h"
 
 #include <atomic>
@@ -49,7 +50,6 @@ namespace sst::native
     return membase_;
   }
 
-  using Microsoft::WRL::ComPtr;
   namespace xenos = rex::graphics::xenos;
   namespace texture_util = rex::graphics::texture_util;
   using namespace texture_format;
@@ -62,14 +62,10 @@ namespace sst::native
 
   }
 
-  bool TextureCache::Initialize(ID3D12Device *device, const uint8_t *physical_membase, ID3D12DescriptorHeap *srv_heap, uint32_t srv_first, uint32_t srv_count, ID3D12DescriptorHeap *sampler_heap, uint32_t sampler_first, uint32_t sampler_count)
+  bool TextureCache::Initialize(gfx::Device &device, const uint8_t *physical_membase, uint32_t srv_first, uint32_t srv_count, uint32_t sampler_first, uint32_t sampler_count)
   {
-    device_ = device;
+    device_ = &device;
     membase_ = physical_membase;
-    srv_heap_ = srv_heap;
-    sampler_heap_ = sampler_heap;
-    srv_size_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    sampler_size_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
     srv_next_ = srv_first;
     srv_end_ = srv_first + srv_count;
     sampler_first_ = sampler_first;
@@ -193,9 +189,9 @@ namespace sst::native
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    t->resource = device_->CreateTexture(desc, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&t->resource))))
+    if (!t->resource)
     {
       ++stats_.failed;
 
@@ -206,11 +202,10 @@ namespace sst::native
     }
 
     {
-      const std::string name = fmt::format("sst texture {:08X} {}x{} {}", k.base_page << 12, k.width, k.height, FormatName(k.format));
-      t->resource->SetName(std::wstring(name.begin(), name.end()).c_str());
+      t->resource->SetName(fmt::format("sst texture {:08X} {}x{} {}", k.base_page << 12, k.width, k.height, FormatName(k.format)));
     }
 
-    t->bytes = device_->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    t->bytes = device_->TextureBytes(desc);
     total_bytes_ += t->bytes;
 
     const texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(dim, k.pitch, k.width, k.height, k.depth_or_array, k.tiled != 0, xenos::TextureFormat(k.format), k.packed != 0, k.base_page != 0, k.mip_max);
@@ -263,7 +258,7 @@ namespace sst::native
     return h;
   }
 
-  bool TextureCache::Upload(ID3D12GraphicsCommandList *list, const AllocateFn &allocate, Texture &t)
+  bool TextureCache::Upload(gfx::CommandList &list, const AllocateFn &allocate, Texture &t)
   {
     const Key &k = t.key;
     const HostFormat hf = GetHostFormat(k.format);
@@ -283,20 +278,20 @@ namespace sst::native
     const auto format = xenos::TextureFormat(k.format);
     const texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(dim, k.pitch, k.width, k.height, k.depth_or_array, k.tiled != 0, format, k.packed != 0, k.base_page != 0, k.mip_max);
 
-    const D3D12_RESOURCE_DESC desc = t.resource->GetDesc();
-    const UINT subresources = t.levels * t.array_size;
+    const D3D12_RESOURCE_DESC &desc = t.resource->desc;
+    const uint32_t subresources = t.levels * t.array_size;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(subresources);
-    std::vector<UINT> rows(subresources);
-    std::vector<UINT64> row_bytes(subresources);
-    UINT64 total = 0;
-    device_->GetCopyableFootprints(&desc, 0, subresources, 0, fp.data(), rows.data(), row_bytes.data(), &total);
+    std::vector<uint32_t> rows(subresources);
+    std::vector<uint64_t> row_bytes(subresources);
+    uint64_t total = 0;
+    device_->Footprints(desc, 0, subresources, fp.data(), rows.data(), row_bytes.data(), &total);
     const UploadSpace up = allocate(size_t(total));
 
     if (!up.cpu)
       return false;
 
     const auto start = std::chrono::steady_clock::now();
-    std::vector<UINT> loaded;
+    std::vector<uint32_t> loaded;
     uint8_t block[16];
 
     // Button-icon atlas pages: the icons follow the input device in use (prompts.h)
@@ -310,6 +305,10 @@ namespace sst::native
 
     if (prompt_page >= 0)
       prompts::BeginPage(prompt_page);
+
+    // Whole rows at a time for plain copies (texture_rows.h); the button atlas needs every block (prompts::Block)
+    const bool copy_rows = prompt_page < 0 && texture_rows::CanCopyRows(hf.load, hf.host_bpb, bpb, k.endian, k.tiled != 0, is3d);
+    thread_local std::vector<uint8_t> row_scratch;
 
     for (uint32_t level = k.mip_min; level <= k.mip_max; ++level)
     {
@@ -343,7 +342,7 @@ namespace sst::native
 
       for (uint32_t slice = 0; slice < t.array_size; ++slice)
       {
-        const UINT sub = level + slice * t.levels;
+        const uint32_t sub = level + slice * t.levels;
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &f = fp[sub];
         const uint32_t host_cols = uint32_t(row_bytes[sub] / hf.host_bpb);
         const uint32_t slice_addr = level_addr + slice * lay.array_slice_stride_bytes;
@@ -353,6 +352,14 @@ namespace sst::native
           for (uint32_t y = 0; y < rows[sub]; ++y)
           {
             uint8_t *dst = up.cpu + f.Offset + (size_t(z) * rows[sub] + y) * f.Footprint.RowPitch;
+
+            if (copy_rows && (!k.tiled || texture_rows::TiledPitchOk(pitch_blocks)))
+            {
+              const uint32_t cols = y < gby && z < gd ? std::min(gbx, host_cols) : 0;
+              const texture_rows::RowSource rs{membase_, src_mem, region_begin, region_end, kGuestPhysicalSize};
+              texture_rows::CopyRow(rs, slice_addr, k.tiled != 0, ox, oy + y, oz + z, cols, host_cols, bpb, bpb_log2, pitch_blocks, lay.row_pitch_bytes, lay.z_slice_stride_block_rows, k.endian, row_scratch, dst);
+              continue;
+            }
 
             for (uint32_t x = 0; x < host_cols; ++x, dst += hf.host_bpb)
             {
@@ -404,36 +411,19 @@ namespace sst::native
     if (loaded.empty())
       return false;
 
-    const D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    D3D12_RESOURCE_BARRIER b = {};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = t.resource.Get();
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    const D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     if (t.resident)
+      list.Barrier(*t.resource, kShaderRead, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    for (uint32_t sub : loaded)
     {
-      b.Transition.StateBefore = kShaderRead;
-      b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-      list->ResourceBarrier(1, &b);
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT f = fp[sub];
+      f.Offset += up.offset;
+      list.CopyBufferToTexture(*t.resource, sub, *up.buffer, f);
     }
 
-    for (UINT sub : loaded)
-    {
-      D3D12_TEXTURE_COPY_LOCATION dst = {};
-      dst.pResource = t.resource.Get();
-      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      dst.SubresourceIndex = sub;
-      D3D12_TEXTURE_COPY_LOCATION src = {};
-      src.pResource = up.resource;
-      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-      src.PlacedFootprint = fp[sub];
-      src.PlacedFootprint.Offset += up.offset;
-      list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    }
-
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    b.Transition.StateAfter = kShaderRead;
-    list->ResourceBarrier(1, &b);
+    list.Barrier(*t.resource, D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead);
     ++stats_.uploads;
 
     if (t.resident)
@@ -444,7 +434,7 @@ namespace sst::native
     return true;
   }
 
-  uint32_t TextureCache::GetTexture(ID3D12GraphicsCommandList *list, const AllocateFn &allocate, const uint32_t fetch[6], uint32_t fetch_dimension)
+  uint32_t TextureCache::GetTexture(gfx::CommandList &list, const AllocateFn &allocate, const uint32_t fetch[6], uint32_t fetch_dimension)
   {
     if (!REXCVAR_GET(sst_native_textures))
       return kNone;
@@ -725,9 +715,7 @@ namespace sst::native
       break;
     }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += size_t(slot) * srv_size_;
-    device_->CreateShaderResourceView(t->resource.Get(), &sd, h);
+    device_->WriteSrv(slot, *t->resource, sd);
     t->views.emplace(view_key, slot);
     return slot;
   }
@@ -814,9 +802,7 @@ namespace sst::native
       sd.Texture2D.MipLevels = 1;
     }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += size_t(slot) * srv_size_;
-    device_->CreateShaderResourceView(e.info.resource, &sd, h);
+    device_->WriteSrv(slot, *e.info.resource, sd);
     e.views.emplace(view_key, slot);
     return slot;
   }
@@ -883,9 +869,7 @@ namespace sst::native
     }
 
     const uint32_t slot = sampler_next_++;
-    D3D12_CPU_DESCRIPTOR_HANDLE h = sampler_heap_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += size_t(slot) * sampler_size_;
-    device_->CreateSampler(&d, h);
+    device_->WriteSampler(slot, d);
     samplers_.emplace(hash, slot);
     return slot;
   }

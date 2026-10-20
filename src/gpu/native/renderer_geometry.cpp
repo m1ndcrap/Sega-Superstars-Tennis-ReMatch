@@ -15,23 +15,16 @@ namespace sst::native
     if (!geo_pool_ && !geo_failed_)
     {
       geo_pool_size_ = uint64_t(std::min(REXCVAR_GET(sst_native_geometry_cache_mb), 4000)) << 20;
-      D3D12_RESOURCE_DESC bd = {};
-      bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      bd.Width = geo_pool_size_;
-      bd.Height = 1;
-      bd.DepthOrArraySize = 1;
-      bd.MipLevels = 1;
-      bd.SampleDesc.Count = 1;
-      bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      geo_pool_ = gfx_->CreateBuffer(geo_pool_size_, gfx::HeapType::kDefault, D3D12_RESOURCE_STATE_COMMON);
 
-      if (FAILED(device_->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&geo_pool_))))
+      if (!geo_pool_)
       {
         geo_failed_ = true;
         REXLOG_WARN("[sst-native] geometry cache: could not allocate {} MB", geo_pool_size_ >> 20);
         return false;
       }
 
-      geo_pool_->SetName(L"sst geometry cache");
+      geo_pool_->SetName("sst geometry cache");
 
       geo_state_ = D3D12_RESOURCE_STATE_COMMON;
       REXLOG_INFO("[sst-native] geometry cache: {} MB of video memory", geo_pool_size_ >> 20);
@@ -45,22 +38,21 @@ namespace sst::native
 
     if (geo_state_ != kRead)
     {
-      auto b = Transition(geo_pool_.Get(), geo_state_, kRead);
-      list_->ResourceBarrier(1, &b);
+      list_->Barrier(*geo_pool_, geo_state_, kRead);
       geo_state_ = kRead;
     }
 
     return true;
   }
 
-  D3D12_GPU_VIRTUAL_ADDRESS Renderer::GeoAddress(const GeoEntry &e) const
+  gfx::GpuAddress Renderer::GeoAddress(const GeoEntry &e) const
   {
-    return geo_pool_->GetGPUVirtualAddress() + e.offset;
+    return geo_pool_->gpu + e.offset;
   }
 
   void Renderer::GeoStore(GeoEntry &e, const Upload &src, uint32_t size)
   {
-    if (!geo_pool_ || !src.resource || !size)
+    if (!geo_pool_ || !src.buffer || !size)
       return;
 
     const uint64_t aligned = (uint64_t(size) + 255) & ~uint64_t(255);
@@ -77,11 +69,9 @@ namespace sst::native
     }
 
     const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER);
-    auto to_copy = Transition(geo_pool_.Get(), geo_state_, D3D12_RESOURCE_STATE_COPY_DEST);
-    list_->ResourceBarrier(1, &to_copy);
-    list_->CopyBufferRegion(geo_pool_.Get(), geo_offset_, src.resource, src.offset, size);
-    auto to_read = Transition(geo_pool_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
-    list_->ResourceBarrier(1, &to_read);
+    list_->Barrier(*geo_pool_, geo_state_, D3D12_RESOURCE_STATE_COPY_DEST);
+    list_->CopyBuffer(*geo_pool_, geo_offset_, *src.buffer, src.offset, size);
+    list_->Barrier(*geo_pool_, D3D12_RESOURCE_STATE_COPY_DEST, kRead);
     geo_state_ = kRead;
     e.offset = geo_offset_;
     e.size = size;

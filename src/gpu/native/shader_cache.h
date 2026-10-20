@@ -17,12 +17,8 @@
 
 #include <sst_translate.h>
 
+#include "gpu/native/gfx/gfx.h"
 #include "gpu/native/shader_pack.h"
-
-namespace rex::ui::d3d12
-{
-  class D3D12Provider;
-}
 
 namespace sst::native
 {
@@ -35,7 +31,7 @@ namespace sst::native
     kPixel
   };
 
-  // DXIL bytes: owned (compiled or read from disk) or a view into the exe's embedded shader pack
+  // Shader bytecode (DXIL or SPIR-V, see ShaderCache::format): owned (compiled or read from disk) or a view into the exe's embedded shader pack / another variant
   class DxilBlob
   {
   public:
@@ -87,7 +83,8 @@ namespace sst::native
       kFailed
     };
     std::atomic<State> state{State::kQueued};
-    DxilBlob dxil;                   // valid once kReady
+    DxilBlob dxil;                    // valid once kReady (DXIL or SPIR-V)
+    uint32_t spec = 0;                // SPIR-V: the value of specialization constant 0 (DXIL compiles it in: always 0)
     std::atomic<bool> claimed{false}; // a worker took its job (a boosted variant has two queued jobs; the second is skipped)
     std::atomic<bool> boosted{false}; // re-queued at the front because a draw needs it
   };
@@ -110,8 +107,8 @@ namespace sst::native
   class ShaderCache
   {
   public:
-    bool Initialize(const rex::ui::d3d12::D3D12Provider &provider,
-                    const std::filesystem::path &cache_dir);
+    // SPIR-V: one module per shader, shared by its variants (spec constant 0 picks the variant at pipeline creation); no embedded pack (it holds DXIL), compiled modules are kept in <cache_dir>/spirv
+    bool Initialize(gfx::ShaderFormat format, const std::filesystem::path &cache_dir);
     void Shutdown();
 
     // SHADER PRECISION: FAST in use (fixed at startup)
@@ -150,10 +147,10 @@ namespace sst::native
 
     std::filesystem::path FilePath(uint64_t hash, uint32_t spec) const;
 
-    const rex::ui::d3d12::D3D12Provider *provider_ = nullptr;
+    gfx::ShaderFormat format_ = gfx::ShaderFormat::kDxil;
     std::filesystem::path cache_dir_;
-    bool fast_ = false;         // SHADER PRECISION: FAST (sst_fast_shaders at startup, and the exe has the fast pack)
-    uint32_t version_ = 0;      // disk cache version: pack::CacheVersion(fast_)
+    bool fast_ = false;                    // SHADER PRECISION: FAST (sst_fast_shaders at startup, and the exe has the fast pack)
+    uint32_t version_ = 0;                 // disk cache version: pack::CacheVersion(fast_)
     std::filesystem::path containers_dir_; // <exe>/cache/containers: shaders missing from the pack, for the next build to bake
 
     mutable std::shared_mutex entries_mutex_;
@@ -174,7 +171,7 @@ namespace sst::native
     // "// dxc: <extra args>"); all.args adds DXC arguments to every shader. Overridden shaders bypass the pack and the disk cache.
     struct Override
     {
-      std::string source;            // replacement HLSL (empty = translate as usual)
+      std::string source;             // replacement HLSL (empty = translate as usual)
       std::vector<std::wstring> args; // extra DXC arguments
     };
 

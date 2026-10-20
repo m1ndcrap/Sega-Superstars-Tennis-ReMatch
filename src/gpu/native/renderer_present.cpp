@@ -6,40 +6,15 @@ namespace sst::native
 {
   using namespace renderer_detail;
 
+  // The blit layout (gfx::Layout::kBlit): b0 = 8 32-bit constants (source offset, flags, gamma; source rectangle for FXAA), t0 = source, s0 = linear clamp
   bool Renderer::CreateBlitResources()
   {
-    // Root signature: b0 = 8 root constants (source offset, flags, gamma; source rectangle for FXAA), t0 = source
-    D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-    D3D12_ROOT_PARAMETER params[2] = {};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 8};
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable = {1, &range};
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_STATIC_SAMPLER_DESC linear = {};
-    linear.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    linear.AddressU = linear.AddressV = linear.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    linear.MaxLOD = D3D12_FLOAT32_MAX;
-    linear.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_ROOT_SIGNATURE_DESC rs = {};
-    rs.NumParameters = 2;
-    rs.pParameters = params;
-    rs.NumStaticSamplers = 1;
-    rs.pStaticSamplers = &linear;
-    ComPtr<ID3DBlob> blob, error;
-
-    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) || FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&blit_root_))))
-      return false;
-
     static const char kVS[] = "float4 main(uint id : SV_VertexID) : SV_Position {\n"
                               "  float2 uv = float2((id << 1) & 2, id & 2);\n"
                               "  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
                               "}\n";
 
-    static const char kPS[] = "cbuffer C : register(b0) { int4 offset; };\n"
-                              "Texture2D<float4> src : register(t0);\n"
-                              "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    static const char kPS[] = "float4 main(float4 p : SV_Position) : SV_Target {\n"
                               "  float4 c = src.Load(int3(int2(p.xy) + offset.xy, 0));\n"
                               "  if (offset.z & 1) c = c.bgra;\n"
                               "  if (offset.w != 0) c.rgb = pow(saturate(c.rgb), asfloat(offset.w));\n"
@@ -47,9 +22,7 @@ namespace sst::native
                               "}\n";
 
     // offset.z: bit 0 swap red / blue, bits 8-15 source samples, bit 16 depth
-    static const char kPSMS[] = "cbuffer C : register(b0) { int4 offset; };\n"
-                                "Texture2DMS<float4> src : register(t0);\n"
-                                "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    static const char kPSMS[] = "float4 main(float4 p : SV_Position) : SV_Target {\n"
                                 "  int2 at = int2(p.xy) + offset.xy;\n"
                                 "  uint n = max((uint(offset.z) >> 8) & 0xFF, 1u);\n"
                                 "  float4 c = src.Load(at, 0);\n"
@@ -63,10 +36,7 @@ namespace sst::native
                                 "}\n";
 
     // FXAA (the compact 'console' variant: 4 diagonal luma taps, one blur direction, two / four taps along it)
-    static const char kPSFxaa[] = "cbuffer C : register(b0) { int4 offset; int4 rect; };\n"
-                                  "Texture2D<float4> src : register(t0);\n"
-                                  "SamplerState lin : register(s0);\n"
-                                  "static float2 lo_uv, hi_uv;\n"
+    static const char kPSFxaa[] = "static float2 lo_uv, hi_uv;\n"
                                   "float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
                                   // Taps stay inside the copied rectangle: with tiled rendering the rest of the source holds another tile's (older) pixels
                                   "float3 S(float2 uv) { return src.SampleLevel(lin, clamp(uv, lo_uv, hi_uv), 0).rgb; }\n"
@@ -99,39 +69,44 @@ namespace sst::native
                                   "  return c;\n"
                                   "}\n";
 
-    ComPtr<IDxcCompiler3> compiler;
+    // The blit layout's bindings: 'offset' / 'rect' (the 8 constants), 'src' (the source: Texture2D, or Texture2DMS with BLIT_MS), 'lin' (linear clamp). D3D12: root constants b0, t0, static sampler s0. Vulkan: push constants (+ the source's and the sampler's slots in the bindless tables, sets 0 and 3)
+    static const char kPrelude[] = "#ifdef __spirv__\n"
+                                   "struct BlitConstants { int4 offset; int4 rect; uint src_index; uint smp_index; };\n"
+                                   "[[vk::push_constant]] BlitConstants g_blit;\n"
+                                   "#define offset g_blit.offset\n"
+                                   "#define rect g_blit.rect\n"
+                                   "#ifdef BLIT_MS\n"
+                                   "[[vk::binding(0, 0)]] Texture2DMS<float4> g_textures[];\n"
+                                   "#else\n"
+                                   "[[vk::binding(0, 0)]] Texture2D<float4> g_textures[];\n"
+                                   "#endif\n"
+                                   "[[vk::binding(0, 3)]] SamplerState g_samplers[];\n"
+                                   "#define src g_textures[g_blit.src_index]\n"
+                                   "#define lin g_samplers[g_blit.smp_index]\n"
+                                   "#else\n"
+                                   "cbuffer C : register(b0) { int4 offset; int4 rect; };\n"
+                                   "#ifdef BLIT_MS\n"
+                                   "Texture2DMS<float4> src : register(t0);\n"
+                                   "#else\n"
+                                   "Texture2D<float4> src : register(t0);\n"
+                                   "#endif\n"
+                                   "SamplerState lin : register(s0);\n"
+                                   "#endif\n";
 
-    if (FAILED(provider_->DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
-      return false;
-
-    auto compile = [&](const char *source, const wchar_t *profile, std::vector<uint8_t> &out)
+    auto compile = [&](const char *source, const wchar_t *profile, std::vector<uint8_t> &out, bool ms = false)
     {
-      const wchar_t *args[] = {L"-T", profile, L"-E", L"main", L"-Qstrip_reflect", L"-Qstrip_debug"};
-      DxcBuffer buffer = {source, std::strlen(source), DXC_CP_UTF8};
-      ComPtr<IDxcResult> result;
-      HRESULT status = E_FAIL;
-
-      if (FAILED(compiler->Compile(&buffer, args, UINT32(std::size(args)), nullptr, IID_PPV_ARGS(&result))) || FAILED(result->GetStatus(&status)) || FAILED(status))
-        return false;
-
-      ComPtr<IDxcBlob> object;
-
-      if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) || !object)
-        return false;
-
-      const auto *b = static_cast<const uint8_t *>(object->GetBufferPointer());
-      out.assign(b, b + object->GetBufferSize());
-      return true;
+      const bool pixel = profile[0] == L'p';
+      const std::string full = pixel ? std::string(ms ? "#define BLIT_MS\n" : "") + kPrelude + source : std::string(source);
+      return CompileRendererShader(full.c_str(), profile, out);
     };
 
-    // FPS counter: c.xy = top-left (host pixels), c.z = font pixel size, c.w = frames per second x 10. 3x5 digits, drawn on a dark box
-    static const char kPSText[] = "cbuffer C : register(b0) { int4 c; };\n"
-                                  "static const uint kFont[11] = {0x7b6f, 0x2c97, 0x73e7, 0x73cf, 0x5bc9, 0x79cf, 0x79ef,\n"
+    // FPS counter: offset.xy = top-left (host pixels), offset.z = font pixel size, offset.w = frames per second x 10. 3x5 digits, drawn on a dark box
+    static const char kPSText[] = "static const uint kFont[11] = {0x7b6f, 0x2c97, 0x73e7, 0x73cf, 0x5bc9, 0x79cf, 0x79ef,\n"
                                   "                               0x7249, 0x7bef, 0x7bcf, 0x2};\n"
                                   "float4 main(float4 p : SV_Position) : SV_Target {\n"
-                                  "  int2 q = (int2(p.xy) - c.xy) / max(c.z, 1) - int2(1, 1);\n"
+                                  "  int2 q = (int2(p.xy) - offset.xy) / max(offset.z, 1) - int2(1, 1);\n"
                                   "  uint chars[5]; uint n = 0;\n"
-                                  "  uint v = uint(c.w) / 10, t = uint(c.w) % 10;\n"
+                                  "  uint v = uint(offset.w) / 10, t = uint(offset.w) % 10;\n"
                                   "  if (v >= 100) chars[n++] = (v / 100) % 10;\n"
                                   "  if (v >= 10) chars[n++] = (v / 10) % 10;\n"
                                   "  chars[n++] = v % 10; chars[n++] = 10; chars[n++] = t;\n"
@@ -144,50 +119,30 @@ namespace sst::native
                                   "  return col;\n"
                                   "}\n";
 
-    if (!compile(kVS, L"vs_6_0", blit_vs_) || !compile(kPS, L"ps_6_0", blit_ps_) || !compile(kPSText, L"ps_6_0", blit_ps_text_) || !compile(kPSMS, L"ps_6_0", blit_ps_ms_) || !compile(kPSFxaa, L"ps_6_0", blit_ps_fxaa_))
-    {
-      blit_root_.Reset();
-      return false;
-    }
-
-    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = kRtRtvCount;
-
-    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt_rtv_heap_))))
-      return false;
-
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    hd.NumDescriptors = kRtDsvCount;
-
-    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt_dsv_heap_))))
-      return false;
-
-    dsv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-    srv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    return true;
+    blit_ready_ = compile(kVS, L"vs_6_0", blit_vs_) && compile(kPS, L"ps_6_0", blit_ps_) && compile(kPSText, L"ps_6_0", blit_ps_text_) && compile(kPSMS, L"ps_6_0", blit_ps_ms_, true) && compile(kPSFxaa, L"ps_6_0", blit_ps_fxaa_);
+    return blit_ready_;
   }
 
-  ID3D12PipelineState *Renderer::GetBlitPipeline(DXGI_FORMAT format, uint32_t kind)
+  gfx::Pipeline *Renderer::GetBlitPipeline(DXGI_FORMAT format, uint32_t kind)
   {
     const uint32_t pso_key = uint32_t(format) | (kind << 16);
     auto it = blit_pipelines_.find(pso_key);
 
     if (it != blit_pipelines_.end())
-      return it->second.Get();
+      return it->second.get();
 
     const std::vector<uint8_t> &ps = kind == 1 ? blit_ps_ms_ : kind == 2 ? blit_ps_fxaa_
                                                            : kind == 3   ? blit_ps_text_
                                                                          : blit_ps_;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
-    d.pRootSignature = blit_root_.Get();
-    d.VS = {blit_vs_.data(), blit_vs_.size()};
-    d.PS = {ps.data(), ps.size()};
-    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    gfx::PipelineDesc d;
+    d.layout = gfx::Layout::kBlit;
+    d.vs = {blit_vs_.data(), blit_vs_.size(), 0};
+    d.ps = {ps.data(), ps.size(), 0};
+    d.blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 
     if (kind == 3)
     {
-      D3D12_RENDER_TARGET_BLEND_DESC &b = d.BlendState.RenderTarget[0];
+      D3D12_RENDER_TARGET_BLEND_DESC &b = d.blend.RenderTarget[0];
       b.BlendEnable = TRUE;
       b.SrcBlend = D3D12_BLEND_SRC_ALPHA;
       b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
@@ -198,64 +153,53 @@ namespace sst::native
       b.LogicOp = D3D12_LOGIC_OP_NOOP;
     }
 
-    d.SampleMask = UINT_MAX;
-    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    d.RasterizerState.DepthClipEnable = TRUE;
-    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    d.NumRenderTargets = 1;
-    d.RTVFormats[0] = format;
-    d.SampleDesc.Count = 1;
-    ComPtr<ID3D12PipelineState> pso;
-
-    if (FAILED(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso))))
-      pso = nullptr;
-
-    return blit_pipelines_.emplace(pso_key, pso).first->second.Get();
+    d.raster.FillMode = D3D12_FILL_MODE_SOLID;
+    d.raster.CullMode = D3D12_CULL_MODE_NONE;
+    d.raster.DepthClipEnable = TRUE;
+    d.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    d.rtv = format;
+    d.samples = 1;
+    gfx::PipelineRef pso = gfx_->CreatePipeline(d);
+    return blit_pipelines_.emplace(pso_key, pso).first->second.get();
   }
 
-  void Renderer::Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb, float gamma, uint32_t src_samples, bool fxaa)
+  void Renderer::Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, uint32_t rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb, float gamma, uint32_t src_samples, bool fxaa)
   {
     // src_samples: bits 0-7 MSAA samples of the source, 0x100 = depth source
     const uint32_t samples = std::max(src_samples & 0xFF, 1u);
     const uint32_t kind = samples > 1 ? 1 : fxaa ? 2
                                                  : 0;
-    ID3D12PipelineState *pso = GetBlitPipeline(format, kind);
+    gfx::Pipeline *pso = GetBlitPipeline(format, kind);
 
     if (!pso || dst.right <= dst.left || dst.bottom <= dst.top)
       return;
 
-    list_->SetGraphicsRootSignature(blit_root_.Get());
-    list_->SetPipelineState(pso);
+    list_->SetLayout(gfx::Layout::kBlit);
+    list_->SetPipeline(*pso);
     int32_t gamma_bits = 0;
 
     if (gamma > 0 && gamma != 1.0f)
       std::memcpy(&gamma_bits, &gamma, 4);
 
     const int32_t flags = (swap_rb ? 1 : 0) | int32_t(samples << 8) | int32_t((src_samples & 0x100) << 8);
-    const int32_t offset[8] = {src_x - dst.left, src_y - dst.top, flags, gamma_bits, src_x, src_y, src_x + (dst.right - dst.left), src_y + (dst.bottom - dst.top)};
-    list_->SetGraphicsRoot32BitConstants(0, 8, offset, 0);
-    list_->SetGraphicsRootDescriptorTable(1, SrvGpu(src_srv));
-    list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const int32_t offset[8] = {int32_t(src_x - dst.left), int32_t(src_y - dst.top), flags, gamma_bits, src_x, src_y, int32_t(src_x + (dst.right - dst.left)), int32_t(src_y + (dst.bottom - dst.top))};
+    list_->SetBlitConstants(offset, 8);
+    list_->SetBlitSource(src_srv);
+    list_->SetTargets(rtv, gfx::CommandList::kNoView);
 
     // The triangle covers the whole viewport; viewport + scissor = destination
     const D3D12_VIEWPORT vp = {float(dst.left), float(dst.top), float(dst.right - dst.left), float(dst.bottom - dst.top), 0, 1};
-    list_->RSSetViewports(1, &vp);
-    list_->RSSetScissorRects(1, &dst);
-    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list_->SetViewport(vp);
+    list_->SetScissor(dst);
+    list_->SetTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     NoteDraw(0, 1);
-    list_->DrawInstanced(3, 1, 0, 0);
+    list_->Draw(3, 0);
     RestoreDrawState();
   }
 
   void Renderer::RestoreDrawState()
   {
-    list_->SetGraphicsRootSignature(root_signature_.Get());
-
-    for (UINT i = 0; i < 3; ++i)
-      list_->SetGraphicsRootDescriptorTable(kRootTextures2D + i, srv_heap_->GetGPUDescriptorHandleForHeapStart());
-
-    list_->SetGraphicsRootDescriptorTable(kRootSamplers, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
+    list_->SetLayout(gfx::Layout::kDraw);
     bound_targets_ = 0;
   }
 
@@ -283,17 +227,16 @@ namespace sst::native
 
       if (present_source_->state != kShaderRead)
       {
-        auto b = Transition(present_source_->resource.Get(), present_source_->state, kShaderRead);
-        list_->ResourceBarrier(1, &b);
+        list_->Barrier(*present_source_->resource, present_source_->state, kShaderRead);
         present_source_->state = kShaderRead;
       }
 
-      Blit(present_source_->srv, 0, 0, Rtv(target_), D3D12Presenter::kGuestOutputFormat, full, present_source_->rb_swapped, gamma_);
+      Blit(present_source_->srv, 0, 0, Rtv(target_), kOutputFormat, full, present_source_->rb_swapped, gamma_);
     }
     else if (last_color_rt_ && last_color_rt_->srv)
     {
       SetRTState(*last_color_rt_, kShaderRead);
-      Blit(last_color_rt_->srv, 0, 0, Rtv(target_), D3D12Presenter::kGuestOutputFormat, full, false, gamma_, last_color_rt_->samples);
+      Blit(last_color_rt_->srv, 0, 0, Rtv(target_), kOutputFormat, full, false, gamma_, last_color_rt_->samples);
       SetRTState(*last_color_rt_, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
 
@@ -306,16 +249,9 @@ namespace sst::native
   void Renderer::DrawFpsCounter(const D3D12_RECT &output)
   {
     // Rate of new frames handed to the display, updated twice a second
-    LARGE_INTEGER qpc;
-    QueryPerformanceCounter(&qpc);
-    const uint64_t now = uint64_t(qpc.QuadPart), frames = shown_frames_.load(std::memory_order_relaxed);
-
-    static const double kFreq = []
-    {
-      LARGE_INTEGER f;
-      QueryPerformanceFrequency(&f);
-      return double(f.QuadPart);
-    }();
+    const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const uint64_t frames = shown_frames_.load(std::memory_order_relaxed);
+    constexpr double kFreq = 1e9;
 
     if (!fps_last_tick_)
     {
@@ -330,7 +266,7 @@ namespace sst::native
       fps_last_frames_ = frames;
     }
 
-    ID3D12PipelineState *pso = GetBlitPipeline(D3D12Presenter::kGuestOutputFormat, 3);
+    gfx::Pipeline *pso = GetBlitPipeline(kOutputFormat, 3);
 
     if (!pso)
       return;
@@ -340,18 +276,17 @@ namespace sst::native
     const int32_t chars = fps_tenths_ >= 1000 ? 5 : fps_tenths_ >= 100 ? 4
                                                                        : 3;
     const D3D12_RECT box = {px * 4, px * 4, px * 4 + px * (chars * 4 + 1), px * 4 + px * 7};
-    list_->SetGraphicsRootSignature(blit_root_.Get());
-    list_->SetPipelineState(pso);
-    const int32_t c[4] = {box.left, box.top, px, int32_t(fps_tenths_)};
-    list_->SetGraphicsRoot32BitConstants(0, 4, c, 0);
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(target_);
-    list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    list_->SetLayout(gfx::Layout::kBlit);
+    list_->SetPipeline(*pso);
+    const int32_t c[4] = {int32_t(box.left), int32_t(box.top), px, int32_t(fps_tenths_)};
+    list_->SetBlitConstants(c, 4);
+    list_->SetTargets(Rtv(target_), gfx::CommandList::kNoView);
     const D3D12_VIEWPORT vp = {float(box.left), float(box.top), float(box.right - box.left), float(box.bottom - box.top), 0, 1};
-    list_->RSSetViewports(1, &vp);
-    list_->RSSetScissorRects(1, &box);
-    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list_->SetViewport(vp);
+    list_->SetScissor(box);
+    list_->SetTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     NoteDraw(0, 1);
-    list_->DrawInstanced(3, 1, 0, 0);
+    list_->Draw(3, 0);
     RestoreDrawState();
   }
 
@@ -375,7 +310,7 @@ namespace sst::native
     return height_ > 720 ? 1.0f : kAspects[DisplayAspect()] / (16.0f / 9.0f);
   }
 
-  ID3D12Resource *Renderer::Acquire(uint32_t *slot, uint32_t *width, uint32_t *height)
+  gfx::Texture *Renderer::Acquire(uint32_t *slot, uint32_t *width, uint32_t *height)
   {
     std::unique_lock lock(slot_mutex_);
 
@@ -393,7 +328,7 @@ namespace sst::native
         *slot = uint32_t(acquired_slot_);
         *width = PxU(width_, output_scale_[acquired_slot_].x);
         *height = PxU(height_, output_scale_[acquired_slot_].y);
-        return outputs_[acquired_slot_].Get();
+        return outputs_[acquired_slot_].get();
       }
     }
 
@@ -452,7 +387,7 @@ namespace sst::native
     *slot = uint32_t(pick);
     *width = PxU(width_, output_scale_[pick].x);
     *height = PxU(height_, output_scale_[pick].y);
-    return outputs_[pick].Get();
+    return outputs_[pick].get();
   }
 
   void Renderer::Release(uint32_t slot)

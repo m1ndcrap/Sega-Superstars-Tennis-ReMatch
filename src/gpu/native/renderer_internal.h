@@ -1,4 +1,4 @@
-// Native renderer: what the renderer_*.cpp files share (includes, options, guest-memory and D3D12 helpers, the pipeline key). Private to the renderer.
+// Native renderer: what the renderer_*.cpp files share (includes, options, guest-memory and state helpers, the pipeline key). Private to the renderer.
 
 #pragma once
 
@@ -13,11 +13,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/system/xmemory.h>
-#include <rex/ui/d3d12/d3d12_presenter.h>
-#include <rex/ui/d3d12/d3d12_provider.h>
-#include <rex/ui/d3d12/d3d12_util.h>
 #include <xxhash.h>
-#include <dxcapi.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <bit>
@@ -78,32 +74,29 @@ REXCVAR_DECLARE(int32_t, sst_aspect);
 
 namespace sst::native
 {
-
-  using Microsoft::WRL::ComPtr;
-  using rex::ui::d3d12::D3D12Presenter;
-  using rex::ui::d3d12::D3D12Provider;
-
   namespace renderer_detail
   {
     constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+
+    // The presenter's guest output format (the SDK's D3D12 / Vulkan presenters: 10:10:10:2 UNORM)
+    constexpr DXGI_FORMAT kOutputFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+
+    // A debug hotkey (F9 capture, F10 render-target trace, bisect keys) was pressed since the last check. Windows virtual-key codes
+    inline bool DebugKeyPressed(int vk)
+    {
+#if defined(_WIN32)
+      return (GetAsyncKeyState(vk) & 1) != 0;
+#else
+      (void)vk;
+      return false;
+#endif
+    }
+
+    // Read in shaders (pixel and other stages)
+    inline const D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     constexpr size_t kUploadPageSize = 32u << 20;
     constexpr uint32_t kMaxDrawVertices = 1u << 20;
     constexpr uint32_t kMaxDrawIndices = 1u << 21;
-
-    // Root parameters (XenosRecomp D3D12 layout + SST raw-constant views)
-    enum RootParam : UINT
-    {
-      kRootVSConstants = 0, // b0 space4
-      kRootPSConstants,     // b1 space4
-      kRootShared,          // b2 space4
-      kRootVSConstantsRaw,  // b3 space4 (same buffer as b0)
-      kRootPSConstantsRaw,  // b4 space4 (same buffer as b1)
-      kRootTextures2D,      // t0 space0 (unbounded)
-      kRootTextures3D,      // t0 space1
-      kRootTexturesCube,    // t0 space2
-      kRootSamplers,        // s0 space3
-      kRootCount
-    };
 
     // Placeholder descriptor indices (heap slots)
     constexpr uint32_t kPlaceholder2D = 0, kPlaceholder3D = 1, kPlaceholderCube = 2;
@@ -294,17 +287,6 @@ namespace sst::native
     // Fetch constants: slot j (2 dwords) at +0x480 + 8j. Textures use 3 slots each (sampler i = slots 3i..3i+2); vertex stream s is slot 95 - s
     constexpr uint32_t kDevFetchConstants = 0x480;
 
-    inline D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-    {
-      D3D12_RESOURCE_BARRIER b = {};
-      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-      b.Transition.pResource = r;
-      b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-      b.Transition.StateBefore = before;
-      b.Transition.StateAfter = after;
-      return b;
-    }
-
     inline D3D12_BLEND BlendFactor(uint32_t f, bool alpha)
     {
       switch (f)
@@ -473,7 +455,6 @@ namespace sst::native
       }
     }
 
-    inline const D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
 
   // render targets: resolves + trace
@@ -510,11 +491,10 @@ namespace sst::native
   struct PipelineJob
   {
     uint64_t hash = 0;
-    std::wstring name; // library name (stable across runs)
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
-    std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
-    ComPtr<ID3D12PipelineState> pso;
-    HRESULT hr = S_OK;
+    std::wstring name; // pipeline cache name (stable across runs)
+    gfx::PipelineDesc desc;
+    gfx::PipelineRef pso;
+    int32_t error = 0; // the backend's failure code
     bool from_library = false;
     double ms = 0;
     std::atomic<int> state{0}; // 0 pending, 1 done, 2 failed

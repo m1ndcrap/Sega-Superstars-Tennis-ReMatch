@@ -1,7 +1,6 @@
-// sst_shader_bake - build-time shader compiler for sst_rematch. Finds every Xbox 360 shader container in the game's ShaderCache code-cache
-// files (and, optionally, raw containers dumped with --sst_dump_shaders), translates each with the vendored XenosRecomp, compiles every
-// spec-constant variant the renderer can request with DXC, and writes one pack (src/gpu/native/shader_pack.h) that CMake embeds in the exe.
-// Players then never compile these shaders.
+// sst_shader_bake - build-time shader compiler for sst_rematch. Finds every Xbox 360 shader container in the game's ShaderCache code-cache files (and, optionally, raw containers dumped with --sst_dump_shaders), translates each with the vendored XenosRecomp, compiles every
+// spec-constant variant the renderer can request with DXC, and writes one pack (src/gpu/native/shader_pack.h) that CMake embeds in the exe. Players then never compile these shaders.
+// --spirv: SPIR-V for the Vulkan renderer instead (one module per shader: the variant is a specialization constant), compressed with the portable planar LZ codec; CMake puts it next to the exe (shaders/spirv*.pack). Builds and runs on Windows and Linux.
 
 #include <sst_translate.h>
 
@@ -9,14 +8,13 @@
 
 #include <xxhash.h>
 
-#ifndef NOMINMAX
-#define NOMINMAX // windows.h would otherwise turn std::max / std::min into macros
-#endif
-#include <windows.h>
+#include "gpu/native/dxc.h" // (dxcapi.h, windows.h on Windows, and dxc::Ref)
 
+#if defined(_WIN32)
 #include <compressapi.h>
-#include <dxcapi.h>
-#include <wrl/client.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -35,7 +33,8 @@
 
 namespace fs = std::filesystem;
 namespace pack = sst::native::pack;
-using Microsoft::WRL::ComPtr;
+template <class T>
+using Ref = sst::native::dxc::Ref<T>;
 
 namespace
 {
@@ -100,7 +99,8 @@ namespace
     fs::path out, dxc, work;
     std::vector<fs::path> game, dump;
     bool no_compress = false;
-    bool fast = false; // SHADER PRECISION: FAST pack (-DSST_FAST_MATH)
+    bool fast = false;  // SHADER PRECISION: FAST pack (-DSST_FAST_MATH)
+    bool spirv = false; // SPIR-V (Vulkan) instead of DXIL
   };
 
   bool ParseArgs(int argc, char **argv, Options &o)
@@ -118,6 +118,12 @@ namespace
       if (a == "--fast")
       {
         o.fast = true;
+        continue;
+      }
+
+      if (a == "--spirv")
+      {
+        o.spirv = true;
         continue;
       }
 
@@ -150,20 +156,33 @@ int main(int argc, char **argv)
 
   if (!ParseArgs(argc, argv, opt))
   {
-    std::fprintf(stderr, "usage: sst_shader_bake --out <pack> --dxc <dir> [--fast] [--work <dir>] [--game <dir>]... [--dump <dir>]...\n");
+    std::fprintf(stderr, "usage: sst_shader_bake --out <pack> --dxc <dir> [--fast] [--spirv] [--work <dir>] [--game <dir>]... [--dump <dir>]...\n");
     return 2;
   }
 
   const auto t0 = std::chrono::steady_clock::now();
 
+#if defined(_WIN32)
   // DXC: dxcompiler.dll loads dxil.dll (the signer) by name later, so its folder goes on the DLL search path
+  const fs::path dxc_path = opt.dxc / "dxcompiler.dll";
   SetDllDirectoryW(opt.dxc.wstring().c_str());
-  HMODULE dxc = LoadLibraryExW((opt.dxc / "dxcompiler.dll").wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+  HMODULE dxc = LoadLibraryExW(dxc_path.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
   auto create = dxc ? reinterpret_cast<DxcCreateInstanceProc>(reinterpret_cast<void *>(GetProcAddress(dxc, "DxcCreateInstance"))) : nullptr;
+#else
+  const fs::path dxc_path = opt.dxc / "libdxcompiler.so";
+  void *dxc = dlopen(dxc_path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
+  auto create = dxc ? reinterpret_cast<DxcCreateInstanceProc>(dlsym(dxc, "DxcCreateInstance")) : nullptr;
+
+  if (!opt.spirv)
+  {
+    std::fprintf(stderr, "sst_shader_bake: DXIL packs are built on Windows only (use --spirv)\n");
+    return 1;
+  }
+#endif
 
   if (!create)
   {
-    std::fprintf(stderr, "sst_shader_bake: can't load %s\n", (opt.dxc / "dxcompiler.dll").string().c_str());
+    std::fprintf(stderr, "sst_shader_bake: can't load %s\n", dxc_path.string().c_str());
     return 1;
   }
 
@@ -244,9 +263,9 @@ int main(int argc, char **argv)
 
   auto work = [&]
   {
-    ComPtr<IDxcCompiler3> compiler;
+    Ref<IDxcCompiler3> compiler;
 
-    if (FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
+    if (FAILED(create(CLSID_DxcCompiler, __uuidof(IDxcCompiler3), compiler.put())))
       return;
 
     for (size_t i; (i = next.fetch_add(1)) < list.size();)
@@ -266,26 +285,41 @@ int main(int argc, char **argv)
       }
       else
       {
-        const uint32_t bits = tr.spec_constants_mask & pack::RuntimeSpecBits(tr.pixel_shader);
+        // SPIR-V: one module (variant 0), the variants are specialization constants
+        const uint32_t bits = opt.spirv ? 0 : tr.spec_constants_mask & pack::RuntimeSpecBits(tr.pixel_shader);
 
         // Every subset of `bits`, 0 included
         for (uint32_t spec = bits;; spec = (spec - 1) & bits)
         {
           Result r;
           r.entry = {s.hash, spec, tr.spec_constants_mask, 0, 0};
-          const std::string source = tr.hlsl + sst::xenos::SpecConstantsDefinition(spec);
+          const std::string source = opt.spirv ? tr.hlsl : tr.hlsl + sst::xenos::SpecConstantsDefinition(spec);
           const wchar_t *profile = tr.pixel_shader ? L"ps_6_0" : L"vs_6_0";
-          uint64_t source_hash = XXH3_64bits(source.data(), source.size());
-          source_hash = XXH3_64bits_withSeed(profile, std::wcslen(profile) * sizeof(wchar_t), source_hash);
+          // Same arguments as the runtime shader cache
+          std::vector<const wchar_t *> args = {L"-T", profile};
 
-          for (const wchar_t *a : pack::kDxcArgs)
-            source_hash = XXH3_64bits_withSeed(a, std::wcslen(a) * sizeof(wchar_t), source_hash);
+          if (opt.spirv)
+          {
+            args.insert(args.end(), std::begin(pack::kDxcSpirvArgs), std::end(pack::kDxcSpirvArgs));
+
+            if (!tr.pixel_shader)
+              args.push_back(pack::kDxcSpirvVsArg);
+          }
+          else
+          {
+            args.insert(args.end(), std::begin(pack::kDxcArgs), std::end(pack::kDxcArgs));
+          }
 
           if (opt.fast)
-            source_hash = XXH3_64bits_withSeed(pack::kFastMathArg, std::wcslen(pack::kFastMathArg) * sizeof(wchar_t), source_hash);
+            args.push_back(pack::kFastMathArg);
+
+          uint64_t source_hash = XXH3_64bits(source.data(), source.size());
+
+          for (const wchar_t *a : args)
+            source_hash = XXH3_64bits_withSeed(a, std::wcslen(a) * sizeof(wchar_t), source_hash);
 
           char name[48];
-          std::snprintf(name, sizeof(name), "%016llX_%u.dxil", (unsigned long long)s.hash, spec);
+          std::snprintf(name, sizeof(name), "%016llX_%u.%s", (unsigned long long)s.hash, spec, opt.spirv ? "spv" : "dxil");
           const fs::path cached = opt.work.empty() ? fs::path() : opt.work / name;
 
           // Work cache
@@ -298,7 +332,7 @@ int main(int argc, char **argv)
             {
               std::memcpy(&h, data.data(), sizeof(h));
 
-              if (h.magic == kWorkMagic && h.source_hash == source_hash && h.size == data.size() - sizeof(h) && IsSigned(data.data() + sizeof(h), h.size))
+              if (h.magic == kWorkMagic && h.source_hash == source_hash && h.size == data.size() - sizeof(h) && (opt.spirv || IsSigned(data.data() + sizeof(h), h.size)))
               {
                 r.dxil.assign(data.begin() + sizeof(h), data.end());
                 ++reused;
@@ -308,23 +342,18 @@ int main(int argc, char **argv)
 
           if (r.dxil.empty())
           {
-            std::vector<const wchar_t *> args = {L"-T", profile};
-            args.insert(args.end(), std::begin(pack::kDxcArgs), std::end(pack::kDxcArgs));
-
-            if (opt.fast)
-              args.push_back(pack::kFastMathArg);
             DxcBuffer buffer = {source.data(), source.size(), DXC_CP_UTF8};
-            ComPtr<IDxcResult> result;
+            Ref<IDxcResult> result;
             HRESULT status = E_FAIL;
-            ComPtr<IDxcBlob> object;
+            Ref<IDxcBlob> object;
 
-            if (SUCCEEDED(compiler->Compile(&buffer, args.data(), UINT32(args.size()), nullptr, IID_PPV_ARGS(&result))) && SUCCEEDED(result->GetStatus(&status)) && SUCCEEDED(status) && SUCCEEDED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) && object && object->GetBufferSize())
+            if (SUCCEEDED(compiler->Compile(&buffer, const_cast<LPCWSTR *>(args.data()), UINT32(args.size()), nullptr, __uuidof(IDxcResult), result.put())) && SUCCEEDED(result->GetStatus(&status)) && SUCCEEDED(status) && SUCCEEDED(result->GetOutput(DXC_OUT_OBJECT, __uuidof(IDxcBlob), object.put(), nullptr)) && object && object->GetBufferSize())
             {
               const auto *b = static_cast<const uint8_t *>(object->GetBufferPointer());
               r.dxil.assign(b, b + object->GetBufferSize());
               ++compiled;
 
-              if (!IsSigned(r.dxil.data(), r.dxil.size()))
+              if (!opt.spirv && !IsSigned(r.dxil.data(), r.dxil.size()))
                 ++unsigned_dxil;
               else if (!cached.empty())
               {
@@ -344,9 +373,9 @@ int main(int argc, char **argv)
             {
               ++failed;
               std::string errors;
-              ComPtr<IDxcBlobUtf8> err;
+              Ref<IDxcBlobUtf8> err;
 
-              if (result && SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&err), nullptr)) && err && err->GetStringLength())
+              if (result && SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, __uuidof(IDxcBlobUtf8), err.put(), nullptr)) && err && err->GetStringLength())
                 errors.assign(err->GetStringPointer(), std::min<size_t>(err->GetStringLength(), 400));
 
               std::fprintf(stderr, "sst_shader_bake: %016llX variant %u: DXC failed: %s\n", (unsigned long long)s.hash, spec, errors.c_str());
@@ -387,9 +416,7 @@ int main(int argc, char **argv)
 
   if (unsigned_dxil)
   {
-    std::fprintf(stderr, "sst_shader_bake: %u shaders came out unsigned: dxil.dll must sit next to dxcompiler.dll in %s. "
-                         "D3D12 rejects unsigned DXIL, so no pack was written.\n",
-                 unsigned_dxil.load(), opt.dxc.string().c_str());
+    std::fprintf(stderr, "sst_shader_bake: %u shaders came out unsigned: dxil.dll must sit next to dxcompiler.dll in %s. D3D12 rejects unsigned DXIL, so no pack was written.\n", unsigned_dxil.load(), opt.dxc.string().c_str());
     return 1;
   }
 
@@ -418,7 +445,7 @@ int main(int argc, char **argv)
   // The pack in memory, then compressed for the exe (DXIL shrinks a lot; the runtime unpacks it once at startup)
   std::vector<uint8_t> raw(offset, 0);
   {
-    const pack::Header h = {pack::kMagic, pack::kFormat, pack::CacheVersion(opt.fast), uint32_t(results.size())};
+    const pack::Header h = {pack::kMagic, pack::kFormat, pack::CacheVersion(opt.fast, opt.spirv), uint32_t(results.size())};
     std::memcpy(raw.data(), &h, sizeof(h));
     size_t pos = sizeof(h);
 
@@ -433,9 +460,19 @@ int main(int argc, char **argv)
   }
 
   std::vector<uint8_t> file;
+
+  if (!opt.no_compress && opt.spirv)
+  {
+    file = pack::CompressPlanar(raw);
+
+    if (file.size() >= raw.size())
+      file.clear();
+  }
+
+#if defined(_WIN32)
   COMPRESSOR_HANDLE compressor = nullptr;
 
-  if (!opt.no_compress && CreateCompressor(pack::kAlgorithmXpressHuff, nullptr, &compressor))
+  if (!opt.no_compress && !opt.spirv && CreateCompressor(pack::kAlgorithmXpressHuff, nullptr, &compressor))
   {
     SIZE_T needed = 0;
     Compress(compressor, raw.data(), raw.size(), nullptr, 0, &needed); // asks for the output size
@@ -459,6 +496,7 @@ int main(int argc, char **argv)
 
     CloseCompressor(compressor);
   }
+#endif
 
   if (file.empty())
   {
@@ -493,7 +531,6 @@ int main(int argc, char **argv)
   }
 
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  std::printf("sst_shader_bake: %zu variants of %zu shaders (%u compiled, %u reused, %u failed), %.1f MB of DXIL, %.1f MB in the exe -> %s in %.1f s\n",
-              results.size(), list.size(), compiled.load(), reused.load(), failed.load(), double(dxil_bytes) / (1 << 20), double(file.size()) / (1 << 20), opt.out.string().c_str(), s);
+  std::printf("sst_shader_bake: %zu variants of %zu shaders (%u compiled, %u reused, %u failed), %.1f MB of %s, %.1f MB packed -> %s in %.1f s\n", results.size(), list.size(), compiled.load(), reused.load(), failed.load(), double(dxil_bytes) / (1 << 20), opt.spirv ? "SPIR-V" : "DXIL", double(file.size()) / (1 << 20), opt.out.string().c_str(), s);
   return 0;
 }

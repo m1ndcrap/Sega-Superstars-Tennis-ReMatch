@@ -47,7 +47,7 @@ namespace sst::native
     FetchStream fetch_streams[kMaxStreams];
     uint32_t fetch_stream_count = 0;
     std::vector<HostElement> host_elements;
-    std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
+    std::vector<gfx::InputElement> layout;
     static constexpr size_t kLayoutHashWords = 64;
     uint64_t layout_hash_input[kLayoutHashWords]; // what the layout is made of (hashed into the pipeline key)
     uint32_t layout_words = 0;
@@ -91,10 +91,10 @@ namespace sst::native
     std::vector<uint32_t> rect_indices; // RECTLIST (4 vertices per rectangle)
 
     // What gets recorded
-    ID3D12PipelineState *pso = nullptr;
+    gfx::Pipeline *pso = nullptr;
     uint32_t draw_count = 0;
     bool draw_indexed = false;
-    D3D12_GPU_VIRTUAL_ADDRESS vsc_gpu = 0, psc_gpu = 0, shared_gpu = 0;
+    gfx::GpuAddress vsc_gpu = 0, psc_gpu = 0, shared_gpu = 0;
     float half_x = 0, half_y = 0; // half-pixel offset (F9 capture)
   };
 }

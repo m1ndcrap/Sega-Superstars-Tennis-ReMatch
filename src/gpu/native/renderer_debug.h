@@ -39,7 +39,7 @@ namespace sst::native::renderer_detail
       if (!REXCVAR_GET(sst_native_debug_bisect))
         return;
 
-      if (GetAsyncKeyState(VK_HOME) & 1)
+      if (DebugKeyPressed(0x24)) // Home
       {
         candidates.assign(recent.begin(), recent.end());
         std::sort(candidates.begin(), candidates.end());
@@ -47,19 +47,19 @@ namespace sst::native::renderer_detail
         Split();
         Log("start");
       }
-      else if (active && (GetAsyncKeyState(VK_PRIOR) & 1))
+      else if (active && DebugKeyPressed(0x21)) // Page Up
       { // still visible: the culprit is among the shown ones
         candidates.erase(candidates.begin(), candidates.begin() + ptrdiff_t(hidden));
         Split();
         Log("still visible");
       }
-      else if (active && (GetAsyncKeyState(VK_NEXT) & 1))
+      else if (active && DebugKeyPressed(0x22)) // Page Down
       { // gone: the culprit is among the hidden ones
         candidates.resize(hidden);
         Split();
         Log("gone");
       }
-      else if (GetAsyncKeyState(VK_END) & 1)
+      else if (DebugKeyPressed(0x23)) // End
       {
         active = false;
         recent.clear();

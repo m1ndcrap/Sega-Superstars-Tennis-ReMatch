@@ -1,4 +1,4 @@
-// Native renderer: pipeline state objects
+// Native renderer: pipelines
 
 #include "gpu/native/renderer_internal.h"
 #include "gpu/native/pipeline_workers.h"
@@ -16,7 +16,7 @@ namespace sst::native
     auto [it, fresh] = dxil_hashes_.try_emplace(v, 0);
 
     if (fresh)
-      it->second = XXH3_64bits(v->dxil.data(), v->dxil.size());
+      it->second = v->spec ? XXH3_64bits_withSeed(v->dxil.data(), v->dxil.size(), v->spec) : XXH3_64bits(v->dxil.data(), v->dxil.size()); // (SPIR-V variants share a module)
 
     return it->second;
   }
@@ -42,20 +42,20 @@ namespace sst::native
     {
       std::string inputs;
 
-      for (const auto &e : job.layout)
-        inputs += fmt::format(" {}{}:{}@{}+{}", e.SemanticName, e.SemanticIndex, int(e.Format), e.InputSlot, e.AlignedByteOffset);
+      for (const auto &e : job.desc.inputs)
+        inputs += fmt::format(" {}{}:{}@{}+{}", e.d3d.SemanticName, e.d3d.SemanticIndex, int(e.d3d.Format), e.d3d.InputSlot, e.d3d.AlignedByteOffset);
 
-      REXLOG_WARN("[sst-native] pipeline creation failed ({:08X}): blend {:08X} topology {} inputs{}", uint32_t(job.hr), key.blend, key.topology_type, inputs);
+      REXLOG_WARN("[sst-native] pipeline creation failed ({:08X}): blend {:08X} topology {} inputs{}", uint32_t(job.error), key.blend, key.topology_type, inputs);
     }
   }
 
   // urgent: a UI-like draw (no depth test, few vertices). Skipping it while its pipeline compiles makes menus and HUD blink out, and on slow CPUs (one background compile thread) a pipeline can wait behind a court's worth of others for seconds.
-  ID3D12PipelineState *Renderer::GetPipeline(const PipelineKey &key, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const ShaderVariant *vs, const ShaderVariant *ps, bool urgent)
+  gfx::Pipeline *Renderer::GetPipeline(const PipelineKey &key, const std::vector<gfx::InputElement> &layout, const ShaderVariant *vs, const ShaderVariant *ps, bool urgent)
   {
     const uint64_t hash = XXH3_64bits(&key, sizeof(key));
 
     if (auto it = pipelines_.find(hash); it != pipelines_.end())
-      return it->second.Get();
+      return it->second.get();
 
     if (failed_pipelines_.count(hash))
       return nullptr;
@@ -83,24 +83,24 @@ namespace sst::native
       FinishPipeline(hash, *it->second, key);
       pending_pipelines_.erase(it);
       auto done = pipelines_.find(hash);
-      return done != pipelines_.end() ? done->second.Get() : nullptr;
+      return done != pipelines_.end() ? done->second.get() : nullptr;
     }
 
     if (!pipeline_workers_)
     {
       const uint32_t threads = std::clamp(uint32_t(std::thread::hardware_concurrency()) / 4, 1u, 4u);
-      pipeline_workers_ = std::make_unique<PipelineWorkers>(device_, threads, REXCVAR_GET(sst_native_pipeline_library), shaders_ && shaders_->fast());
+      pipeline_workers_ = std::make_unique<PipelineWorkers>(*gfx_, threads, REXCVAR_GET(sst_native_pipeline_library), shaders_ && shaders_->fast());
     }
 
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
-    d.pRootSignature = root_signature_.Get();
-    d.VS = {vs->dxil.data(), vs->dxil.size()};
+    gfx::PipelineDesc d;
+    d.layout = gfx::Layout::kDraw;
+    d.vs = {vs->dxil.data(), vs->dxil.size(), vs->spec};
 
     if (ps)
-      d.PS = {ps->dxil.data(), ps->dxil.size()}; // null: depth-only
+      d.ps = {ps->dxil.data(), ps->dxil.size(), ps->spec}; // null: depth-only
 
     const uint32_t b = key.blend;
-    D3D12_RENDER_TARGET_BLEND_DESC &rt = d.BlendState.RenderTarget[0];
+    D3D12_RENDER_TARGET_BLEND_DESC &rt = d.blend.RenderTarget[0];
     rt.SrcBlend = BlendFactor(b & 0x1F, false);
     rt.BlendOp = BlendOp((b >> 5) & 7);
     rt.DestBlend = BlendFactor((b >> 8) & 0x1F, false);
@@ -110,37 +110,34 @@ namespace sst::native
     rt.BlendEnable = !(rt.SrcBlend == D3D12_BLEND_ONE && rt.DestBlend == D3D12_BLEND_ZERO && rt.BlendOp == D3D12_BLEND_OP_ADD && rt.SrcBlendAlpha == D3D12_BLEND_ONE && rt.DestBlendAlpha == D3D12_BLEND_ZERO && rt.BlendOpAlpha == D3D12_BLEND_OP_ADD);
     rt.LogicOp = D3D12_LOGIC_OP_NOOP;
     rt.RenderTargetWriteMask = key.color_mask;
-    d.SampleMask = UINT_MAX;
 
-    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    d.RasterizerState.CullMode = key.cull == 1 ? D3D12_CULL_MODE_FRONT : key.cull == 2 ? D3D12_CULL_MODE_BACK
-                                                                                       : D3D12_CULL_MODE_NONE;
-    d.RasterizerState.FrontCounterClockwise = key.front_ccw;
-    d.RasterizerState.DepthClipEnable = TRUE;
-    d.RasterizerState.DepthBias = key.depth_bias;
-    d.RasterizerState.SlopeScaledDepthBias = key.slope_bias;
+    d.raster.FillMode = D3D12_FILL_MODE_SOLID;
+    d.raster.CullMode = key.cull == 1 ? D3D12_CULL_MODE_FRONT : key.cull == 2 ? D3D12_CULL_MODE_BACK
+                                                                              : D3D12_CULL_MODE_NONE;
+    d.raster.FrontCounterClockwise = key.front_ccw;
+    d.raster.DepthClipEnable = TRUE;
+    d.raster.DepthBias = key.depth_bias;
+    d.raster.SlopeScaledDepthBias = key.slope_bias;
 
-    d.DepthStencilState.DepthEnable = key.depth_enable;
-    d.DepthStencilState.DepthWriteMask = key.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(key.depth_func + 1); // xenos 0-7
+    d.depth.DepthEnable = key.depth_enable;
+    d.depth.DepthWriteMask = key.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    d.depth.DepthFunc = D3D12_COMPARISON_FUNC(key.depth_func + 1); // xenos 0-7
 
-    d.InputLayout = {layout.data(), UINT(layout.size())};
-    d.IBStripCutValue = key.strip_cut == 1 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : key.strip_cut == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
-                                                                                                            : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    d.inputs = layout;
+    d.strip_cut = key.strip_cut == 1 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : key.strip_cut == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
+                                                                                                      : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
 
-    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE(key.topology_type);
-    d.NumRenderTargets = 1;
-    d.RTVFormats[0] = key.rtv_format ? DXGI_FORMAT(key.rtv_format) : D3D12Presenter::kGuestOutputFormat;
+    d.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(key.topology_type);
+    d.rtv = key.rtv_format ? DXGI_FORMAT(key.rtv_format) : kOutputFormat;
     const uint32_t dsv_kind = key.dsv & 0xF;
-    d.DSVFormat = dsv_kind == 0 ? kDepthFormat : dsv_kind == 2 ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                                                               : DXGI_FORMAT_UNKNOWN;
+    d.dsv = dsv_kind == 0 ? kDepthFormat : dsv_kind == 2 ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                                         : DXGI_FORMAT_UNKNOWN;
 
-    d.SampleDesc.Count = 1u << (key.dsv >> 4);
+    d.samples = 1u << (key.dsv >> 4);
 
     auto job = std::make_shared<PipelineJob>();
     job->hash = hash;
-    job->layout = layout;
-    job->desc = d;
+    job->desc = std::move(d);
 
     // Library name: everything in the key, with the shaders by content (the variant pointers differ between runs)
     {
@@ -158,7 +155,7 @@ namespace sst::native
       {
         FinishPipeline(hash, *job, key);
         auto done = pipelines_.find(hash);
-        return done != pipelines_.end() ? done->second.Get() : nullptr;
+        return done != pipelines_.end() ? done->second.get() : nullptr;
       }
 
       pending_pipelines_.emplace(hash, job);
@@ -177,6 +174,6 @@ namespace sst::native
 
     FinishPipeline(hash, *job, key);
     auto done = pipelines_.find(hash);
-    return done != pipelines_.end() ? done->second.Get() : nullptr;
+    return done != pipelines_.end() ? done->second.get() : nullptr;
   }
 }

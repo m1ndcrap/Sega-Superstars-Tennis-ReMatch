@@ -1,4 +1,4 @@
-// Native renderer: D3D12 frame recording and draw submission
+// Native renderer: frame recording and draw submission (through the gfx backend)
 
 #pragma once
 
@@ -14,21 +14,15 @@
 #include <unordered_set>
 #include <vector>
 
+#include "gpu/native/gfx/gfx.h"
 #include "gpu/native/memexport.h"
 #include "gpu/native/texture_cache.h"
 
-#include <d3d12.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <x86intrin.h>
 #endif
-#include <wrl/client.h>
-
-namespace rex::ui::d3d12
-{
-  class D3D12Provider;
-}
 
 namespace sst::native
 {
@@ -89,7 +83,7 @@ namespace sst::native
     ~Renderer();
 
     // physical_membase: host address of guest physical memory (fetch constants hold physical addresses)
-    bool Initialize(const rex::ui::d3d12::D3D12Provider &provider, ShaderCache *shaders, const uint8_t *physical_membase, uint32_t width, uint32_t height);
+    bool Initialize(std::unique_ptr<gfx::Device> device, ShaderCache *shaders, const uint8_t *physical_membase, uint32_t width, uint32_t height);
     void Shutdown();
 
     // render thread
@@ -126,21 +120,22 @@ namespace sst::native
     void SetThreaded(bool threaded) { threaded_ = threaded; }
 
     // plugin (command-processor thread)
-    ID3D12Resource *Acquire(uint32_t *slot, uint32_t *width, uint32_t *height);
+    gfx::Texture *Acquire(uint32_t *slot, uint32_t *width, uint32_t *height);
     void Release(uint32_t slot);
+
+    gfx::Device *device() const { return gfx_.get(); }
 
   private:
     struct UploadPage
     {
-      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      gfx::BufferRef buffer;
       uint8_t *cpu = nullptr;
-      D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+      gfx::GpuAddress gpu = 0;
       size_t size = 0;
     };
 
     struct FrameResources
     {
-      Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
       uint64_t fence_value = 0;
       std::vector<UploadPage> pages;
       size_t page = 0, offset = 0;
@@ -149,8 +144,8 @@ namespace sst::native
     struct Upload
     {
       uint8_t *cpu = nullptr;
-      D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
-      ID3D12Resource *resource = nullptr;
+      gfx::GpuAddress gpu = 0;
+      gfx::Buffer *buffer = nullptr;
       uint64_t offset = 0;
     };
 
@@ -224,7 +219,7 @@ namespace sst::native
   private:
     const GuestCopy *draw_vertex_copies_ = nullptr;
     uint32_t draw_vertex_copy_count_ = 0;
-    Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamps_;
+    gfx::TimestampPoolRef timestamps_;
 
     // GPU time per render-target pass (perf line "GPU by pass"): a timestamp at each target switch, labelled with the target
     static constexpr uint32_t kPassMarks = 512;
@@ -236,8 +231,8 @@ namespace sst::native
       uint8_t kind;  // 0 other, 1 3D scene, 2 shadow map, 3 frame start, 4 present
     };
 
-    Microsoft::WRL::ComPtr<ID3D12QueryHeap> pass_ts_;
-    Microsoft::WRL::ComPtr<ID3D12Resource> pass_readback_;
+    gfx::TimestampPoolRef pass_ts_;
+    gfx::BufferRef pass_readback_;
     std::array<std::vector<PassMark>, kSlots> pass_marks_;
     uint64_t pass_pair_ = 0;
 
@@ -250,7 +245,7 @@ namespace sst::native
     std::unordered_map<uint64_t, PassCost> pass_costs_;
     uint64_t pass_frames_ = 0;
     void MarkPass(uint32_t rt, uint32_t w, uint32_t h, uint8_t kind);
-    Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback_;
+    gfx::BufferRef timestamp_readback_;
     uint64_t timestamp_frequency_ = 0;
     std::array<bool, kSlots> timestamp_pending_{};
     void CreateTimestampQueries();
@@ -258,10 +253,10 @@ namespace sst::native
     void LogProfile();
 
     // Constant files uploaded this frame, by content (XXH3 of the guest bytes)
-    std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> constant_cache_;
+    std::unordered_map<uint64_t, gfx::GpuAddress> constant_cache_;
 
     // Uploads the first `bytes` of a stage's constant file (the registers its shader reads; 4096 = all)
-    D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(const uint8_t *guest, uint32_t bytes = 4096);
+    gfx::GpuAddress UploadConstants(const uint8_t *guest, uint32_t bytes = 4096);
 
     // Bytes of the constant file a shader reads: up to its highest register, or everything with relative addressing. Cached per entry
     uint32_t ConstantBytes(const ShaderEntry *entry);
@@ -298,19 +293,20 @@ namespace sst::native
 
     bool GeoCacheUsable();
     void GeoStore(GeoEntry &e, const Upload &src, uint32_t size);
-    D3D12_GPU_VIRTUAL_ADDRESS GeoAddress(const GeoEntry &e) const;
-    Microsoft::WRL::ComPtr<ID3D12Resource> geo_pool_;
+    gfx::GpuAddress GeoAddress(const GeoEntry &e) const;
+    gfx::BufferRef geo_pool_;
     uint64_t geo_pool_size_ = 0, geo_offset_ = 0, geo_generation_ = 1;
     D3D12_RESOURCE_STATES geo_state_ = D3D12_RESOURCE_STATE_COMMON;
     bool geo_failed_ = false;
     std::unordered_map<uint64_t, GeoEntry> geo_entries_;
 
-    bool CreateRootSignature();
     bool CreateDescriptorsAndPlaceholders();
+
+    // The renderer's own shaders (blits, debug shading): HLSL compiled for the device (entry point main). profile: vs_6_0 / ps_6_0
+    bool CompileRendererShader(const char *source, const wchar_t *profile, std::vector<uint8_t> &out);
     void CreateDebugPixelShader();
     Upload Allocate(size_t size, size_t alignment = 256);
     void BeginFrame();
-    void WaitFence(uint64_t value);
     ShaderEntry *ResolveShader(const uint8_t *base, uint32_t object, bool vertex);
     ShaderEntry *ResolveShaderSlow(const uint8_t *base, uint32_t object, bool vertex, uint32_t vcopy, uint32_t vsize, uint32_t ucode_ptr);
 
@@ -337,10 +333,10 @@ namespace sst::native
     bool ComputeFetchRecords(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count);
     std::unordered_map<uint32_t, std::vector<int32_t>> fetch_records_;
     bool EnsureCaptureResources();
-    ID3D12PipelineState *GetSoPipeline(const ShaderVariant *vs, uint64_t layout_hash, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout);
-    void CaptureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, const ShaderVariant *vs, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, uint64_t layout_hash, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, float half_x, float half_y);
+    void *GetSoPipeline(const ShaderVariant *vs, uint64_t layout_hash, const std::vector<gfx::InputElement> &layout); // ID3D12PipelineState (D3D12 only)
+    void CaptureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, const ShaderVariant *vs, const std::vector<gfx::InputElement> &layout, uint64_t layout_hash, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, float half_x, float half_y);
     void FinishCapture();
-    void CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0);
+    void CheckMorphJumps(const ShaderEntry *vs_entry, const DrawCall &call, const std::vector<gfx::InputElement> &layout, const uint8_t *host, uint32_t host_inputs, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0);
 
     // Screen extent (NDC) of a small draw, from running its vertex shader on the CPU (aspect ratio: tells 2D UI from 3D, and full-screen layers from elements). flat: every vertex has w = 1 (2D)
     struct DrawExtent
@@ -351,16 +347,21 @@ namespace sst::native
 
     DrawExtent MeasureDraw(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count);
     void CheckVsPositions(const uint8_t *base, const DrawCall &call, uint32_t vs_obj, const ShaderEntry *vs_entry, uint32_t first_vertex, uint32_t vertex_count, uint32_t stream0, bool reads_morph, const float *host, uint32_t host_inputs);
-    D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t slot) const;
+
+    // View table slots. RTVs: the outputs, then render-target / resolve-texture slices. DSVs: the output depth buffer, then depth targets
+    static uint32_t Rtv(uint32_t output) { return output; }
+    static uint32_t RtRtv(uint32_t index) { return kOutputs + index; }
+    static constexpr uint32_t kOutputDsv = 0;
+    static uint32_t RtDsv(uint32_t index) { return 1 + index; }
 
     // Every guest render-target surface (colour or depth) is a host texture at its logical size (max of the surface size and the viewports drawn with; the main scene's 640x736 tile surface is drawn as one 1280x736 image). Resolves copy them into host textures registered with the texture cache under the destination's guest address; the frame shown is the last full-size resolve (the game's front buffer copy)
     struct HostRT
     {
-      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      gfx::TextureRef resource;
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; // RTV / DSV format
       uint32_t width = 0, height = 0;
       bool depth = false;
-      uint32_t view = 0; // RTV or DSV index in rt_rtv_heap_ / rt_dsv_heap_
+      uint32_t view = 0; // render-target / depth-target index (RtRtv / RtDsv)
       uint32_t srv = 0;  // shader-visible SRV slot (resolve source)
       D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
       uint32_t guest_format = 0;
@@ -370,7 +371,7 @@ namespace sst::native
 
     struct ResolvedTexture
     {
-      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      gfx::TextureRef resource;
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
       uint32_t width = 0, height = 0, slices = 1;
       bool volume = false;
@@ -385,26 +386,22 @@ namespace sst::native
     bool RenderTargetsEnabled() const;
     HostRT *GetHostRT(const uint8_t *base, uint32_t surface, bool depth, Scale2 scale, uint32_t samples, uint32_t min_width, uint32_t min_height);
     void SetRTState(HostRT &rt, D3D12_RESOURCE_STATES state);
-    D3D12_CPU_DESCRIPTOR_HANDLE RtRtv(uint32_t index) const;
-    D3D12_CPU_DESCRIPTOR_HANDLE RtDsv(uint32_t index) const;
     uint32_t AllocateRtSrv();
-    D3D12_GPU_DESCRIPTOR_HANDLE SrvGpu(uint32_t slot) const;
     ResolvedTexture *GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, Scale2 scale);
     bool CreateBlitResources();
 
     // kind: 0 copy, 1 copy from MSAA (average / sample 0 for depth), 2 FXAA, 3 FPS counter text (alpha blended)
-    ID3D12PipelineState *GetBlitPipeline(DXGI_FORMAT format, uint32_t kind);
+    gfx::Pipeline *GetBlitPipeline(DXGI_FORMAT format, uint32_t kind);
 
-    // Copies src_srv texels (src_x, src_y)+ into `rtv` at dst rect (draws a triangle; the caller handles states). Restores the draw root signature
-    void Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb = false, float gamma = 0, uint32_t src_samples = 1, bool fxaa = false);
+    // Copies src_srv texels (src_x, src_y)+ into RTV slot `rtv` at dst rect (draws a triangle; the caller handles states). Restores the draw layout
+    void Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, uint32_t rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb = false, float gamma = 0, uint32_t src_samples = 1, bool fxaa = false);
     void RestoreDrawState();
     void PresentRenderTargets();
 
     std::unordered_map<uint32_t, HostRT> color_rts_, depth_rts_;
     std::unordered_map<uint32_t, std::unique_ptr<ResolvedTexture>> resolved_;
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rt_rtv_heap_, rt_dsv_heap_;
-    uint32_t rt_rtv_next_ = 0, rt_dsv_next_ = 0, rt_srv_next_ = 0, dsv_size_ = 0, srv_size_ = 0;
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> blit_root_;
+    uint32_t rt_rtv_next_ = 0, rt_dsv_next_ = 0, rt_srv_next_ = 0;
+    bool blit_ready_ = false; // the blit shaders compiled (render targets are emulated)
     std::vector<uint8_t> blit_vs_, blit_ps_, blit_ps_ms_, blit_ps_fxaa_, blit_ps_text_;
 
     // VIDEO > FPS COUNTER: frames shown per second (new frames handed to the display), drawn in the output's top-left corner
@@ -413,13 +410,13 @@ namespace sst::native
     uint32_t fps_tenths_ = 0;
     void DrawFpsCounter(const D3D12_RECT &output);
 
-    std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> blit_pipelines_;
+    std::unordered_map<uint32_t, gfx::PipelineRef> blit_pipelines_;
     uint32_t present_page_ = 0; // page of this frame's front-buffer resolve (0: none)
     HostRT *last_color_rt_ = nullptr;
     uint64_t bound_targets_ = 0; // (rtv, dsv) pair bound for draws, 0 = rebind
 
     // Replaced targets, released once the GPU has passed this fence value
-    std::vector<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>> retired_rts_;
+    std::vector<std::pair<uint64_t, gfx::TextureRef>> retired_rts_;
 
     struct RtTrace
     {
@@ -487,10 +484,9 @@ namespace sst::native
     std::unique_ptr<TextureCache> textures_;
     std::unordered_map<const ShaderEntry *, TextureUsage> texture_usage_;
 
-    ID3D12PipelineState *GetPipeline(const struct PipelineKey &key, const std::vector<D3D12_INPUT_ELEMENT_DESC> &layout, const ShaderVariant *vs, const ShaderVariant *ps, bool urgent = false);
+    gfx::Pipeline *GetPipeline(const struct PipelineKey &key, const std::vector<gfx::InputElement> &layout, const ShaderVariant *vs, const ShaderVariant *ps, bool urgent = false);
 
-    const rex::ui::d3d12::D3D12Provider *provider_ = nullptr;
-    ID3D12Device *device_ = nullptr;
+    std::unique_ptr<gfx::Device> gfx_;
     ShaderCache *shaders_ = nullptr;
     const uint8_t *physical_membase_ = nullptr;
     uint32_t width_ = 0, height_ = 0; // guest output size (1280x720)
@@ -526,24 +522,17 @@ namespace sst::native
     float DisplayStretch() const; // display aspect / the frame's (16:9)
 
     // Output ring (handed to the plugin) + depth
-    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kOutputs> outputs_;
+    std::array<gfx::TextureRef, kOutputs> outputs_;
     std::array<uint64_t, kOutputs> output_seq_{}; // frame sequence held (0 = none)
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtv_heap_, dsv_heap_;
-    uint32_t rtv_size_ = 0;
-    Microsoft::WRL::ComPtr<ID3D12Resource> depth_;
+    gfx::TextureRef depth_;
 
-    // Bindless heaps (XenosRecomp layout) + placeholders
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srv_heap_, sampler_heap_;
-    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> placeholder_textures_;
-    Microsoft::WRL::ComPtr<ID3D12Resource> zero_buffer_; // for VS inputs the decl lacks
+    // Bindless texture placeholders
+    std::vector<gfx::TextureRef> placeholder_textures_;
+    gfx::BufferRef zero_buffer_; // for VS inputs the decl lacks
 
     // Frame recording
     std::array<FrameResources, kSlots> frames_;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list_;
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
-    HANDLE event_ = nullptr;
-    uint64_t fence_value_ = 0;
+    std::unique_ptr<gfx::CommandList> list_;
     uint64_t submitted_ = 0;
     bool recording_ = false;
     uint32_t frame_res_ = 0; // index into frames_
@@ -645,8 +634,8 @@ namespace sst::native
     std::vector<CapturedDraw> captured_;
     std::string capture_detail_;
     const float *capture_host_ = nullptr;
-    Microsoft::WRL::ComPtr<ID3D12Resource> so_buffer_, so_readback_, so_zero_;
-    std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> so_pipelines_;
+    gfx::BufferRef so_buffer_, so_readback_, so_zero_;
+    std::unordered_map<uint64_t, std::shared_ptr<void>> so_pipelines_; // ID3D12PipelineState (D3D12 only)
 
     struct MorphWrite
     {
@@ -676,7 +665,7 @@ namespace sst::native
     std::vector<float> check_constants_, check_positions_;
 
     // Pipelines
-    std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> pipelines_;
+    std::unordered_map<uint64_t, gfx::PipelineRef> pipelines_;
     std::unordered_set<uint64_t> failed_pipelines_;
     struct PipelineWorkers;
     std::unique_ptr<PipelineWorkers> pipeline_workers_;

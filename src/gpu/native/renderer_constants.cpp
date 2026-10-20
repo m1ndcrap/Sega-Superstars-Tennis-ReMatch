@@ -99,7 +99,7 @@ namespace sst::native
     guest_watch::ConstantUse(key, mask);
   }
 
-  D3D12_GPU_VIRTUAL_ADDRESS Renderer::UploadConstants(const uint8_t *guest, uint32_t bytes)
+  gfx::GpuAddress Renderer::UploadConstants(const uint8_t *guest, uint32_t bytes)
   {
     bytes = std::clamp(bytes, 16u, 4096u);
     const uint64_t hash = XXH3_64bits(guest, bytes) ^ (uint64_t(bytes) << 52);
