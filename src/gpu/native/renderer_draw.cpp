@@ -470,7 +470,7 @@ namespace sst::native
         ui_fit = ext.flat && !full;
 
         // (Single quads only - a curved shape stretched this way would no longer meet the fitted pieces next to it.)
-        if (ui_fit && ui_fit_x_ < 1.0f && (touch_l || touch_r) && vertex_count <= 6)
+        if (ui_fit && ui_fit_x_ < 1.0f && (touch_l || touch_r) && vertex_count <= 6 && ext.x1 - ext.x0 >= 0.2f)
         {
           const float k = ui_fit_x_;
 
@@ -690,7 +690,31 @@ namespace sst::native
             return fit_cy + (float(v) - fit_cy) * ui_fit_y_;
           };
 
-          rect = {rect.left <= 0 ? 0 : LONG(std::floor(fx(rect.left))), rect.top <= 0 ? 0 : LONG(std::floor(fy(rect.top))), rect.right >= fw ? LONG(target_w) : LONG(std::ceil(fx(rect.right))), rect.bottom >= fh ? LONG(target_h) : LONG(std::ceil(fy(rect.bottom)))};
+          // A scissor that reaches past the frame (inside a HUD gauge moved to the screen edge) is in the window registers only as its part inside the frame: its x sides come from the rectangle as set instead, fitted like the geometry.
+          D3D12_RECT raw = rect;
+          bool raw_x = false;
+
+          if (REXCVAR_GET(sst_native_scissor) && be32(base, dev + kDevScissorEnable))
+          {
+            for (int i = 0; i < 4; ++i)
+              (&raw.left)[i] = LONG(int32_t(be32(base, dev + kDevScissorRect + 4 * i)));
+
+            raw_x = raw.right > raw.left && raw.bottom > raw.top && raw.left > 0 && (raw.left > fw || raw.right > fw + 1);
+          }
+
+          if (raw_x)
+            rect = {LONG(std::floor(fx(raw.left))), raw.top <= 0 ? 0 : LONG(std::floor(fy(std::min(raw.top, fh)))), LONG(std::ceil(fx(raw.right))), raw.bottom >= fh ? LONG(target_h) : LONG(std::ceil(fy(raw.bottom)))};
+          else
+            rect = {rect.left <= 0 ? 0 : LONG(std::floor(fx(rect.left))), rect.top <= 0 ? 0 : LONG(std::floor(fy(rect.top))), rect.right >= fw ? LONG(target_w) : LONG(std::ceil(fx(rect.right))), rect.bottom >= fh ? LONG(target_h) : LONG(std::ceil(fy(rect.bottom)))};
+
+          rect.left = std::clamp(rect.left, LONG(0), LONG(target_w));
+          rect.right = std::clamp(rect.right, rect.left, LONG(target_w));
+        }
+
+        if (capture_active_)
+        {
+          const uint32_t tl = be32(base, dev + kDevScissorTL), br = be32(base, dev + kDevScissorBR);
+          REXLOG_INFO("[sst-native] F9 draw {} scissor guest {}x{}-{}x{} -> {}x{}-{}x{} (target {}x{}, {})", draw_seq_, tl & 0x7FFF, (tl >> 16) & 0x7FFF, br & 0x7FFF, (br >> 16) & 0x7FFF, int(rect.left), int(rect.top), int(rect.right), int(rect.bottom), target_w, target_h, ui_fit ? "fitted" : "not fitted");
         }
 
         rect = Scaled(rect, draw_scale);

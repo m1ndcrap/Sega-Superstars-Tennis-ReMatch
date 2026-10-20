@@ -36,6 +36,7 @@ set(SSTREMATCH_SOURCES
   src/menu/scene_achievements.cpp
   src/menu/script_asm.cpp
   src/menu/main_menu_quit.cpp
+  src/menu/vs_screen.cpp
   src/movie/movie_debug.cpp
   src/movie/movie_audio.cpp
   src/input/devices.cpp

@@ -12,6 +12,8 @@
 #include <cctype>
 #include <fstream>
 #include <mutex>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -108,6 +110,37 @@ namespace sst::lang
         return 0;
       }
 #else
+      // The desktop's language: LANGUAGE (a list, first entry), LC_ALL, LC_MESSAGES, LANG ("fr_FR.UTF-8", "de", ...)
+      for (const char *var : {"LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"})
+      {
+        const char *value = std::getenv(var);
+
+        if (!value || !*value)
+          continue;
+
+        const std::string code = Lower(std::string(value, std::strcspn(value, ":_.@")));
+
+        if (code == "c" || code == "posix")
+          return kEnglish;
+
+        if (code == "en")
+          return kEnglish;
+
+        if (code == "fr")
+          return kFrench;
+
+        if (code == "de")
+          return kGerman;
+
+        if (code == "es")
+          return kSpanish;
+
+        if (code == "it")
+          return kItalian;
+
+        return 0;
+      }
+
       return 0;
 #endif
     }

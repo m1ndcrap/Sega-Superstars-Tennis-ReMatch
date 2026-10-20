@@ -255,6 +255,7 @@ namespace sst::menu::page
         if (m.shown != 1)
         {
           g_anims.push_back({pause::kScrollGroup, kAnimShow});
+          g_anims.push_back({pause::kScrollGroup, pause::kScrollShow});
           m.shown = 1;
           g_scroll_bar = true;
         }
@@ -288,6 +289,7 @@ namespace sst::menu::page
       if (g_list.pause)
       {
         g_anims.push_back({pause::kScrollGroup, kAnimHide});
+        g_anims.push_back({pause::kScrollGroup, pause::kScrollHide});
         g_scroll_bar = false;
       }
       else
@@ -797,6 +799,16 @@ namespace sst::menu::page
   }
 
   bool ScrollBarShown() { return g_scroll_bar; }
+
+  void PauseMenuStarted()
+  {
+    std::lock_guard lock(MenuMutex());
+
+    if (g_list.pause)
+      g_markers = {};
+
+    g_scroll_bar = false;
+  }
 
   bool KeyBindingsUp()
   {

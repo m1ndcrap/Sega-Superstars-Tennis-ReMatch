@@ -1,4 +1,4 @@
-// sst_rematch - restarting the game from the VIDEO page
+// Restarting the game from the VIDEO page
 
 #include "menu/restart.h"
 
@@ -13,6 +13,19 @@
 
 #include <cwchar>
 #include <string>
+#else
+#include <cerrno>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <signal.h>
+#include <spawn.h>
+#include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+extern char **environ;
 #endif
 
 namespace sst::menu
@@ -31,6 +44,7 @@ namespace sst::menu
       return false;
 
     std::wstring command_line = GetCommandLineW(); // same arguments
+
     // Inherited by the new copy: it waits for this process to exit
     SetEnvironmentVariableW(kParentVar, std::to_wstring(GetCurrentProcessId()).c_str());
     STARTUPINFOW si = {};
@@ -80,12 +94,70 @@ namespace sst::menu
         reinterpret_cast<LPVOID>(uintptr_t(ms)), 0, nullptr);
   }
 #else
-  bool RestartGame()
+  namespace
   {
-    return false;
+    constexpr const char *kParentVar = "SST_RESTART_PARENT";
+
+    // This process's arguments (/proc/self/cmdline: NUL-separated)
+    std::vector<std::string> Arguments()
+    {
+      std::vector<std::string> args;
+      std::ifstream file("/proc/self/cmdline", std::ios::binary);
+      std::string arg;
+
+      while (std::getline(file, arg, '\0'))
+        args.push_back(arg);
+
+      return args;
+    }
   }
 
-  void WaitForRestartParent() {}
-  void ExitSoon(unsigned) {}
+  bool RestartGame()
+  {
+    std::vector<std::string> args = Arguments();
+
+    if (args.empty())
+      return false;
+
+    std::vector<char *> argv;
+
+    for (std::string &a : args)
+      argv.push_back(a.data());
+
+    argv.push_back(nullptr);
+
+    // Inherited by the new copy: it waits for this process to exit. Same arguments and working folder
+    setenv(kParentVar, std::to_string(getpid()).c_str(), 1);
+    pid_t child = 0;
+    const int rc = posix_spawn(&child, "/proc/self/exe", nullptr, nullptr, argv.data(), environ);
+    unsetenv(kParentVar);
+    return rc == 0;
+  }
+
+  void WaitForRestartParent()
+  {
+    const char *value = std::getenv(kParentVar);
+
+    if (!value)
+      return;
+
+    const pid_t pid = pid_t(std::strtol(value, nullptr, 10));
+    unsetenv(kParentVar);
+
+    if (pid <= 0)
+      return;
+
+    for (int i = 0; i < 300 && (kill(pid, 0) == 0 || errno == EPERM); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  void ExitSoon(unsigned ms)
+  {
+    std::thread([ms]
+                {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      _exit(0); })
+        .detach();
+  }
 #endif
 }

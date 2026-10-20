@@ -21,6 +21,12 @@ namespace sst::menu::hud
   // `edge_only`: a side element moves only when it reaches the outer 15% of its side.
   int Anchor(uint8_t *data, size_t size, float shift, std::vector<std::string> *log, bool sides = true, bool edge_only = false);
 
+  // Spreads a scene's elements across the wider screen: each top-level element (not one spanning most of the width) moves by (its resting centre - 0.5) x 2 shift, so it keeps its place relative to the screen rather than to the 16:9 box. For layouts drawn over 3D that is spread the same way (the VS screen: its characters, menu/vs_screen.cpp). Returns how many elements moved...
+  int Spread(uint8_t *data, size_t size, float shift, std::vector<std::string> *log);
+
+  // Is `name` a scene to spread (loading.dat: the VS screen's player labels)?
+  bool IsSpreadScene(const std::string &name);
+
   // The shift for a display aspect (0 when not wider than 16:9)
   inline float ShiftFor(float aspect)
   {

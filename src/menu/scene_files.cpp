@@ -15,16 +15,23 @@
 #include "menu/scene_patches.h"
 #include "menu/video_settings.h"
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <optional>
 #include <unordered_map>
+
+REXCVAR_DEFINE_BOOL(sst_hud_anchor, true, "SST", "Ultrawide: move in-match HUD elements to the screen edges (and off-screen ones further out). false: the HUD stays in the 16:9 box (for comparing)");
+REXCVAR_DEFINE_BOOL(sst_vs_spread, true, "SST", "Ultrawide: the VS (loading) and character select screens' characters and player labels spread across the screen as at 16:9, instead of staying in the middle 16:9 area");
 
 extern "C" void __imp__sub_82594618(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_825946B0(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_82595158(PPCContext &__restrict, uint8_t *);
+extern "C" void __imp__sub_82580E98(PPCContext &__restrict, uint8_t *);
 extern "C" void sub_82594820(PPCContext &__restrict, uint8_t *); // file size (path)
 extern "C" void sub_82122480(PPCContext &__restrict, uint8_t *); // allocate (size, align)
 extern "C" void sub_82128A90(PPCContext &__restrict, uint8_t *); // start reading (fs, path, buffer, 0) -> request handle
@@ -259,7 +266,7 @@ namespace sst::menu
     // Ultrawide: in-match HUD elements to the screen edges (every scene: elements waiting off-screen move out with the edges)
     void AnchorHud(const Scene &s, const std::string &dat_name)
     {
-      const float shift = hud::ShiftFor(CameraAspect());
+      const float shift = REXCVAR_GET(sst_hud_anchor) ? hud::ShiftFor(CameraAspect()) : 0.0f;
 
       if (shift <= 0.0f)
         return;
@@ -268,6 +275,17 @@ namespace sst::menu
       const bool edge_only = hud::IsEdgeHudScene(dat_name);
       const bool sides = edge_only || hud::IsHudScene(dat_name);
       const int moved = hud::Anchor(s.Dat(), s.dat_size, shift, sides ? &log : nullptr, sides, edge_only);
+
+      // The VS and character select screens: labels spread across the screen with the characters (vs_screen.cpp)
+      if (hud::IsSpreadScene(dat_name) && REXCVAR_GET(sst_vs_spread))
+      {
+        std::vector<std::string> spread_log;
+        const int spread = hud::Spread(s.Dat(), s.dat_size, shift, &spread_log);
+        REXLOG_INFO("[sst-menu] {}: {} elements spread across the screen (shift {:.3f})", dat_name, spread, shift);
+
+        for (const std::string &line : spread_log)
+          REXLOG_INFO("[sst-menu]   {}", line);
+      }
 
       if (!sides)
         return;
@@ -496,4 +514,28 @@ extern "C" REX_FUNC(sub_82595158)
   ctx.r4.u64 = (uint64_t(s.dat) << 32) | s.dat_size;
   ctx.r5.u64 = (uint64_t(s.rel) << 32) | s.rel_size;
   __imp__sub_82595158(ctx, base);
+}
+
+// SumoTool scissor (SCIS objects), x: clamps a scissor side to the screen (object +0x4C .. +0x54, pixels). A scissor that ends past the 16:9 frame came out empty, and the game then skipped what it clips. At ultrawide, the bounds are widened by the shift on each side; the renderer fits the rectangle like the geometry to prevent this
+extern "C" REX_FUNC(sub_82580E98)
+{
+  const float shift = sst::menu::hud::ShiftFor(sst::menu::CameraAspect());
+
+  if (shift <= 0.0f || sst::menu::video::Boot().four_three)
+  {
+    __imp__sub_82580E98(ctx, base);
+    return;
+  }
+
+  auto load_f = [&](uint32_t a)
+  {
+    const uint32_t v = sst::menu::Load32(base, a);
+    float f;
+    std::memcpy(&f, &v, 4);
+    return f;
+  };
+
+  const float lo = load_f(ctx.r3.u32 + 0x4C), hi = load_f(ctx.r3.u32 + 0x54);
+  const float extra = (hi - lo) * shift;
+  ctx.f1.f64 = double(std::clamp(float(ctx.f1.f64), lo - extra, hi + extra));
 }

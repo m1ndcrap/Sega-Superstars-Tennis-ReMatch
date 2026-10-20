@@ -17,6 +17,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <SDL3/SDL_keyboard.h>
+#include <rex/ui/sdl_virtual_key.h>
 #endif
 
 #include <cctype>
@@ -360,7 +363,8 @@ namespace sst::input
     DWORD pid = 0;
     return fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
 #else
-    return false;
+    // SDL's keyboard focus: one of the game's windows has it
+    return SDL_GetKeyboardFocus() != nullptr;
 #endif
   }
 
@@ -369,7 +373,19 @@ namespace sst::input
 #if defined(_WIN32)
     return (GetAsyncKeyState(int(vk)) & 0x8000) != 0;
 #else
-    (void)vk;
+    // SDL's keyboard state (kept by the window's event loop), through the SDK's scancode -> virtual key table
+    int count = 0;
+    const bool *state = SDL_GetKeyboardState(&count);
+
+    if (!state)
+      return false;
+
+    for (int sc = 0; sc < count; ++sc)
+    {
+      if (state[sc] && uint32_t(rex::ui::TranslateSDLScancode(SDL_Scancode(sc))) == vk)
+        return true;
+    }
+
     return false;
 #endif
   }

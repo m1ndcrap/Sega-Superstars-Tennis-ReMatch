@@ -27,6 +27,8 @@ namespace sst::menu::pause
   // The VIDEO page's scroll bar (added to the scene; the port hides kScrollGroup (4:5) except on the VIDEO page; the thumb's key kScrollPos + i is scroll position i)
   constexpr uint32_t kScrollGroup = 0x53560040, kScrollTrack = 0x53560041, kScrollThumb = 0x53560042;
   constexpr uint32_t kScrollHide = 0x53560048, kScrollShow = 0x53560049, kScrollPos = 0x53560050;
+  constexpr uint32_t kScrollShowFrame = 1000; // (the shown key: past any frame the panel's animations play)
+  constexpr float kScrollHiddenX = 4.0f;      // (hidden: this far right of the frame)
   constexpr uint32_t kYellowTag = 0x2A3BDF69; // the yellow (3P) tag texture
   constexpr uint32_t kThumbTex = 0x53560060;  // its middle (a bright yellow strip: the whole tag, squeezed thin, samples a blurred mip level)
   constexpr int kScrollCount = 12;            // settings on the pause menu's VIDEO page (no ASPECT RATIO)

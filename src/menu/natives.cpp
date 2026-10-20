@@ -3,18 +3,25 @@
 #include "input/controls.h"
 #include "menu/achievements.h"
 #include "menu/main_menu_quit.h"
+#include "menu/video_settings.h"
 #include "menu/menu_internal.h"
 #include "menu/pause_patch.h"
 #include "menu/restart.h"
+#include "menu/vs_screen.h"
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <vector>
 
 extern "C" void __imp__sub_821DFBC0(PPCContext &__restrict, uint8_t *);
+extern "C" void __imp__sub_8227C100(PPCContext &__restrict, uint8_t *);
+
+REXCVAR_DEFINE_BOOL(sst_esrb_notice, true, "SST", "Boot intro: show the ESRB rating card, as on a North American console (the game shows it only when XGetGameRegion reports North America; the SDK reports all regions)");
 
 namespace sst::menu
 {
@@ -159,16 +166,17 @@ namespace sst::menu
       }
     }
 
-    // The pause menu's script reads input (3:18) only while the menu is up (r4 = the calling VM, +8 its module): there, Esc is "back", not Start, and the VIDEO page's scroll bar stays hidden on the rest of the menu
+    // A native call from the pause menu's script (r4 = the calling VM, +8 its module)
+    bool FromPauseMenu(PPCContext &ctx, uint8_t *base)
+    {
+      return ctx.r4.u32 && IsPauseMenuModule(Load32(base, ctx.r4.u32 + 8));
+    }
+
+    // The pause menu's script reads input (3:18) only while the menu is up: there, Esc is 'back', not Start
     void PauseMenuInput(PPCContext &ctx, uint8_t *base)
     {
-      if (!ctx.r4.u32 || !IsPauseMenuModule(Load32(base, ctx.r4.u32 + 8)))
-        return;
-
-      sst::input::PauseMenuFrame();
-
-      if (!page::ScrollBarShown())
-        controls::SceneShow(ctx, base, pause::kScrollGroup, false);
+      if (FromPauseMenu(ctx, base))
+        sst::input::PauseMenuFrame();
     }
 
     // QUIT row: closing OPTIONS plays (kOptionsCloseFrom -> kOptionsCloseTo) on the rows below it, which for this row is the wrong distance; it goes back from where OPTIONS put it instead
@@ -227,5 +235,45 @@ extern "C" REX_FUNC(sub_821DFBC0)
   if (id == kSceneAnimateKeys && ctx.r10.u32 >= 3 && ctx.r10.u32 <= 8 && ctx.r8.u32)
     FixQuitRowAnimation(base, ctx.r8.u32);
 
+  // The VIDEO page's scroll bar sits in the pause panel, so the panel's intro (the script's first natives, before it reads input) showed it too: after each of the pause script's natives it is hidden again, except on the VIDEO page
+  const vs::Pending vs_call = vs::BeforeNative(ctx, base, id);
+  const bool pause_menu = sst::input::InMatch() && FromPauseMenu(ctx, base) && !page::ScrollBarShown();
+  const uint64_t r6 = ctx.r6.u64, r7 = ctx.r7.u64; // (the scene natives' context, which SceneShow passes on; volatile across the call)
+
   __imp__sub_821DFBC0(ctx, base);
+  vs::AfterNative(base, vs_call);
+
+  if (pause_menu && !page::ScrollBarShown())
+  {
+    ctx.r6.u64 = r6;
+    ctx.r7.u64 = r7;
+    controls::SceneShow(ctx, base, pause::kScrollGroup, false);
+
+    // (and parked off the frame: its hidden key)
+    const uint32_t values[4] = {pause::kScrollGroup, pause::kScrollHide, pause::kScrollHide, 0};
+    const uint8_t types[4] = {kHash, kHash, kHash, kInt};
+    controls::SceneCall(ctx, base, sub_82282AA0, values, types, 4);
+  }
+}
+
+// An on-court object's screen x, -1..1, projected with the game camera (sub_82214BD8). Scripts turn it into a layout x ((x + 1) / 2 * width) for markers over the 3D scene: Space Harrier's target reticles (ballgamehuds). The 2D layout is fitted into the middle 16:9 area, so the marker landed nearer the middle than its target the further out it was: x is scaled by aspect / (16/9) to land on the target across the whole width...
+extern "C" REX_FUNC(sub_8227C100)
+{
+  const uint32_t out = ctx.r3.u32;
+  __imp__sub_8227C100(ctx, base);
+
+  const float aspect = sst::menu::CameraAspect();
+
+  if (sst::menu::video::Boot().four_three || aspect <= 16.0f / 9.0f + 0.01f || sst::menu::Load32(base, out + 4) != 1) // (1: a float)
+    return;
+
+  const float x = std::bit_cast<float>(sst::menu::Load32(base, out));
+  sst::menu::Store32(base, out, std::bit_cast<uint32_t>(x * aspect / (16.0f / 9.0f)));
+}
+
+extern "C" REX_FUNC(sub_82280E18)
+{
+  const uint32_t flag = REXCVAR_GET(sst_esrb_notice) ? 1u : uint32_t(*sst::menu::GuestPtr(base, 0x82DB7F2E));
+  sst::menu::Store32(base, ctx.r3.u32, flag);
+  sst::menu::Store32(base, ctx.r3.u32 + 4, 2); // int
 }

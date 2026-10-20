@@ -524,7 +524,7 @@ namespace sst::menu::scenes
 
   bool WantsWideLayout(const std::string &name)
   {
-    static const char *kSkip[] = {"hud.dat", "hudicons.dat", "spechud.dat", "stadiumig.dat", "ingame.dat", "pausemenu.dat"};
+    static const char *kSkip[] = {"hud.dat", "hudicons.dat", "spechud.dat", "stadiumig.dat", "ingame.dat", "bghuds.dat", "pausemenu.dat"};
 
     if (!name.ends_with(".dat"))
       return false;

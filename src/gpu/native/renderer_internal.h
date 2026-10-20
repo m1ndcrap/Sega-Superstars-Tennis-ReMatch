@@ -282,7 +282,8 @@ namespace sst::native
     constexpr uint32_t kDevVSConstants = 0x780, kDevPSConstants = 0x1780, kDevBools = 0x2780;
     constexpr uint32_t kDevIndices = 0x3094, kDevRT0 = 0x3098, kDevDepth = 0x30A8;
     constexpr uint32_t kDevPS = 0x3194, kDevVS = 0x3198;
-    constexpr uint32_t kDevScissorTL = 0x28C4, kDevScissorBR = 0x28C8; // PA_SC_WINDOW_SCISSOR_*
+    constexpr uint32_t kDevScissorTL = 0x28C4, kDevScissorBR = 0x28C8;       // PA_SC_WINDOW_SCISSOR_*
+    constexpr uint32_t kDevScissorEnable = 0x2E50, kDevScissorRect = 0x3184; // the rectangle as set (left, top, right, bottom; before the viewport intersection)
 
     // Fetch constants: slot j (2 dwords) at +0x480 + 8j. Textures use 3 slots each (sampler i = slots 3i..3i+2); vertex stream s is slot 95 - s
     constexpr uint32_t kDevFetchConstants = 0x480;

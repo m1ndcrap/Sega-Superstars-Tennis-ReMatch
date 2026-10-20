@@ -1,4 +1,4 @@
-// sst_rematch - mouse cursor hiding
+// mouse cursor hiding
 
 #include "input/cursor.h"
 
@@ -17,6 +17,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_init.h>
+#include <SDL3/SDL_mouse.h>
+#include <SDL3/SDL_timer.h>
 #endif
 
 REXCVAR_DEFINE_BOOL(sst_hide_cursor, true, "SST", "Hide the mouse cursor over the game window when the mouse is not moving");
@@ -136,6 +141,7 @@ namespace sst::input
 
       return TRUE;
     }
+
   }
 
   void StartCursorHider()
@@ -145,35 +151,90 @@ namespace sst::input
     if (started.exchange(true))
       return;
 
-    std::thread([]
-                {
-      // Wait for the game window (up to a minute), then subclass it
-      for (int i = 0; i < 240 && !g_window; ++i)
-      {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        g_any_window = i >= 40;
-        HWND found = nullptr;
-        EnumWindows(FindWindowProc, reinterpret_cast<LPARAM>(&found));
-
-        if (found)
+    std::thread(
+        []
         {
-          g_last_move = NowMs();
-          g_original = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(found, GWLP_WNDPROC));
-
-          if (g_original && SetWindowLongPtrW(found, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&Proc)))
+          // Wait for the game window (up to a minute), then subclass it
+          for (int i = 0; i < 240 && !g_window; ++i)
           {
-            g_window = found;
-            // (the timer starts with the window's next message)
-            PostMessageW(found, WM_NULL, 0, 0);
-            REXLOG_INFO("[sst-input] mouse cursor: hidden after {} s without movement{}", kIdleMs / 1000, REXCVAR_GET(sst_hide_cursor) ? "" : " (off: --sst_hide_cursor=false)");
-          }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            g_any_window = i >= 40;
+            HWND found = nullptr;
+            EnumWindows(FindWindowProc, reinterpret_cast<LPARAM>(&found));
 
-          break;
-        }
-      } })
+            if (found)
+            {
+              g_last_move = NowMs();
+              g_original = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(found, GWLP_WNDPROC));
+
+              if (g_original && SetWindowLongPtrW(found, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&Proc)))
+              {
+                g_window = found;
+
+                // (the timer starts with the window's next message)
+                PostMessageW(found, WM_NULL, 0, 0);
+                REXLOG_INFO("[sst-input] mouse cursor: hidden after {} s without movement{}", kIdleMs / 1000, REXCVAR_GET(sst_hide_cursor) ? "" : " (off: --sst_hide_cursor=false)");
+              }
+
+              break;
+            }
+          }
+        })
         .detach();
   }
 #else
-  void StartCursorHider() {}
+  // SDL: the cursor shows on mouse movement and hides after 2 s without it while it is over the game window
+  namespace
+  {
+    constexpr uint64_t kIdleMs = 2000;
+    std::atomic<uint64_t> g_last_move{0};
+    std::atomic<bool> g_hidden{false};
+
+    bool OnEvent(void *, SDL_Event *event)
+    {
+      // (on the thread that pumps events: the main thread)
+      if (event->type == SDL_EVENT_MOUSE_MOTION || event->type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+      {
+        g_last_move = SDL_GetTicks();
+
+        if (g_hidden.exchange(false))
+          SDL_ShowCursor();
+      }
+
+      return true;
+    }
+
+    uint32_t OnTimer(void *, SDL_TimerID, uint32_t interval)
+    {
+      if (!g_hidden && REXCVAR_GET(sst_hide_cursor) && SDL_GetTicks() - g_last_move >= kIdleMs)
+      {
+        SDL_RunOnMainThread(
+            [](void *)
+            {
+              if (!g_hidden && SDL_GetMouseFocus() && SDL_GetTicks() - g_last_move >= kIdleMs)
+              {
+                g_hidden = true;
+                SDL_HideCursor();
+              }
+            },
+            nullptr, false);
+      }
+
+      return interval;
+    }
+  }
+
+  void StartCursorHider()
+  {
+    static std::atomic<bool> started{false};
+
+    if (started.exchange(true))
+      return;
+
+    g_last_move = SDL_GetTicks();
+    SDL_AddEventWatch(OnEvent, nullptr);
+    SDL_AddTimer(250, OnTimer, nullptr);
+    REXLOG_INFO("[sst-input] mouse cursor: hidden after {} s without movement{}", kIdleMs / 1000, REXCVAR_GET(sst_hide_cursor) ? "" : " (off: --sst_hide_cursor=false)");
+  }
 #endif
 }

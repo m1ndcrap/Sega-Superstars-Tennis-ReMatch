@@ -130,6 +130,9 @@ namespace sst::menu
     // The pause menu's VIDEO page has its scroll bar up (the rest of the pause menu keeps it hidden)
     bool ScrollBarShown();
 
+    // The pause menu is opening: its VIDEO page is not up (in case the last pause ended without leaving it)
+    void PauseMenuStarted();
+
     // The list shows KEY BINDINGS (the VIDEO page script, CONTROLS > Y)
     bool KeyBindingsUp();
 

@@ -12,6 +12,7 @@
 #include "menu/main_menu_quit.h"
 #include "menu/menu_internal.h"
 #include "menu/pause_patch.h"
+#include "menu/vs_screen.h"
 
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
@@ -243,11 +244,15 @@ extern "C" REX_FUNC(sub_821CCA28)
 
   const uint32_t script = ctx.r4.u32;
   TrackScreens(script);
+  vs::OnScriptStart(base, front_end, script);
 
   if (REXCVAR_GET(sst_graphics_menu))
   {
     if (script == pause::kScriptHash)
+    {
       RedirectPatched(base, front_end, g_pause_script, true);
+      page::PauseMenuStarted();
+    }
 
     if (script == quit::kScriptHash)
       RedirectPatched(base, front_end, g_main_menu_script, REXCVAR_GET(sst_quit_item));

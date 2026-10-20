@@ -361,12 +361,12 @@ namespace sst::menu::pause
         t.keys.clear();
         t.count = 0;
 
-        for (auto [label, frame, alpha] : {std::tuple{kScrollHide, 0u, 0x00u}, std::tuple{kScrollShow, 10u, 0xFFu}})
+        for (auto [label, frame, off_x] : {std::tuple{kScrollHide, 0u, kScrollHiddenX}, std::tuple{kScrollShow, kScrollShowFrame, 0.0f}})
         {
           Wr32(key.data(), label);
           Wr32(key.data() + 4, frame);
-          Wr32(key.data() + 8, 0xFFFFFF00u | alpha | 0xFF); // (a group's colour does not reach its children: shown / hidden with 4:4 / 4:5)
-          WrF(key.data() + 0xC, 0.0f);
+          Wr32(key.data() + 8, 0xFFFFFFFFu);
+          WrF(key.data() + 0xC, off_x);
           WrF(key.data() + 0x10, 0.0f);
           WrF(key.data() + 0x14, 1.0f);
           WrF(key.data() + 0x18, 1.0f);
