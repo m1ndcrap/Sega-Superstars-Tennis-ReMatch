@@ -108,6 +108,7 @@ namespace sst::menu::hud
         return 0;
 
       std::map<uint32_t, Track> tracks;
+
       {
         const uint32_t count = Rd32(kfrm);
 
@@ -127,6 +128,7 @@ namespace sst::menu::hud
       }
 
       std::map<uint32_t, Object> objects;
+
       {
         const uint32_t count = Rd32(objs + 8);
 
@@ -333,8 +335,8 @@ namespace sst::menu::hud
 
       // Top-level objects of every scene in the file: SCNE is u32 count, then {hash, object count, 0, list offset, width, height} per scene
       std::vector<uint32_t> tops;
-
       std::map<uint32_t, std::vector<uint32_t>> scenes_of; // top-level object -> the scenes listing it
+
       {
         const uint32_t scenes = Rd32(scne);
 

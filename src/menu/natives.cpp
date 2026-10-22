@@ -15,11 +15,13 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <chrono>
 #include <vector>
 
 extern "C" void __imp__sub_821DFBC0(PPCContext &__restrict, uint8_t *);
 extern "C" void __imp__sub_8227C100(PPCContext &__restrict, uint8_t *);
+extern "C" void __imp__sub_8227BC40(PPCContext &__restrict, uint8_t *);
 
 REXCVAR_DEFINE_BOOL(sst_esrb_notice, true, "SST", "Boot intro: show the ESRB rating card, as on a North American console (the game shows it only when XGetGameRegion reports North America; the SDK reports all regions)");
 
@@ -269,6 +271,24 @@ extern "C" REX_FUNC(sub_8227C100)
 
   const float x = std::bit_cast<float>(sst::menu::Load32(base, out));
   sst::menu::Store32(base, out, std::bit_cast<uint32_t>(x * aspect / (16.0f / 9.0f)));
+}
+
+// A player's aim x in layout pixels, (aim + 1) * width / 2 from the aim kept at player+0x190 (-1..1, screen x of the shot). Virtua Squad's shooting missions draw their crosshairs there (ballgamehuds). The shot follows the aim over the whole (wider) screen while the 2D layout is fitted into the
+// middle 16:9 area, so the crosshair sat nearer the middle than where the ball went: the pixel x spreads about the middle by aspect / (16/9). (9:33, y, is the same at any width).
+extern "C" REX_FUNC(sub_8227BC40)
+{
+  const uint32_t out = ctx.r3.u32;
+  __imp__sub_8227BC40(ctx, base);
+
+  const float aspect = sst::menu::CameraAspect();
+  const uint32_t width = sst::menu::Load32(base, 0x825F0540); // 4:20's width
+
+  if (sst::menu::video::Boot().four_three || aspect <= 16.0f / 9.0f + 0.01f || sst::menu::Load32(base, out + 4) != 2 || width < 320 || width > 16384) // (2: an int)
+    return;
+
+  const float half = 0.5f * float(width);
+  const float x = float(int32_t(sst::menu::Load32(base, out)));
+  sst::menu::Store32(base, out, uint32_t(int32_t(std::lround(half + (x - half) * aspect / (16.0f / 9.0f)))));
 }
 
 extern "C" REX_FUNC(sub_82280E18)
