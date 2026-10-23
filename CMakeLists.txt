@@ -42,6 +42,7 @@ set(SSTREMATCH_SOURCES
   src/movie/movie_audio.cpp
   src/input/devices.cpp
   src/input/key_bindings.cpp
+  src/game/court_collision.cpp
   src/debug/crash_log.cpp
   src/debug/scene_guard.cpp
   src/input/cursor.cpp
