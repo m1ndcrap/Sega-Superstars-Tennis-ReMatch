@@ -98,6 +98,81 @@ namespace sst::native
     marks.push_back({rt, uint16_t(std::min(w, 65535u)), uint16_t(std::min(h, 65535u)), kind});
   }
 
+  Renderer::FrameSnapshot Renderer::TakeFrameSnapshot() const
+  {
+    FrameSnapshot f;
+    std::copy(std::begin(prof_.ticks), std::end(prof_.ticks), f.ticks);
+    f.draws = stats_.draws;
+    f.memexport_run = stats_.memexport_run;
+    f.memexport_waits = stats_.memexport_waits;
+    f.memexport_wait_ms = stats_.memexport_wait_ms;
+    f.pipelines_created = stats_.pipelines_created;
+    f.pipeline_ms = stats_.pipeline_ms;
+
+    if (textures_)
+    {
+      const TextureCache::Counters t = textures_->TotalCounters();
+      f.tex_created = t.created;
+      f.tex_uploads = t.uploads;
+      f.tex_upload_bytes = t.upload_bytes;
+      f.tex_hashed_bytes = t.hashed_bytes;
+      f.tex_upload_ms = t.upload_ms;
+      f.tex_hash_ms = t.hash_ms;
+    }
+
+    return f;
+  }
+
+  // At every frame end, a frame whose renderer work took longer than --sst_native_slow_frame_ms is logged with its own breakdown (the 10 s profile averages hide one-off frames like a match's first). Running totals can be reset by the periodic log; a total smaller than its snapshot counts from 0.
+  void Renderer::CheckSlowFrame(uint64_t frame)
+  {
+    const FrameSnapshot now = TakeFrameSnapshot();
+    const FrameSnapshot &was = frame_prev_;
+    const int32_t threshold = REXCVAR_GET(sst_native_slow_frame_ms);
+
+    auto d = [](auto a, auto b)
+    { return a >= b ? a - b : a; };
+
+    if (threshold > 0 && ms_per_tick_ > 0)
+    {
+      double phase[kPhCount], renderer = 0;
+
+      for (uint32_t i = 0; i < kPhCount; ++i)
+      {
+        phase[i] = double(d(now.ticks[i], was.ticks[i])) * ms_per_tick_;
+
+        if (i != kPhFenceWait)
+          renderer += phase[i];
+      }
+
+      if (renderer >= threshold && (slow_frames_logged_ < 60 || (slow_frames_logged_ % 20) == 0))
+      {
+        static constexpr const char *kNames[kPhCount] = {"other", "memexport", "shaders", "inputs", "indices", "pipelines", "vertices", "constants", "textures", "ui fit", "recording", "clears", "submit", "GPU wait"};
+        uint32_t order[kPhCount];
+
+        for (uint32_t i = 0; i < kPhCount; ++i)
+          order[i] = i;
+
+        std::sort(std::begin(order), std::end(order), [&](uint32_t a, uint32_t b)
+                  { return phase[a] > phase[b]; });
+
+        std::string top;
+
+        for (uint32_t i = 0; i < 5 && phase[order[i]] >= 0.5; ++i)
+          top += fmt::format("{}{} {:.1f}", i ? ", " : "", kNames[order[i]], phase[order[i]]);
+
+        REXLOG_INFO("[sst-native] slow render frame {}: {:.1f} ms in the renderer ({}); {} draws; textures: {} created, {} uploads ({:.1f} MB, {:.1f} ms), {:.1f} MB hashed ({:.1f} ms); memexport: {} run, waited {} times ({:.1f} ms); pipelines: {} ready ({:.1f} ms)", frame, renderer, top,
+                    d(now.draws, was.draws), d(now.tex_created, was.tex_created), d(now.tex_uploads, was.tex_uploads), double(d(now.tex_upload_bytes, was.tex_upload_bytes)) / (1 << 20), d(now.tex_upload_ms, was.tex_upload_ms), double(d(now.tex_hashed_bytes, was.tex_hashed_bytes)) / (1 << 20),
+                    d(now.tex_hash_ms, was.tex_hash_ms), d(now.memexport_run, was.memexport_run), d(now.memexport_waits, was.memexport_waits), d(now.memexport_wait_ms, was.memexport_wait_ms), d(now.pipelines_created, was.pipelines_created), d(now.pipeline_ms, was.pipeline_ms));
+      }
+
+      if (renderer >= threshold)
+        ++slow_frames_logged_;
+    }
+
+    frame_prev_ = now;
+  }
+
   // Every sst_native_log_every frames: where the frame time went.
   void Renderer::LogProfile()
   {
@@ -109,6 +184,7 @@ namespace sst::native
     {
       const double wall_ms = std::chrono::duration<double, std::milli>(now - p.period_start).count();
       const double ms_per_tick = wall_ms / double(std::max<uint64_t>(1, tsc - p.period_tsc));
+      ms_per_tick_ = ms_per_tick;
       const double frames = double(p.frames);
 
       auto ms = [&](Phase ph)

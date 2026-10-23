@@ -203,6 +203,21 @@ namespace sst::native
     Profile prof_;
     bool threaded_ = false;
 
+    struct FrameSnapshot
+    {
+      uint64_t ticks[kPhCount] = {};
+      uint64_t draws = 0, memexport_run = 0, memexport_waits = 0, pipelines_created = 0;
+      double memexport_wait_ms = 0, pipeline_ms = 0;
+      uint64_t tex_created = 0, tex_uploads = 0, tex_upload_bytes = 0, tex_hashed_bytes = 0;
+      double tex_upload_ms = 0, tex_hash_ms = 0;
+    };
+
+    FrameSnapshot frame_prev_;
+    double ms_per_tick_ = 0; // TSC calibration from the last profile period (0 until the first one)
+    uint32_t slow_frames_logged_ = 0;
+    FrameSnapshot TakeFrameSnapshot() const;
+    void CheckSlowFrame(uint64_t frame);
+
     // Device-removed diagnostics: what each draw op of the last frames was (frame number, labels in draw-op order), per frame slot
     struct DrawLabels
     {
@@ -281,15 +296,29 @@ namespace sst::native
       bool dynamic = false;        // changes too often to cache
       uint32_t stable = 0;         // consecutive checks with unchanged data
       uint64_t checked_frame = 0;  // frame of the last hash check
+      uint32_t stamp = 0;          // write-watch stamp of the guest source taken before the last unchanged hash check
+      bool armed = false;          // its pages are watched and `stamp` is valid
+      bool no_watch = false;       // its pages are written often while the data stays the same: hashed every frame instead
+      uint8_t false_alarms = 0;    // stamp changed, data didn't
+      uint64_t verified_frame = 0; // frame of the last hash check that found the data unchanged
     };
 
-    // An entry whose data never changed in several checks and was already checked this frame is trusted for the rest of the frame (static meshes are drawn several times a frame: shadow cascades + scene). Every entry is still checked once per frame: data rewritten in place between frames (UI, menus, loading screens) must show up on the next frame, not a few later
+    // An entry whose data never changed in several checks and was already checked this frame is trusted for the rest of the frame (static meshes are drawn several times a frame: shadow cascades + scene). Otherwise an entry is checked once per frame (data rewritten in place between frames (UI, menus, loading screens) must show up on the next frame), unless the write watch vouches for it across frames.
     bool GeoTrusted(const GeoEntry &e) const { return e.changes == 0 && e.stable >= 4 && e.size && e.generation == geo_generation_ && e.checked_frame == submitted_; }
+
     void GeoChecked(GeoEntry &e, bool unchanged)
     {
       e.stable = unchanged ? e.stable + 1 : 0;
       e.checked_frame = submitted_;
     }
+
+    // Across frames: an entry whose guest pages were not written since its last unchanged check (write watch stamp) is trusted without hashing, for up to kGeoReverifyFrames frames; then it is hashed again, which also catches a write the watch missed (cross-frame trust then turns itself off)
+    static constexpr uint64_t kGeoReverifyFrames = 60;
+    bool GeoWatchUsable() const;
+    bool GeoWatchTrusted(const GeoEntry &e, uint32_t stamp) const { return e.armed && !e.no_watch && e.changes == 0 && e.stable >= 4 && e.size && e.generation == geo_generation_ && e.stamp == stamp && submitted_ - e.verified_frame < kGeoReverifyFrames; }
+    void GeoWatchVerified(GeoEntry &e, uint32_t stamp, bool watch);
+    void GeoWatchChanged(GeoEntry &e, uint32_t stamp, bool watch);
+    bool geo_watch_off_ = false; // a write the watch missed was found: hash every frame again (this session)
 
     bool GeoCacheUsable();
     void GeoStore(GeoEntry &e, const Upload &src, uint32_t size);
@@ -709,7 +738,7 @@ namespace sst::native
       uint64_t constants_uploaded = 0, constants_reused = 0;
       uint64_t resolves = 0, resolves_logged = 0;
       uint64_t resolves_done = 0, resolves_skipped = 0, rects_converted = 0, host_rts = 0, presented_from_resolve = 0;
-      uint64_t geo_vertex_hits = 0, geo_index_hits = 0, geo_stores = 0, geo_store_bytes = 0, geo_dynamic = 0, geo_flushes = 0, geo_trusted = 0;
+      uint64_t geo_vertex_hits = 0, geo_index_hits = 0, geo_stores = 0, geo_store_bytes = 0, geo_dynamic = 0, geo_flushes = 0, geo_trusted = 0, geo_watch_trusted = 0, geo_watch_arms = 0, geo_watch_false = 0;
       uint64_t scissored_draws = 0, scissor_logged = 0;
       uint64_t pipelines_created = 0, pipelines_failed = 0, pipelines_from_cache = 0, skip_pipeline_pending = 0;
       double pipeline_ms = 0;

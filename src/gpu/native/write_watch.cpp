@@ -67,6 +67,14 @@ namespace sst::native::write_watch
     return sum;
   }
 
+  void Touch(uint32_t phys, uint32_t size)
+  {
+    const uint32_t last = std::min((phys + std::max(size, 1u) - 1) >> 12, kPages - 1);
+
+    for (uint32_t p = phys >> 12; p <= last; ++p)
+      g_writes[p].fetch_add(1, std::memory_order_relaxed);
+  }
+
   void Arm(uint32_t phys, uint32_t size)
   {
     if (g_memory)

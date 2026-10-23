@@ -3,6 +3,7 @@
 #include "gpu/native/draw_context.h"
 #include "gpu/native/guest_watch.h"
 #include "gpu/native/renderer_debug.h"
+#include "gpu/native/write_watch.h"
 
 namespace sst::native
 {
@@ -423,23 +424,58 @@ namespace sst::native
         }
         else
         {
-          ihash = XXH3_64bits(ib_src, ib_src_bytes);
+          // Write watch (physical views only): stamp, arm, then hash, a write after the stamp is either in the data hashed or changes the stamp
+          const uint32_t ib_phys = ib_addr & 0x1FFFFFFFu;
+          const bool watch = ib_addr >= 0xA0000000u && ib_addr < 0xE0000000u && !ientry->no_watch && GeoWatchUsable();
+          const uint32_t stamp = watch ? write_watch::Stamp(ib_phys + aligned_begin, aligned_end - aligned_begin) : 0;
 
-          if (ientry->hash == ihash && ientry->generation == geo_generation_ && ientry->size)
+          if (watch && GeoWatchTrusted(*ientry, stamp))
           {
+            ihash = ientry->hash;
             index_hit = true;
             vmin = ientry->vmin;
             vmax = ientry->vmax;
-            GeoChecked(*ientry, true);
-          }
-          else if (ientry->hash && ientry->hash != ihash && ++ientry->changes >= 2)
-          {
-            ientry->dynamic = true;
-            ientry = nullptr;
+            ientry->checked_frame = submitted_;
+            ++stats_.geo_trusted;
+            ++stats_.geo_watch_trusted;
           }
           else
           {
-            GeoChecked(*ientry, false);
+            if (watch)
+            {
+              write_watch::Arm(ib_phys + aligned_begin, aligned_end - aligned_begin);
+              ++stats_.geo_watch_arms;
+            }
+
+            ihash = XXH3_64bits(ib_src, ib_src_bytes);
+
+            if (ientry->hash == ihash && ientry->generation == geo_generation_ && ientry->size)
+            {
+              index_hit = true;
+              vmin = ientry->vmin;
+              vmax = ientry->vmax;
+              GeoChecked(*ientry, true);
+              GeoWatchVerified(*ientry, stamp, watch);
+            }
+            else
+            {
+              const bool changed = ientry->hash && ientry->hash != ihash;
+
+              if (changed)
+                GeoWatchChanged(*ientry, stamp, watch);
+              else
+                ientry->armed = false;
+
+              if (changed && ++ientry->changes >= 2)
+              {
+                ientry->dynamic = true;
+                ientry = nullptr;
+              }
+              else
+              {
+                GeoChecked(*ientry, false);
+              }
+            }
           }
         }
       }
@@ -750,33 +786,74 @@ namespace sst::native
         }
         else
         {
-          // One hashing state, reused (creating one per draw allocated)
-          static thread_local XXH3_state_t *st = XXH3_createState();
-          XXH3_64bits_reset(st);
+          // Write watch: the streams' referenced ranges (physical), stamped, armed, then hashed, a write after the stamp is either in the data hashed or changes the stamp
+          bool watch = !ventry->no_watch && GeoWatchUsable();
+          uint32_t stamp = 0;
 
-          for (uint32_t i = 0; i < fetch_stream_count; ++i)
-            XXH3_64bits_update(st, resolved[i].src + size_t(first_vertex) * fetch_streams[i].stride, size_t(vertex_count) * fetch_streams[i].stride);
-
-          vhash = XXH3_64bits_digest(st);
-
-          if (ventry->hash == vhash && ventry->generation == geo_generation_ && ventry->size)
+          for (uint32_t i = 0; watch && i < fetch_stream_count; ++i)
           {
+            if (!resolved[i].phys || resolved[i].src != physical_membase_ + resolved[i].phys) // (not the game thread's draw-time copy: it can be older than the last check)
+              watch = false;
+            else
+              stamp += write_watch::Stamp(uint32_t(resolved[i].phys + uint64_t(first_vertex) * fetch_streams[i].stride), vertex_count * fetch_streams[i].stride) * (2 * i + 1);
+          }
+
+          if (watch && GeoWatchTrusted(*ventry, stamp))
+          {
+            vhash = ventry->hash;
             vhit = true;
-            GeoChecked(*ventry, true);
+            ventry->checked_frame = submitted_;
+            ++stats_.geo_trusted;
+            ++stats_.geo_watch_trusted;
           }
           else
           {
-            if (ventry->hash && ventry->hash != vhash)
-              mark_vertices_changed(); // the game rewrites this data: the game thread copies it with the draws from now on
-
-            if (ventry->hash && ventry->hash != vhash && ++ventry->changes >= 2)
+            if (watch)
             {
-              ventry->dynamic = true; // keeps changing: stop caching it
-              ventry = nullptr;
+              for (uint32_t i = 0; i < fetch_stream_count; ++i)
+                write_watch::Arm(uint32_t(resolved[i].phys + uint64_t(first_vertex) * fetch_streams[i].stride), vertex_count * fetch_streams[i].stride);
+
+              ++stats_.geo_watch_arms;
+            }
+
+            // One hashing state, reused (creating one per draw allocated)
+            static thread_local XXH3_state_t *st = XXH3_createState();
+            XXH3_64bits_reset(st);
+
+            for (uint32_t i = 0; i < fetch_stream_count; ++i)
+              XXH3_64bits_update(st, resolved[i].src + size_t(first_vertex) * fetch_streams[i].stride, size_t(vertex_count) * fetch_streams[i].stride);
+
+            vhash = XXH3_64bits_digest(st);
+
+            if (ventry->hash == vhash && ventry->generation == geo_generation_ && ventry->size)
+            {
+              vhit = true;
+              GeoChecked(*ventry, true);
+              GeoWatchVerified(*ventry, stamp, watch);
             }
             else
             {
-              GeoChecked(*ventry, false);
+              const bool changed = ventry->hash && ventry->hash != vhash;
+
+              if (changed)
+              {
+                GeoWatchChanged(*ventry, stamp, watch);
+                mark_vertices_changed();
+              }
+              else
+              {
+                ventry->armed = false;
+              }
+
+              if (changed && ++ventry->changes >= 2)
+              {
+                ventry->dynamic = true; // keeps changing: stop caching it
+                ventry = nullptr;
+              }
+              else
+              {
+                GeoChecked(*ventry, false);
+              }
             }
           }
         }

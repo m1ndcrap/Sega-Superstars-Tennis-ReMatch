@@ -67,6 +67,15 @@ namespace sst::native
       unchanged_.clear();
     }
 
+    // Running totals for the renderer's slow-frame report (renderer_profile.cpp)
+    struct Counters
+    {
+      uint64_t created = 0, uploads = 0, upload_bytes = 0, hashed_bytes = 0;
+      double upload_ms = 0, hash_ms = 0;
+    };
+
+    Counters TotalCounters() const { return {stats_.created, stats_.uploads, stats_.upload_bytes, stats_.hashed_bytes, stats_.upload_ms, stats_.hash_ms}; }
+
   private:
     struct Snapshot
     {

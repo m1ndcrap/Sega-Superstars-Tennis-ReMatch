@@ -21,6 +21,9 @@ namespace sst::native::write_watch
   // Changes whenever any page of [phys, phys + size) is written (or memory is released)
   uint32_t Stamp(uint32_t phys, uint32_t size);
 
+  // Counts [phys, phys + size) as written: for the renderer's own host writes into guest memory (memexport output), which the watch can't see
+  void Touch(uint32_t phys, uint32_t size);
+
   // Watch [phys, phys + size) for writes (pages already watched cost a flag check)
   void Arm(uint32_t phys, uint32_t size);
 

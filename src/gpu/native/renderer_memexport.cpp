@@ -1,6 +1,7 @@
 // Native renderer: memory-export (morph) shaders, run on the CPU
 
 #include "gpu/native/renderer_internal.h"
+#include "gpu/native/write_watch.h"
 
 namespace sst::native
 {
@@ -185,6 +186,9 @@ namespace sst::native
 
       // Consumers this frame read these ranges (checks in Draw)
       memexport_written_.push_back({streams[i].begin, streams[i].begin + streams[i].size});
+
+      // The job writes guest memory from the host, unseen by the write watch: counted as written now and again when it finishes, so geometry cached from this range across frames is checked again
+      write_watch::Touch(streams[i].begin, streams[i].size);
     }
 
     // --sst_native_memexport_dump: the first 3 runs of each shader, run here (synchronously) so the output can be saved with the inputs
@@ -353,6 +357,9 @@ namespace sst::native
 
     ++stats_.memexport_run;
     const uint64_t written = job.stats.elements;
+
+    for (uint32_t i = 0; i < p.stream_count; ++i)
+      write_watch::Touch(p.begin[i], p.size[i]);
 
     if (!job.ok || !written)
     {

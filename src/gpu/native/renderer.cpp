@@ -17,6 +17,8 @@ REXCVAR_DEFINE_BOOL(sst_native_memexport, true, "SST", "Native renderer: run mem
 REXCVAR_DEFINE_BOOL(sst_native_present_queue, true, "SST", "Native renderer (render thread): show every frame once, in order, keeping one in reserve after a late frame (smooth, ~1 frame more latency). false = always show the newest frame");
 REXCVAR_DEFINE_INT32(sst_native_present_wait_ms, 4, "SST", "Native renderer: at a swap, wait up to this long for the render thread to finish a new frame before showing the previous one again (0 = never wait)");
 REXCVAR_DEFINE_INT32(sst_native_geometry_cache_mb, 384, "SST", "Native renderer: video memory for decoded vertex / index data kept between frames (0 = decode every draw)");
+REXCVAR_DEFINE_INT32(sst_native_slow_frame_ms, 0, "SST", "Native renderer, debug: log any frame whose render-thread work takes at least this many ms, with what it spent the time on (0 = off; 25 is a good value)");
+REXCVAR_DEFINE_BOOL(sst_native_geometry_watch, true, "SST", "Native renderer: trust cached geometry across frames while the write watch reports its guest pages unwritten (hashed again every 60 frames); false: hash every cached buffer once a frame as before");
 REXCVAR_DEFINE_BOOL(sst_native_pipeline_async, true, "SST", "Native renderer: create new pipelines on background threads (a draw whose pipeline isn't ready yet is skipped for those frames instead of stalling)");
 REXCVAR_DEFINE_BOOL(sst_native_pipeline_library, true, "SST", "Native renderer: keep created pipelines in cache/pipelines.bin so later runs load them instead of compiling");
 REXCVAR_DEFINE_INT32(sst_native_rt_trace, 0, "SST", "Native renderer debug: log the render-target passes, clears and resolves of this frame number (F10 traces the next frame)");
@@ -37,6 +39,7 @@ REXCVAR_DEFINE_BOOL(sst_native_skip_blended, false, "SST", "Native renderer debu
 REXCVAR_DEFINE_BOOL(sst_native_check_late_writes, false, "SST", "Native renderer debug: report draws whose index / vertex data the game changes after issuing the draw (within the frame)");
 REXCVAR_DEFINE_INT32(sst_native_capture_frame, 0, "SST", "Native renderer debug: capture this frame number (as F9 does): every draw's vertex positions from the GPU are compared with the original shader run on the CPU. -1 = every frame, logging only disagreements (slow)");
 REXCVAR_DEFINE_BOOL(sst_native_ui_fit, true, "SST", "Native renderer: keep 2D UI in a 16:9 box at other aspect ratios (debug: false stretches it, to tell UI fitting apart from game-side issues)");
+REXCVAR_DEFINE_BOOL(sst_native_ui_fit_skip_3d, true, "SST", "Native renderer, wide aspect ratios: don't measure depth-tested draws of the 3D scene on the CPU for UI fitting (they are 3D, never fitted; saves render-thread time in busy stadiums). Debug: false measures them as before");
 REXCVAR_DEFINE_BOOL(sst_native_wide_targets, true, "SST", "Native renderer: render targets take the display's shape (2520x1080 at 21:9 and 1080p) instead of a 16:9 image stretched to it");
 REXCVAR_DEFINE_BOOL(sst_native_scissor, true, "SST", "Native renderer: apply the game's scissor rectangle (menus clip panels with it)");
 
@@ -714,6 +717,7 @@ namespace sst::native
     }
 
     prof_.last_frame = now;
+    CheckSlowFrame(submitted_);
 
     if (textures_)
       textures_->ClearSnapshots(); // their memory (the frame's arena) is recycled after this
@@ -760,8 +764,8 @@ namespace sst::native
     REXLOG_INFO("[sst-native]   memexport: {} draws, {} run ({} in the background, render thread waited {} times), constants: {} files uploaded, {} reused", s.memexport_draws, s.memexport_run, s.memexport_async, s.memexport_waits, s.constants_uploaded, s.constants_reused);
     REXLOG_INFO("[sst-native]   render targets: {} host targets made, resolves {} done / {} skipped, rectangle lists {}, frames shown from the front-buffer resolve {}", s.host_rts, s.resolves_done, s.resolves_skipped, s.rects_converted, s.presented_from_resolve);
 
-    REXLOG_INFO("[sst-native]   geometry cache: vertex hits {}, index hits {} ({} trusted without re-hashing), stored {} ({:.1f} MB), dynamic (decoded each time) {}, flushes {}; {} keys, {:.0f} of {} MB used",
-                s.geo_vertex_hits, s.geo_index_hits, s.geo_trusted, s.geo_stores, double(s.geo_store_bytes) / (1 << 20), s.geo_dynamic, s.geo_flushes, geo_entries_.size(), double(geo_offset_) / (1 << 20), geo_pool_size_ >> 20);
+    REXLOG_INFO("[sst-native]   geometry cache: vertex hits {}, index hits {} ({} trusted without re-hashing, {} of them across frames by the write watch; {} watch arms, {} false alarms{}), stored {} ({:.1f} MB), dynamic (decoded each time) {}, flushes {}; {} keys, {:.0f} of {} MB used",
+                s.geo_vertex_hits, s.geo_index_hits, s.geo_trusted, s.geo_watch_trusted, s.geo_watch_arms, s.geo_watch_false, geo_watch_off_ ? "; watch OFF" : "", s.geo_stores, double(s.geo_store_bytes) / (1 << 20), s.geo_dynamic, s.geo_flushes, geo_entries_.size(), double(geo_offset_) / (1 << 20), geo_pool_size_ >> 20);
 
     REXLOG_INFO("[sst-native]   memexport: {} draws, {} run ({:.2f} ms total, {:.3f} ms/frame), {} cached, {} not run; totals: {} vertices, {} elements, bad address {}, bad format {}, out of range {}, fetch out of bounds {}, malformed {}, per-vertex {}",
                 s.memexport_draws, s.memexport_run, s.memexport_ms, s.memexport_ms / double(std::max<uint64_t>(1, frame - last_stats_frame_)), s.memexport_cached, s.memexport_failed, m.vertices, m.elements, m.bad_address, m.bad_format, m.out_of_range, m.fetch_oob, m.malformed, m.per_vertex_draws);

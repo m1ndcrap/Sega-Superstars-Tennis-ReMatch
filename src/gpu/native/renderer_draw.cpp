@@ -449,7 +449,10 @@ namespace sst::native
     {
       // Draws that test and write depth are 3D (never measured: running every 3D draw's vertex shader on the CPU costs a lot of frame time). Small ones (a quad) are measured anyway: 2D sprites drawn with depth (e.g. character select's loading ring) are flat and get fitted
       const bool depth_test = (depthcontrol & 6) == 6; // Z_ENABLE + Z_WRITE_ENABLE
-      const bool measure = !depth_test || vertex_count <= 6;
+
+      // In the 3D scene's target, a draw that tests depth is 3D and is not fitted as the unmeasured case below decides too. Measuring each of them on the CPU cost up to ~3.5 ms of render thread per frame... Small ones are still measured like 2D sprites
+      const bool scene_3d = REXCVAR_GET(sst_native_ui_fit_skip_3d) && (depthcontrol & 2) && vertex_count > 6 && scene_surfaces_.count(rt0);
+      const bool measure = (!depth_test || vertex_count <= 6) && !scene_3d;
       const DrawExtent ext = measure ? MeasureDraw(base, call, vs_obj, vs_entry, first_vertex, vertex_count) : DrawExtent{};
 
       if (depth_test && scene_surfaces_.count(rt0) && vertex_count <= 6 && vs_entry && LogOnce(0xD100000000000000ull ^ vs_entry->hash ^ (uint64_t(ext.ok) << 40) ^ (uint64_t(ext.flat) << 41)))
@@ -492,7 +495,7 @@ namespace sst::native
         const bool z_test = (depthcontrol & 2) != 0;
         ui_fit = !draw_composite_ && (!scene_surfaces_.count(rt0) || (call.up_data && !z_test));
 
-        if (scene_surfaces_.count(rt0) && vs_entry && vertex_count <= 64 && LogOnce(0xD000000000000000ull ^ vs_entry->hash ^ (uint64_t(z_test) << 40)))
+        if (!scene_3d && scene_surfaces_.count(rt0) && vs_entry && vertex_count <= 64 && LogOnce(0xD000000000000000ull ^ vs_entry->hash ^ (uint64_t(z_test) << 40)))
           REXLOG_INFO("[sst-native] aspect: unmeasured draw in the 3D target (vs {:016X}, prim {}, {} vertices, {}, depth {:08X}) - {}", vs_entry->hash, call.prim, vertex_count, call.up_data ? "user memory" : "vertex buffer", depthcontrol, ui_fit ? "fitted" : "not fitted");
       }
 

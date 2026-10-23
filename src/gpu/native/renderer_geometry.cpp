@@ -2,6 +2,7 @@
 
 #include "gpu/native/draw_context.h"
 #include "gpu/native/renderer_debug.h"
+#include "gpu/native/write_watch.h"
 
 namespace sst::native
 {
@@ -43,6 +44,48 @@ namespace sst::native
     }
 
     return true;
+  }
+
+  bool Renderer::GeoWatchUsable() const
+  {
+    return !geo_watch_off_ && REXCVAR_GET(sst_native_geometry_watch) && write_watch::Enabled();
+  }
+
+  void Renderer::GeoWatchVerified(GeoEntry &e, uint32_t stamp, bool watch)
+  {
+    if (!watch || e.no_watch)
+    {
+      e.armed = false;
+      return;
+    }
+
+    // Pages written while the data stayed the same: the entry shares pages with data the game rewrites; after a few, it is hashed every frame as before (no more faults for it)
+    if (e.armed && e.stamp != stamp)
+    {
+      ++stats_.geo_watch_false;
+
+      if (++e.false_alarms > 8)
+      {
+        e.no_watch = true;
+        e.armed = false;
+        return;
+      }
+    }
+
+    e.stamp = stamp;
+    e.armed = true;
+    e.verified_frame = submitted_;
+  }
+
+  void Renderer::GeoWatchChanged(GeoEntry &e, uint32_t stamp, bool watch)
+  {
+    if (watch && e.armed && e.stamp == stamp && !geo_watch_off_)
+    {
+      geo_watch_off_ = true;
+      REXLOG_WARN("[sst-native] geometry cache: guest data changed without the write watch seeing it; cached geometry is hashed every frame again for this session");
+    }
+
+    e.armed = false;
   }
 
   gfx::GpuAddress Renderer::GeoAddress(const GeoEntry &e) const
