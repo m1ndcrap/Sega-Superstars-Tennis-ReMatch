@@ -12,6 +12,7 @@
 #include <rex/ppc/func.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <initializer_list>
@@ -58,6 +59,18 @@ namespace sst::menu::page
     };
 
     constexpr std::pair<uint32_t, int> kPauseEvents[] = {{0xF5BF6BF3, kLeft}, {0x5856F909, kRight}, {0xB0A4EB7F, kUp}, {0xA3AD84E1, kDown}, {0x2FAB294A, kSelect}, {0xA979AAA1, kBack}};
+
+    // The value text each visible line is drawn in (UpdateDims): Settings > VIDEO, GENERAL's value objects, the pause menu, the spare value text at the line's place on screen
+    controls::Dim g_dim_main[kVisible] = {{0x84383A9D}, {0x2A0D35CF}, {0x50DB65BA}, {0x9BCCFC3F}};
+    std::array<controls::Dim, pause::kRows> g_dim_pause = []
+    {
+      std::array<controls::Dim, pause::kRows> dims{};
+
+      for (int line = 0; line < pause::kRows; ++line)
+        dims[line].hash = pause::kSpareValue + uint32_t(pause::kVisualOrder[line]);
+
+      return dims;
+    }();
 
     // What the page script plays after an event
     enum Sound : int
@@ -790,6 +803,32 @@ namespace sst::menu::page
     }
 
     return false;
+  }
+
+  void UpdateDims(PPCContext &ctx, uint8_t *base)
+  {
+    bool dim_main[kVisible] = {}, dim_pause[pause::kRows] = {};
+    bool pause = false;
+    {
+      std::lock_guard lock(MenuMutex());
+      const List &l = g_list;
+      const Settings &s = Current();
+      pause = l.pause;
+      const bool greyed = !l.keys && !l.general && !l.leave && !ResolutionFits(s, s.v[kResolution]);
+
+      for (int line = 0; line < (pause ? int(pause::kRows) : kVisible); ++line)
+      {
+        const bool on = greyed && l.Row(l.top + line) == kResolution;
+        (pause ? dim_pause : dim_main)[line] = on;
+      }
+    }
+
+    // (the other page's texts get their alpha back, if they still have them dimmed)
+    for (int line = 0; line < kVisible; ++line)
+      controls::DimText(ctx, base, g_dim_main[line], !pause && dim_main[line]);
+
+    for (int line = 0; line < pause::kRows; ++line)
+      controls::DimText(ctx, base, g_dim_pause[line], pause && dim_pause[line]);
   }
 
   std::vector<Anim> TakeAnims()

@@ -85,13 +85,6 @@ namespace sst::menu::controls
     }
 
     // VIBRATION is grayed (half alpha, similar to how the game grays the main menu's Xbox LIVE item which is now renamed as ONLINE PLAY in this port)
-    struct Dim
-    {
-      uint32_t hash;
-      bool active = false;
-      uint8_t written = 0, original = 0xFF;
-    };
-
     Dim g_dim_controls[] = {{0x7D139BC8}, {0x9FFE01DC}, {0xC9C4FF84}}; // VIBRATION, OFF, ON (SETTINGS_CONTROLLER\OPTION_2)
     Dim g_dim_pause[] = {{0x2408EA3F}, {0xAF864C0C}};                  // VIBRATION, its value (pause menu row F8A9F905)
 
@@ -111,43 +104,11 @@ namespace sst::menu::controls
       SceneCall(ctx, base, sub_82283318, values, types, 2);
     }
 
-    // Each frame: halves the texts' alpha (the game's own alpha changes - fades, highlights - are followed), or puts it back
     template <size_t N>
     void DimTexts(PPCContext &ctx, uint8_t *base, Dim (&dims)[N], bool dim)
     {
       for (Dim &d : dims)
-      {
-        if (!dim && !d.active)
-          continue;
-
-        const uint32_t obj = FindObject(ctx, base, d.hash);
-
-        if (!obj)
-        {
-          d.active = false;
-          continue;
-        }
-
-        const uint8_t a = *GuestPtr(base, obj + 0xB);
-
-        if (dim)
-        {
-          if (!d.active || a != d.written)
-          {
-            d.original = a;
-            d.written = uint8_t(a / 2);
-            d.active = true;
-            SetAlpha(ctx, base, d.hash, d.written);
-          }
-        }
-        else
-        {
-          if (a == d.written)
-            SetAlpha(ctx, base, d.hash, d.original);
-
-          d.active = false;
-        }
-      }
+        DimText(ctx, base, d, dim);
     }
 
     // The navbar call (2:5, three arguments, the button list in the second): a copy of the list with a fourth button, Y
@@ -269,6 +230,41 @@ namespace sst::menu::controls
       }
 
       return false;
+    }
+  }
+
+  // Each frame: halves the text's alpha (to basically gray it out) or puts it back
+  void DimText(PPCContext &ctx, uint8_t *base, Dim &d, bool dim)
+  {
+    if (!dim && !d.active)
+      return;
+
+    const uint32_t obj = FindObject(ctx, base, d.hash);
+
+    if (!obj)
+    {
+      d.active = false;
+      return;
+    }
+
+    const uint8_t a = *GuestPtr(base, obj + 0xB);
+
+    if (dim)
+    {
+      if (!d.active || a != d.written)
+      {
+        d.original = a;
+        d.written = uint8_t(a / 2);
+        d.active = true;
+        SetAlpha(ctx, base, d.hash, d.written);
+      }
+    }
+    else
+    {
+      if (a == d.written)
+        SetAlpha(ctx, base, d.hash, d.original);
+
+      d.active = false;
     }
   }
 

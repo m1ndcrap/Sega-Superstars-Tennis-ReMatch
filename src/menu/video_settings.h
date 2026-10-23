@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "window/window_fit.h"
+
 #include <array>
 #include <functional>
 #include <string>
@@ -106,9 +108,9 @@ namespace sst::menu::video
   bool Load(Settings &s);
   void Save(const Settings &s);
 
-  // Sets the cvars the renderer and presenter read; fullscreen goes through the handler (SetFullscreenHandler)
+  // Sets the cvars the renderer and presenter read; the window (fullscreen, windowed size and shape) goes through the handler (SetWindowHandler)
   void Apply(const Settings &s);
-  void SetFullscreenHandler(std::function<void(bool)> handler);
+  void SetWindowHandler(std::function<void(const sst::window::Request &)> handler);
 
   void ApplyPreset(Settings &s, int preset);
 
@@ -127,6 +129,9 @@ namespace sst::menu::video
   // The settings in use. Callers hold MenuMutex() (menu_internal.h)
   Settings &Current();
   BootSettings &Boot();
+
+  // This RESOLUTION value fits on the monitor at the aspect ratio
+  bool ResolutionFits(const Settings &s, int value);
 
   // ASPECT RATIO / SHADER PRECISION differ from what this run started with
   bool RestartNeeded();

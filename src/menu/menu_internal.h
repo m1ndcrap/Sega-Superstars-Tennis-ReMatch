@@ -127,6 +127,9 @@ namespace sst::menu
     constexpr uint32_t kAnimShow = 0, kAnimHide = 1;
     std::vector<Anim> TakeAnims();
 
+    // After the page's per-frame natives (kPageFrame; kPauseEvent, kEvent): RESOLUTION's value grayed while it is more than the monitor can show (video::ResolutionFits), its alpha back otherwise and when the page leaves. Outside the page's lock (it calls scene natives)
+    void UpdateDims(PPCContext &ctx, uint8_t *base);
+
     // The pause menu's VIDEO page has its scroll bar up (the rest of the pause menu keeps it hidden)
     bool ScrollBarShown();
 
@@ -156,6 +159,16 @@ namespace sst::menu
     // Calls a scene native directly, as the dispatcher would (r3 result, r4 kept, r5 values, r6 types, r7 count), not through the dispatcher, which pushes the result on the calling script's stack
     void SceneCall(PPCContext &ctx, uint8_t *base, void (*native)(PPCContext &__restrict, uint8_t *), const uint32_t *values, const uint8_t *types, uint32_t count);
     void SceneShow(PPCContext &ctx, uint8_t *base, uint32_t object, bool show);
+
+    // A text grayed out (half alpha, as the game grays its Xbox LIVE item), called each frame: the game's own alpha changes (fades, highlights) are followed. With `dim` false it gets its alpha back
+    struct Dim
+    {
+      uint32_t hash;
+      bool active = false;
+      uint8_t written = 0, original = 0xFF;
+    };
+
+    void DimText(PPCContext &ctx, uint8_t *base, Dim &d, bool dim);
   }
 
   // script_start.cpp:

@@ -38,8 +38,6 @@ namespace sst::menu::pause
     // New objects (hashes chosen outside the scene's)
     constexpr uint32_t kNewRow = 0x53560006;
     constexpr uint32_t kNewRowChild = 0x53560010; // + 0..3, copies of RETRY's children
-    constexpr uint32_t kSpareLabel = 0x53560020;  // + row
-    constexpr uint32_t kSpareValue = 0x53560030;  // + row
     // The VIDEO page's scroll bar (pause_patch.h)
     constexpr uint32_t kPanelGroup = 0x26F7E3DD; // the panel (edges, body); its colour fades the menu in and out
     constexpr uint32_t kDarkStrip = 0x0944873D;  // the confirmation dialog's body: a dark blue strip (texture 85FE4B82)

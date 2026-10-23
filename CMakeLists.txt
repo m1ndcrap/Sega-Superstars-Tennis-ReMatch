@@ -47,6 +47,7 @@ set(SSTREMATCH_SOURCES
   src/debug/scene_guard.cpp
   src/input/cursor.cpp
   src/input/lightbar.cpp
+  src/window/window_fit.cpp
 )
 
 # The native renderer uses D3D12 or Vulkan on Windows, Vulkan on Linux
@@ -113,6 +114,7 @@ endif()
 
 if(WIN32)
   list(APPEND SSTREMATCH_SOURCES icon/icon.rc)
+  set_source_files_properties(icon/icon.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/icon/icon.ico")
   add_executable(sst_rematch WIN32 ${SSTREMATCH_SOURCES})
 else()
   add_executable(sst_rematch ${SSTREMATCH_SOURCES})
@@ -124,9 +126,9 @@ if(WIN32 OR SST_NATIVE_LINUX)
   target_compile_definitions(sst_rematch PRIVATE SST_NATIVE_RENDERER=1)
 endif()
 
-# src/input/lightbar.cpp writes the PlayStation pads' HID output reports
+# src/input/lightbar.cpp writes the PlayStation pads' HID output reports; src/window/window_fit.cpp subclasses the game window (comctl32)
 if(WIN32)
-  target_link_libraries(sst_rematch PRIVATE hid setupapi ole32)
+  target_link_libraries(sst_rematch PRIVATE hid setupapi ole32 comctl32)
 endif()
 
 # Linker map next to the exe: turns the "sst_rematch.exe+0x..." frames of a crash report (sst_crash.txt) into function names

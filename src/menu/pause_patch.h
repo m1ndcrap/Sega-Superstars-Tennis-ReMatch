@@ -24,6 +24,9 @@ namespace sst::menu::pause
   constexpr uint32_t kTextBlank = 0x5354FF00;
   constexpr uint32_t kTextVideo = 0x5354FF01;
 
+  // Spare label / value texts the VIDEO page writes + the row's place on screen (0-6, top to bottom)
+  constexpr uint32_t kSpareLabel = 0x53560020, kSpareValue = 0x53560030;
+
   // The VIDEO page's scroll bar (added to the scene; the port hides kScrollGroup (4:5) except on the VIDEO page; the thumb's key kScrollPos + i is scroll position i)
   constexpr uint32_t kScrollGroup = 0x53560040, kScrollTrack = 0x53560041, kScrollThumb = 0x53560042;
   constexpr uint32_t kScrollHide = 0x53560048, kScrollShow = 0x53560049, kScrollPos = 0x53560050;

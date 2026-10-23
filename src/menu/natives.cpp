@@ -225,6 +225,11 @@ extern "C" REX_FUNC(sub_821DFBC0)
 
     ctx.r3.u32 = call.out;
     PlayAnims(ctx, base);
+
+    // The list pages' per-frame natives: RESOLUTION grayed while it is more than the monitor can show
+    if ((id & 0xFF) == kPageFrame || (id & 0xFF) == kPauseEvent || (id & 0xFF) == kEvent)
+      page::UpdateDims(ctx, base);
+
     return;
   }
 

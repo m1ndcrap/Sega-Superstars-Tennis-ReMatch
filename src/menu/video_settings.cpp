@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-REXCVAR_DEFINE_INT32(sst_resolution, 720, "SST", "Internal resolution in lines: 480, 720, 1080, 1440, 2160 (VIDEO page)");
+REXCVAR_DEFINE_INT32(sst_resolution, 720, "SST", "Internal resolution in lines: 480, 720, 1080, 1440, 2160, at most what the monitor shows at the aspect ratio. Windowed it sets the window's size, and the internal resolution then follows the window (sst_window_resolution; VIDEO page)");
 REXCVAR_DEFINE_INT32(sst_render_scale, 100, "SST", "3D render scale in percent of the internal resolution, 50-100 (the UI stays at the internal resolution; VIDEO page)");
 REXCVAR_DEFINE_INT32(sst_shadow_size, 1024, "SST", "Shadow map size: 0 (shadows off), 128-2048 (the game's is 1024; 3D textures stop at 2048 in D3D12; VIDEO page)");
 REXCVAR_DEFINE_INT32(sst_aa_type, 0, "SST", "Anti-aliasing: 0 off, 1 FXAA, 2 MSAA (VIDEO page)");
@@ -51,9 +51,18 @@ namespace sst::menu::video
         {5, 3, 10, kMsaa, 1},  // HIGH: 2048 shadows, 1440p, MSAA 4x
     };
 
+    // The aspect ratio the window shows: the presenter's (4:3 picked after startup shows 16:9 until the restart, as the renderer does)
+    float WindowAspect(const Settings &s, const BootSettings &boot)
+    {
+      static constexpr float kAspectValues[5] = {4.0f / 3.0f, 16.0f / 9.0f, 1.6f, 21.0f / 9.0f, 32.0f / 9.0f};
+      const int aspect = boot.four_three ? 0 : s.v[kAspect] == 0 ? 1
+                                                                 : s.v[kAspect];
+      return kAspectValues[aspect];
+    }
+
     Settings g_current;
     BootSettings g_boot;
-    std::function<void(bool)> g_set_fullscreen;
+    std::function<void(const sst::window::Request &)> g_set_window;
 
     // The preset the rows match (CUSTOM if none)
     void UpdatePreset(Settings &s)
@@ -124,7 +133,7 @@ namespace sst::menu::video
   Settings &Current() { return g_current; }
   BootSettings &Boot() { return g_boot; }
 
-  void SetFullscreenHandler(std::function<void(bool)> handler) { g_set_fullscreen = std::move(handler); }
+  void SetWindowHandler(std::function<void(const sst::window::Request &)> handler) { g_set_window = std::move(handler); }
 
   Settings FromFlags()
   {
@@ -258,8 +267,15 @@ namespace sst::menu::video
     set_bool("sst_fast_shaders", s.v[kShaderPrecision]); // read when the renderer starts
     set_bool("sst_fullscreen", s.v[kFullscreen]);
 
-    if (g_set_fullscreen)
-      g_set_fullscreen(s.v[kFullscreen] != 0);
+    // The window: shaped like the picture the presenter shows (4:3 picked after startup shows 16:9 until the restart, as the renderer does), sized from RESOLUTION
+    if (g_set_window)
+    {
+      sst::window::Request request;
+      request.fullscreen = s.v[kFullscreen] != 0;
+      request.lines = kResolutions[s.v[kResolution]];
+      request.aspect = WindowAspect(s, g_boot);
+      g_set_window(request);
+    }
   }
 
   void ApplyPreset(Settings &s, int preset)
@@ -287,6 +303,21 @@ namespace sst::menu::video
 
     v += dir;
     v = info.slider ? std::clamp(v, 0, count - 1) : (v + count) % count;
+
+    // RESOLUTION: past the values the monitor can't show at the aspect ratio (if none fits, any goes)
+    if (row == kResolution && !ResolutionFits(s, v))
+    {
+      for (int step = 1; step < count; ++step)
+      {
+        const int w = ((v + dir * step) % count + count) % count;
+
+        if (ResolutionFits(s, w))
+        {
+          v = w;
+          break;
+        }
+      }
+    }
 
     if (row == kPreset)
     {
@@ -413,6 +444,13 @@ namespace sst::menu::video
       return PauseFit(sst::text::Tr("NONE"), kPauseValueFont, true);
 
     return PauseFit(sst::text::Tr(ValueText(s, row)), kPauseValueFont, true);
+  }
+
+  // Windowed and fullscreen alike: the picture is shown at the aspect ratio on this monitor, so nothing taller than it can show
+  bool ResolutionFits(const Settings &s, int value)
+  {
+    const int max_lines = sst::window::MaxLines(WindowAspect(s, g_boot));
+    return max_lines <= 0 || kResolutions[std::clamp(value, 0, 4)] <= max_lines || kResolutions[0] > max_lines;
   }
 
   // A new aspect ratio needs a restart: 4:3 is the game's own mode, and the wide layouts are made as scenes load (the main menu's at boot). So does a new shader precision: the renderer picks its shader pack once, at startup

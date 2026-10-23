@@ -33,22 +33,24 @@ namespace sst::menu
       g_request_quit();
   }
 
-  void Initialize(std::function<void(bool)> set_fullscreen, std::function<void()> request_quit)
+  void Initialize(std::function<void(const sst::window::Request &)> set_window, std::function<void()> request_quit)
   {
     std::lock_guard lock(g_mutex);
-    video::SetFullscreenHandler(std::move(set_fullscreen));
+    video::SetWindowHandler(std::move(set_window));
     g_request_quit = std::move(request_quit);
 
     video::Settings &s = video::Current();
     s = video::FromFlags();
     g_loaded_from_file = video::Load(s);
-    video::Apply(s);
-    REXLOG_INFO("[sst-menu] video settings{}: {}", g_loaded_from_file ? " (sst_settings.ini)" : "", video::Describe(s));
 
+    // Before Apply: the window's shape depends on the 4:3 mode
     video::BootSettings &boot = video::Boot();
     boot.aspect = std::clamp(s.v[video::kAspect], 0, 4);
     boot.precision = s.v[video::kShaderPrecision];
     boot.four_three = boot.aspect == 0;
+
+    video::Apply(s);
+    REXLOG_INFO("[sst-menu] video settings{}: {}", g_loaded_from_file ? " (sst_settings.ini)" : "", video::Describe(s));
     ApplyCameraAspect(nullptr); // scenes loaded at boot already see the aspect
 
     // ASPECT RATIO 4:3: a 4:3 video mode (1280x1024, the game's HD 4:3 mode) makes the game pick its 4:3 layouts and cameras at boot

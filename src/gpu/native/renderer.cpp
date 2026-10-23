@@ -5,6 +5,7 @@
 #include "gpu/native/renderer_debug.h"
 
 #include "gpu/native/dxc.h"
+#include "window/window_fit.h"
 
 #if defined(_WIN32)
 #include "gpu/native/gfx/d3d12/d3d12_gfx.h"
@@ -383,8 +384,9 @@ namespace sst::native
   void Renderer::BeginFrame()
   {
     {
-      // VIDEO page settings. Targets / resolve textures are re-made at a new size on their next use. Internal resolution in lines of the game's frame (720, or 1024 in its 4:3 mode)
-      const float lines = float(std::clamp(REXCVAR_GET(sst_resolution), 240, 4320)) / float(height_);
+      // VIDEO page settings. Targets / resolve textures are re-made at a new size on their next use. Internal resolution in lines of the game's frame (720, or 1024 in its 4:3 mode): RESOLUTION, or windowed the picture's height in the window.
+      const int window_lines = sst::window::RenderLines();
+      const float lines = float(std::clamp(window_lines > 0 ? window_lines : REXCVAR_GET(sst_resolution), 240, 4320)) / float(height_);
       const float scene_lines = lines * float(std::clamp(REXCVAR_GET(sst_render_scale), 25, 100)) / 100.0f;
 
       // Width follows the display's shape (RESOLUTION is the number of lines): at 21:9, 1080p renders 2520x1080 rather than a 1920x1080 image stretched. (Narrower displays - 16:10 - keep the full 16:9 width.)

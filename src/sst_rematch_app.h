@@ -12,6 +12,7 @@
 #include "menu/achievements.h"
 #include "menu/graphics_menu.h"
 #include "menu/restart.h"
+#include "window/window_fit.h"
 
 #include <filesystem>
 
@@ -69,10 +70,15 @@ public:
   // Video settings (sst_settings.ini, VIDEO page), then the native renderer: attaches to the "sst" GPU plugin when it is the one loaded (--gpu_plugin=sst), otherwise does nothing
   void OnPostSetup() override
   {
-    sst::menu::Initialize([this](bool fullscreen)
-                          { app_context().CallInUIThread([this, fullscreen]
-                                                         {
-        if (auto* w = window(); w && w->IsFullscreen() != fullscreen) w->SetFullscreen(fullscreen); }); }, [this]
+    // The window's title
+    if (auto *w = window())
+      w->SetTitle("Sega Superstars Tennis Rematch");
+
+    // The window follows the VIDEO settings (fullscreen; windowed: the aspect ratio's shape, RESOLUTION's size, resizable). Deferred: the first call comes from inside Initialize, on this thread
+    sst::menu::Initialize([this](const sst::window::Request &request)
+                          { app_context().CallInUIThreadDeferred([this, request]
+                                                                 {
+        if (auto* w = window()) sst::window::Apply(*w, request); }); }, [this]
                           { app_context().RequestDeferredQuit(); });
 
     sst::native::Initialize(runtime());
