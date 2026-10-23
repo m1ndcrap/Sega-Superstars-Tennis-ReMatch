@@ -416,7 +416,7 @@ namespace sst::native
     HostRT *GetHostRT(const uint8_t *base, uint32_t surface, bool depth, Scale2 scale, uint32_t samples, uint32_t min_width, uint32_t min_height);
     void SetRTState(HostRT &rt, D3D12_RESOURCE_STATES state);
     uint32_t AllocateRtSrv();
-    ResolvedTexture *GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, Scale2 scale);
+    ResolvedTexture *GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, Scale2 scale, bool keep_16bit = false);
     bool CreateBlitResources();
 
     // kind: 0 copy, 1 copy from MSAA (average / sample 0 for depth), 2 FXAA, 3 FPS counter text (alpha blended)
@@ -431,7 +431,8 @@ namespace sst::native
     std::unordered_map<uint32_t, std::unique_ptr<ResolvedTexture>> resolved_;
     uint32_t rt_rtv_next_ = 0, rt_dsv_next_ = 0, rt_srv_next_ = 0;
     bool blit_ready_ = false; // the blit shaders compiled (render targets are emulated)
-    std::vector<uint8_t> blit_vs_, blit_ps_, blit_ps_ms_, blit_ps_fxaa_, blit_ps_text_;
+    std::vector<uint8_t> blit_vs_, blit_ps_, blit_ps_ms_, blit_ps_fxaa_, blit_ps_text_, blit_ps_bspline_;
+    void BlitSmooth(uint32_t src_srv, const D3D12_RECT &src_rect, uint32_t rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb);
 
     // VIDEO > FPS COUNTER: frames shown per second (new frames handed to the display), drawn in the output's top-left corner
     std::atomic<uint64_t> shown_frames_{0};
@@ -522,7 +523,14 @@ namespace sst::native
 
     // Internal resolution (latched per frame from the VIDEO page cvars): host render targets, resolve textures and outputs are their guest size x a scale - scale_ (sst_resolution / 720) for the UI / final image and the output, scene_scale_ (x sst_render_scale %) for the 3D scene's targets (the surfaces drawn with MSAA), shadow_scale_ (sst_shadow_size / 1024) for the shadow map's (resolved into stacked textures). (x: also x the display's stretch - wide_x_ - except for the shadow map.)
     Scale2 scale_, scene_scale_, shadow_scale_;
-    float wide_x_ = 1; // display aspect / 16:9 (2.333 / 1.778 at 21:9): host targets' extra width
+    float wide_x_ = 1;   // display aspect / 16:9 (2.333 / 1.778 at 21:9): host targets' extra width
+    Scale2 bloom_scale_; // the glow/bloom chain's targets (sst_native_bloom_guest_size: guest size x wide_x_ across; else scale_)
+
+    // final bloom image is stored at the frame's size with a smooth upscale (sst_native_bloom_smooth), so the game's bilinear magnification of it doesn't show weird banding like previous builds
+    bool bloom_small_seen_ = false;
+    std::unordered_set<uint32_t> bloom_final_pages_, bloom_early_pages_;
+    std::unordered_set<uint64_t> solid_vs_; // vertex shaders that drew solid geometry into the 3D scene this frame (FringeDepthPass)
+    void FringeDepthPass(DrawContext &d);
     bool shadows_off_ = false;
     bool bloom_off_ = false;                              // VIDEO > BLOOM OFF: the quarter-size glow / bloom targets stay black
     bool fxaa_ = false;                                   // VIDEO > ANTI-ALIASING FXAA: on the 3D scene's colour resolves
@@ -530,6 +538,7 @@ namespace sst::native
     std::unordered_map<uint32_t, uint32_t> msaa_support_; // format << 8 | samples -> usable
     uint32_t UsableSamples(DXGI_FORMAT format, uint32_t samples);
     bool BloomSurface(const HostRT &rt, uint32_t surface) const;
+    bool BloomShape(uint32_t width, uint32_t height) const;
     float gamma_ = 1;                // present: output = colour ^ gamma_ (sst_brightness)
     std::atomic<bool> fps30_{false}; // read by Acquire (plugin thread)
     std::unordered_set<uint32_t> scene_surfaces_, shadow_surfaces_;
@@ -655,7 +664,17 @@ namespace sst::native
       size_t so_offset = 0;
       std::vector<float> cpu; // CPU clip positions (empty if not run)
       std::string detail;     // inputs (live / original fetch, host values)
+
+      uint64_t ps_hash = 0;
+      uint32_t blend = 0, depth = 0, colour = 0, rt0 = 0, color_mask = 0;
+      float alpha_ref = 0;
+      bool scene = false, immediate = false;
     };
+
+    bool pick_valid_ = false;
+    float pick_x_ = 0, pick_y_ = 0;
+    void CapturePickPoint();
+    void LogPick(const uint8_t *so_data);
 
     bool capture_requested_ = false, capture_active_ = false, capture_quiet_ = false;
     uint64_t capture_mismatch_logged_ = 0, capture_frames_logged_ = 0;
@@ -732,7 +751,7 @@ namespace sst::native
       uint64_t check_jump_checks = 0, check_jump_draws = 0, check_jump_logged = 0;
       uint64_t late_checked = 0, late_changed = 0, late_changed_index = 0, late_logged = 0;
       uint64_t shader_rebinds = 0, shader_rebinds_logged = 0, computed_fetch_draws = 0, fetch_remapped = 0;
-      uint64_t clears = 0, clear_logged = 0, sample_logged = 0, depth_only = 0, shaders_from_objects = 0, skip_shader_logged = 0;
+      uint64_t clears = 0, clear_logged = 0, sample_logged = 0, depth_only = 0, fringe_depth = 0, shaders_from_objects = 0, skip_shader_logged = 0;
       uint64_t upload_bytes = 0;
       uint64_t textured_draws = 0, texture_placeholders = 0, shadow_placeholders = 0;
       uint64_t constants_uploaded = 0, constants_reused = 0;

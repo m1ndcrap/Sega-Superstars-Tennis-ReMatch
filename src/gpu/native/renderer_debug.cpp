@@ -674,6 +674,10 @@ namespace sst::native
     for (size_t d = 0; d < captured_.size(); ++d)
     {
       const CapturedDraw &c = captured_[d];
+
+      if (c.immediate)
+        continue; // debugging with F9
+
       uint32_t filled;
       std::memcpy(&filled, data + kSoDataBytes + d * 16, 4);
       const uint32_t n = std::min<uint32_t>(filled / 16, c.vertex_count);
@@ -750,6 +754,8 @@ namespace sst::native
         }
       }
     }
+
+    LogPick(data);
 
     if (capture_quiet_)
     {
@@ -1025,8 +1031,39 @@ namespace sst::native
   // F9 capture: the draw's inputs and its GPU-transformed vertices (stream output), compared with the CPU's at the frame's end
   void Renderer::DebugAfterDraw(DrawContext &d)
   {
-    if (!capture_active_ || d.host_elements.empty() || d.call.up_data)
+    if (!capture_active_)
       return;
+
+    // Debug with F9 by pointing cursor at something you want to debug while pressing F9 to get every draw's state (immediate-mode draws with no stream output are listed without positions)
+    auto pick_state = [&](CapturedDraw &c)
+    {
+      c.ps_hash = d.ps_entry ? d.ps_entry->hash : 0;
+      c.blend = d.key.blend;
+      c.depth = d.depthcontrol;
+      c.colour = d.colorcontrol;
+      c.color_mask = d.key.color_mask;
+      c.rt0 = d.rt0;
+      c.alpha_ref = RegF(d.base, d.dev, RB_ALPHA_REF);
+      c.scene = scene_surfaces_.count(d.rt0) != 0;
+    };
+
+    if (d.host_elements.empty() || d.call.up_data)
+    {
+      if (pick_valid_ && captured_.size() < kSoMaxDraws)
+      {
+        CapturedDraw c;
+        c.vs_hash = d.vs_entry ? d.vs_entry->hash : 0;
+        c.prim = d.call.prim;
+        c.count = d.call.count;
+        c.seq = draw_seq_;
+        c.immediate = true;
+        c.so_offset = SIZE_MAX;
+        pick_state(c);
+        captured_.push_back(std::move(c));
+      }
+
+      return;
+    }
 
     const auto &host_elements = d.host_elements;
     const auto *resolved = d.resolved;
@@ -1052,6 +1089,118 @@ namespace sst::native
     }
 
     capture_detail_ = std::move(capture_detail);
+    const size_t before = captured_.size();
     CaptureDraw(d.base, d.call, d.vs_obj, d.vs_entry, d.vs, d.layout, d.key.layout_hash, d.first_vertex, d.vertex_count, d.fetch_stream_count ? uint32_t(d.resolved[0].src - physical_membase_) : 0, d.reads_morph, d.half_x, d.half_y);
+
+    if (captured_.size() > before)
+      pick_state(captured_.back());
+  }
+
+  // Debugging with F9: the mouse position over the game's picture (the window's client area, less any letterbox bars), as clip-space x / y
+  void Renderer::CapturePickPoint()
+  {
+    pick_valid_ = false;
+#if defined(_WIN32)
+    HWND window = GetForegroundWindow();
+    POINT p;
+    RECT client;
+
+    if (!window || !GetCursorPos(&p) || !ScreenToClient(window, &p) || !GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
+      return;
+
+    const float cw = float(client.right), ch = float(client.bottom);
+    const float frame_aspect = float(PxU(width_, output_scale_[target_].x)) / float(std::max(1u, PxU(height_, output_scale_[target_].y)));
+    float pw = cw, ph = cw / frame_aspect;
+
+    if (ph > ch)
+    {
+      ph = ch;
+      pw = ch * frame_aspect;
+    }
+
+    const float u = (float(p.x) - (cw - pw) * 0.5f) / pw, v = (float(p.y) - (ch - ph) * 0.5f) / ph;
+
+    if (u < 0 || u > 1 || v < 0 || v > 1)
+    {
+      REXLOG_INFO("[sst-native] pick: the mouse is outside the picture ({} {} in a {}x{} window); no draw list", p.x, p.y, client.right, client.bottom);
+      return;
+    }
+
+    pick_x_ = u * 2 - 1;
+    pick_y_ = 1 - v * 2;
+    pick_valid_ = true;
+    REXLOG_INFO("[sst-native] pick: mouse at {:.3f} {:.3f} of the picture (clip {:.3f} {:.3f})", u, v, pick_x_, pick_y_);
+#endif
+  }
+
+  // the draws of the 3D scene whose vertices reach around the picked point, in draw order: a box test over the vertices (no indices here), plus how close the nearest vertex comes. Immediate-mode draws are listed by state only.
+  void Renderer::LogPick(const uint8_t *data)
+  {
+    if (!pick_valid_)
+      return;
+
+    pick_valid_ = false;
+    const float aspect = float(width_) * wide_x_ / float(height_);
+    uint32_t listed = 0, scene_draws = 0;
+    REXLOG_INFO("[sst-native] pick: 3D scene draws around the point (draw #, VS, PS, prim / count, blend, depth, colour control, alpha ref, colour mask; vertices within 0.03 of the point, nearest, depth z/w range of those near):");
+
+    for (size_t i = 0; i < captured_.size(); ++i)
+    {
+      const CapturedDraw &c = captured_[i];
+
+      if (!c.scene)
+        continue;
+
+      ++scene_draws;
+      std::string where;
+
+      if (c.immediate)
+      {
+        where = "immediate-mode, no positions";
+      }
+      else
+      {
+        uint32_t filled;
+        std::memcpy(&filled, data + kSoDataBytes + i * 16, 4);
+        const uint32_t n = std::min<uint32_t>(filled / 16, c.vertex_count);
+        const float *g = reinterpret_cast<const float *>(data + c.so_offset);
+        float x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY, nearest = INFINITY, z0 = INFINITY, z1 = -INFINITY;
+        uint32_t near_count = 0;
+
+        for (uint32_t v = 0; v < n; ++v)
+        {
+          const float *gp = g + 4 * size_t(v);
+
+          if (!(gp[3] > 1e-4f) || !std::isfinite(gp[0] + gp[1] + gp[2]))
+            continue;
+
+          const float x = gp[0] / gp[3], y = gp[1] / gp[3];
+          x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+          const float dist = std::hypot((x - pick_x_) * aspect, y - pick_y_) * 0.5f; // in picture heights
+
+          nearest = std::min(nearest, dist);
+
+          if (dist < 0.03f)
+          {
+            ++near_count;
+            z0 = std::min(z0, gp[2] / gp[3]), z1 = std::max(z1, gp[2] / gp[3]);
+          }
+        }
+
+        constexpr float kMargin = 0.01f;
+
+        if (!(pick_x_ >= x0 - kMargin && pick_x_ <= x1 + kMargin && pick_y_ >= y0 - kMargin && pick_y_ <= y1 + kMargin))
+          continue;
+
+        where = near_count ? fmt::format("{} vertices near (nearest {:.4f}, z {:.6f}..{:.6f})", near_count, nearest, z0, z1) : fmt::format("box only (nearest vertex {:.3f})", nearest);
+      }
+
+      if (++listed > 150)
+        continue;
+
+      REXLOG_INFO("[sst-native]   #{} VS {:016X} PS {:016X} prim {} x{} blend {:08X} depth {:08X} colour {:08X} ref {:.3f} mask {:X}: {}", c.seq, c.vs_hash, c.ps_hash, c.prim, c.count, c.blend, c.depth, c.colour, c.alpha_ref, c.color_mask, where);
+    }
+
+    REXLOG_INFO("[sst-native] pick: {} of {} 3D scene draws listed{}", std::min<uint32_t>(listed, 150), scene_draws, listed > 150 ? fmt::format(" ({} more not shown)", listed - 150) : std::string());
   }
 }

@@ -498,6 +498,16 @@ if(REXSDK_DIR AND EXISTS "${REXSDK_DIR}/src/ui/vulkan/vulkan_device.cpp")
   endif()
 endif()
 
+# XMA decoder fixes (rexglue-sst-xma.patch, on top of rexglue-sst.patch): end-of-stream padding no longer leaves a context stuck (which caused eggman's superstar sounds to end in a weird stutter), the last frame is played out at the end of input, junk after a sound decodes as silence
+if(REXSDK_DIR AND EXISTS "${REXSDK_DIR}/src/audio/xma_context.cpp")
+  file(READ "${REXSDK_DIR}/src/audio/xma_context.cpp" _sst_xma_context)
+  string(FIND "${_sst_xma_context}" "no more frames start in this packet" _sst_xma_patched)
+
+  if(_sst_xma_patched EQUAL -1)
+    message(WARNING "sst_rematch: the ReXGlue SDK at ${REXSDK_DIR} is missing the current rexglue-sst-xma.patch (XMA audio dropouts). Undo an older copy and apply it with:\n  git -C \"${REXSDK_DIR}\" checkout -- src/audio include/rex/audio\n  git -C \"${REXSDK_DIR}\" apply \"${CMAKE_CURRENT_SOURCE_DIR}/rexglue-sst-xma.patch\"")
+  endif()
+endif()
+
 # Linux: the exe finds its shared libraries next to itself ($ORIGIN), but the SDK stages them only on Windows and macOS. Copy librexruntime.so and libTracyClient.so there too, so the build folder runs as it is
 if(UNIX AND NOT APPLE)
   foreach(_sst_lib rex::runtime rexruntime rex::TracyClient TracyClient)

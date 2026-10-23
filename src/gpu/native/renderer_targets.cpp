@@ -41,14 +41,17 @@ namespace sst::native
     const uint32_t w = std::clamp(std::max(sw, min_width), 1u, 4096u);
     const uint32_t h = std::clamp(std::max(sh, min_height), 1u, 4096u);
     const uint32_t guest_format = (be32(base, surface + 0x1C) >> 16) & 0xF;
-    samples = UsableSamples(depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : ColorTargetFormat(guest_format), samples);
+
+    const bool frame_16 = !depth && guest_format == 0 && samples == 1 && sw >= width_ && sh >= height_ && REXCVAR_GET(sst_native_frame_16bit);
+    const DXGI_FORMAT color_format = frame_16 ? DXGI_FORMAT_R16G16B16A16_UNORM : ColorTargetFormat(guest_format);
+    samples = UsableSamples(depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : color_format, samples);
     auto it = map.find(surface);
 
     if (it != map.end())
     {
       HostRT &rt = it->second;
 
-      if (rt.width >= w && rt.height >= h && rt.scale == scale && rt.samples == samples && (depth || rt.guest_format == guest_format))
+      if (rt.width >= w && rt.height >= h && rt.scale == scale && rt.samples == samples && (depth || (rt.guest_format == guest_format && rt.format == color_format)))
         return &rt;
 
       // Grows (or changes format): make a new one; the old one may still be in use by submitted frames, so keep it alive until the GPU is done
@@ -65,7 +68,7 @@ namespace sst::native
     rt.guest_format = guest_format;
     rt.scale = scale;
     rt.samples = samples;
-    rt.format = depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : ColorTargetFormat(guest_format);
+    rt.format = depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : color_format;
     D3D12_RESOURCE_DESC desc = {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = PxU(rt.width, scale.x);
@@ -152,9 +155,10 @@ namespace sst::native
     return &stored;
   }
 
-  Renderer::ResolvedTexture *Renderer::GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, Scale2 scale)
+  Renderer::ResolvedTexture *Renderer::GetResolvedTexture(uint32_t page, uint32_t guest_format, uint32_t width, uint32_t height, uint32_t slices, bool volume, Scale2 scale, bool keep_16bit)
   {
-    const DXGI_FORMAT format = ResolveTextureFormat(guest_format);
+    const DXGI_FORMAT guest_host_format = ResolveTextureFormat(guest_format);
+    const DXGI_FORMAT format = keep_16bit && guest_host_format == DXGI_FORMAT_R8G8B8A8_UNORM ? DXGI_FORMAT_R16G16B16A16_UNORM : guest_host_format;
     auto it = resolved_.find(page);
 
     if (it != resolved_.end())
@@ -363,7 +367,25 @@ namespace sst::native
       REXLOG_INFO("[sst-native] shadow map surfaces: depth {:08X}, colour {:08X}", surface, be32(base, dev + kDevRT0));
     }
 
-    ResolvedTexture *dst = GetResolvedTexture(page, fetch[1] & 0x3F, dw, dh, slices, stacked, src.scale);
+    // final smoothed bloom image
+    const bool bloom_src = !depth && !stacked && BloomSurface(src, surface);
+    bool bloom_final = false;
+
+    if (bloom_src)
+    {
+      if (!bloom_small_seen_ && bloom_early_pages_.insert(page).second && bloom_final_pages_.erase(page))
+        REXLOG_INFO("[sst-native] bloom: {:08X} is also an input of the chain, not its final image", page << 12);
+
+      if (dw * 16 <= width_)
+        bloom_small_seen_ = true;
+      else if (bloom_small_seen_ && dw * 4 >= width_ && !bloom_early_pages_.count(page) && bloom_final_pages_.insert(page).second)
+        REXLOG_INFO("[sst-native] bloom: final image at {:08X} ({}x{}), stored at the frame's size with a smooth upscale", page << 12, dw, dh);
+
+      bloom_final = REXCVAR_GET(sst_native_bloom_smooth) && bloom_final_pages_.count(page) && dw && dh;
+    }
+
+    const Scale2 dst_scale = bloom_final ? Scale2{scale_.x * float(width_) / float(dw), scale_.y * float(height_) / float(dh)} : src.scale;
+    ResolvedTexture *dst = GetResolvedTexture(page, fetch[1] & 0x3F, dw, dh, slices, stacked, dst_scale, !depth && src.format == DXGI_FORMAT_R16G16B16A16_UNORM);
 
     // Full-screen images (the 3D scene, the glow chain, frame copies): draws that sample them are composites, not UI (aspect ratio fit)
     {
@@ -401,6 +423,13 @@ namespace sst::native
     const bool swap_rb = !depth && (dst_swizzle & 7) == 2 && ((dst_swizzle >> 6) & 7) == 0;
     dst->rb_swapped = swap_rb;
 
+    if (bloom_final)
+    {
+      const Scale2 k = src.scale;
+      const D3D12_RECT src_host = {Px(sx0 + (dr.left - px), k.x), Px(sy0 + (dr.top - py), k.y), Px(sx0 + (dr.right - px), k.x), Px(sy0 + (dr.bottom - py), k.y)};
+      BlitSmooth(src.srv, src_host, RtRtv(dst->rtvs[slice]), dst->format, Scaled(dr, dst_scale), swap_rb);
+    }
+    else
     {
       const Scale2 k = src.scale;
       const D3D12_RECT host = Scaled(dr, k);
@@ -490,11 +519,19 @@ namespace sst::native
   // The quarter-size glow / bloom chain (320x180 down to 20x11, 16:9 targets that are neither the 3D scene nor the shadow map)
   bool Renderer::BloomSurface(const HostRT &rt, uint32_t surface) const
   {
-    if (rt.depth || rt.width > 320 || rt.width < 16 || scene_surfaces_.count(surface) || shadow_surfaces_.count(surface))
+    if (rt.depth || scene_surfaces_.count(surface) || shadow_surfaces_.count(surface))
       return false;
 
-    // Same shape as the frame (16:9, or 5:4 in the game's 4:3 mode)
-    const int64_t aspect = int64_t(rt.width) * height_ - int64_t(rt.height) * width_;
+    return BloomShape(rt.width, rt.height);
+  }
+
+  // A guest size in the bloom's range, shaped like the frame
+  bool Renderer::BloomShape(uint32_t width, uint32_t height) const
+  {
+    if (width > 320 || width < 16)
+      return false;
+
+    const int64_t aspect = int64_t(width) * height_ - int64_t(height) * width_;
     return std::abs(aspect) <= int64_t(width_) * 2;
   }
 
@@ -517,6 +554,14 @@ namespace sst::native
 
     if ((color && scene_surfaces_.count(color)) || (depth && scene_surfaces_.count(depth)))
       return scene_scale_;
+
+    if (color && !msaa && PlausibleAddress(color))
+    {
+      const uint32_t size = be32(base, color + 0x24);
+
+      if (BloomShape((size >> 18) + 1, ((size >> 3) & 0x7FFF) + 1))
+        return bloom_scale_;
+    }
 
     return scale_;
   }

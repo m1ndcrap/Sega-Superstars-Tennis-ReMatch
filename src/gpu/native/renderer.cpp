@@ -42,6 +42,11 @@ REXCVAR_DEFINE_INT32(sst_native_capture_frame, 0, "SST", "Native renderer debug:
 REXCVAR_DEFINE_BOOL(sst_native_ui_fit, true, "SST", "Native renderer: keep 2D UI in a 16:9 box at other aspect ratios (debug: false stretches it, to tell UI fitting apart from game-side issues)");
 REXCVAR_DEFINE_BOOL(sst_native_ui_fit_skip_3d, true, "SST", "Native renderer, wide aspect ratios: don't measure depth-tested draws of the 3D scene on the CPU for UI fitting (they are 3D, never fitted; saves render-thread time in busy stadiums). Debug: false measures them as before");
 REXCVAR_DEFINE_BOOL(sst_native_wide_targets, true, "SST", "Native renderer: render targets take the display's shape (2520x1080 at 21:9 and 1080p) instead of a 16:9 image stretched to it");
+REXCVAR_DEFINE_BOOL(sst_native_bloom_guest_size, true, "SST", "Native renderer: draw the glow / bloom chain (320x180 down to 20x11) at the game's own size, only widened at wide aspect ratios. Its blur shaders space their taps for that size, so scaled up with RESOLUTION a thin glow turned into several separate faded copies. false = scale it like the rest (debug / comparison)");
+REXCVAR_DEFINE_BOOL(sst_native_frame_16bit, true, "SST", "Native renderer: draw the game's final 8-bit image (the full-size target the 3D scene, bloom and UI are combined in) and its copies at 16 bits per channel, so bloom halos fade smoothly instead of in bands. false = 8 bits, as on the Xbox 360");
+REXCVAR_DEFINE_BOOL(sst_native_bloom_smooth, true, "SST", "Native renderer: store the game's final bloom image at the frame's size, upscaled with a smooth (cubic) filter, so bloom halos fade without the rings of a 320x180 image magnified with plain bilinear filtering");
+REXCVAR_DEFINE_BOOL(sst_native_fringe_depth, true, "SST", "Native renderer: soft-edged see-through parts of models (Eggman's moustache, hair) also write depth where they are mostly opaque, so see-through scenery drawn after them (a waterfall behind) no longer shows over them. false = the game's own behaviour");
+REXCVAR_DEFINE_BOOL(sst_present_dither, true, "SST", "Native renderer: add a faint noise (+-1 8-bit step) when presenting, hiding banding in smooth gradients on 8-bit displays");
 REXCVAR_DEFINE_BOOL(sst_native_scissor, true, "SST", "Native renderer: apply the game's scissor rectangle (menus clip panels with it)");
 
 // VIDEO page settings (src/menu/graphics_menu.cpp)
@@ -399,6 +404,15 @@ namespace sst::native
       const Scale2 shadow_scale{shadow_k, shadow_k};
       wide_x_ = wide;
 
+      // The glow/bloom chain: the game's own size (x the display's stretch, so the blur keeps its on-screen shape), or the UI / final image's scale
+      const Scale2 bloom = REXCVAR_GET(sst_native_bloom_guest_size) ? Scale2{wide, 1.0f} : scale;
+
+      if (bloom != bloom_scale_)
+      {
+        REXLOG_INFO("[sst-native] glow / bloom targets at {}x{} for 320x180", PxU(320, bloom.x), PxU(180, bloom.y));
+        bloom_scale_ = bloom;
+      }
+
       if (scale != scale_ || scene != scene_scale_ || shadow_scale != shadow_scale_ || shadows_off_ != (shadow == 0))
       {
         REXLOG_INFO("[sst-native] internal resolution {}x{}, 3D {}x{}, shadow map {}", PxU(width_, scale.x), PxU(height_, scale.y), PxU(width_, scene.x), PxU(height_, scene.y), shadow ? fmt::format("{0}x{0}", shadow) : "off");
@@ -524,6 +538,9 @@ namespace sst::native
 
     list_->Barrier(*outputs_[target_], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     list_->SetTargets(Rtv(target_), kOutputDsv);
+
+    bloom_small_seen_ = false;
+    solid_vs_.clear();
 
     // Start each frame defined (the game clears explicitly too)
     static constexpr float kBlack[4] = {0, 0, 0, 1};
@@ -656,6 +673,7 @@ namespace sst::native
     {
       capture_requested_ = true;
       capture_quiet_ = false;
+      CapturePickPoint(); // and lists the 3D scene draws around the mouse
     }
     else if (capture_quiet_ || (REXCVAR_GET(sst_native_capture_frame) > 0 && submitted_ + 1 == uint64_t(REXCVAR_GET(sst_native_capture_frame))))
     {

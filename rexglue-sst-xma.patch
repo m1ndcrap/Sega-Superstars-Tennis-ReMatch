@@ -1,0 +1,496 @@
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 8426798..83f9fa9 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -14,6 +14,7 @@
+ #include <array>
+ #include <atomic>
+ #include <mutex>
++#include <string>
+ 
+ #include <rex/kernel.h>
+ #include <rex/memory.h>
+@@ -299,6 +300,21 @@ class XmaContext {
+   // Loop subframe precision state
+   uint8_t loop_frame_output_limit_ = 0;
+   bool loop_start_skip_pending_ = false;
++  uint32_t consecutive_failures_ = 0;  // sst_rematch: frames in a row the decoder gave no output for
++  bool in_bad_episode_ = false;        // sst_rematch: inside a run of bad frames (dumped once per run)
++  struct RecentFrame {
++    uint32_t offset = 0, bits = 0;
++    uint8_t buffer = 0, result = 0;  // result: 1 ok, 0 no output, 2 ffmpeg complained
++  };
++  std::array<RecentFrame, 12> recent_{};
++  uint32_t recent_count_ = 0;
++  void NoteRecentFrame(const XMA_CONTEXT_DATA* data, uint32_t frame_bits, uint8_t result);
++  std::string RecentFramesText() const;
++  void LogBufferChanges(const XMA_CONTEXT_DATA& data);
++  bool seen_valid_[2] = {}, seen_any_ = false;
++  uint32_t seen_address_[2] = {}, seen_packets_[2] = {}, buffer_log_lines_ = 0;
++  void DumpBadFrame(const XMA_CONTEXT_DATA* data, int packet_index, uint32_t bit, uint32_t frame_bits);
++  uint32_t failed_frames_logged_ = 0;  // sst_rematch: "frame not decoded" lines logged since the last reset
+ 
+   // Start-padding realignment state. Attributes belong to the frame whose
+   // samples are still being assembled, so they land one decode after the frame
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..9d6c1cf 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -10,9 +10,14 @@
+ */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <string>
+ 
+ #include <rex/audio/xma/context.h>
++#include <rex/cvar.h>
+ #include <rex/audio/xma/decoder.h>
+ #include <rex/audio/xma/helpers.h>
+ #include <rex/dbg.h>
+@@ -36,8 +41,18 @@ extern "C" {
+ // Credits for most of this code goes to:
+ // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
+ 
++REXCVAR_DEFINE_BOOL(xma_log_buffers, false, "Audio",
++                    "sst_rematch: log the input buffers the game gives each XMA context (first 400 "
++                    "lines per context)");
++REXCVAR_DEFINE_INT32(xma_dump_bad_frames, 0, "Audio",
++                     "sst_rematch: write the XMA input buffers and context to xma_dump/ at the "
++                     "first bad frame of a run of them, up to this many times a run (0 = off)");
++
+ namespace rex::audio {
+ 
++// sst_rematch: ffmpeg warnings / errors logged on this thread (xma_decoder.cpp, av_log_callback)
++extern thread_local uint32_t g_xma_ffmpeg_complaints;
++
+ using stream::BitStream;
+ 
+ const uint32_t XmaContext::kBitsPerPacketHeader;
+@@ -103,6 +118,7 @@ bool XmaContext::Work() {
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
+   const XMA_CONTEXT_DATA initial_data = data;
++  LogBufferChanges(data);
+ 
+   if (!data.output_buffer_valid) {
+     return true;
+@@ -132,6 +148,52 @@ bool XmaContext::Work() {
+     return true;
+   }
+ 
++  // sst_rematch: end of a stream. The decoder's output runs behind the bitstream: the last decoded
++  // frame's tail waits in the carry for the next frame, which never comes. The hardware would have
++  // put out every frame by now, and a game that counts samples (the superstar jingle, streamed in
++  // 1 s chunks) keeps reading the output ring - the last ~40 ms over and over - waiting for them.
++  // So once the input has run out and the game has read nearly all the output (less than a frame
++  // left: not just the gap before its next chunk arrives), play the tail out, its missing overlap
++  // silent
++  // (Also when the decoder is stuck waiting for input that doesn't come - error 4, a frame running
++  // into a packet past the buffer's end: the input is treated as used up then, so the game sees the
++  // stream end)
++  const bool output_low = output_rb.read_count() < (kBytesPerFrameChannel << data.is_stereo);
++  if (data.error_status == 4 && data.IsAnyInputBufferValid() && output_low &&
++      current_frame_remaining_subframes_ == 0) {
++    if (REXCVAR_GET(xma_log_buffers) && buffer_log_lines_ < 400) {
++      ++buffer_log_lines_;
++      REXAPU_INFO("XmaContext {}: stuck at read offset {} with the output drained: input used up",
++                  id(), static_cast<uint32_t>(data.input_buffer_read_offset));
++    }
++    data.input_buffer_0_valid = 0;
++    data.input_buffer_1_valid = 0;
++    data.error_status = 0;
++  }
++  if (!data.IsAnyInputBufferValid() && current_frame_remaining_subframes_ == 0 && carry_valid_ &&
++      output_low) {
++    const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data.is_stereo;
++    const size_t carry_bytes = (kBytesPerFrameChannel << data.is_stereo) - pad_bytes;
++    std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
++    std::memset(raw_frame_.data() + carry_bytes, 0, pad_bytes);
++    current_frame_remaining_subframes_ = 4 << data.is_stereo;
++    loop_frame_output_limit_ = pending_output_limit_;
++    current_frame_remaining_subframes_ -=
++        std::min(pending_start_skip_, current_frame_remaining_subframes_);
++    carry_valid_ = false;
++    if (REXCVAR_GET(xma_log_buffers) && buffer_log_lines_ < 400) {
++      ++buffer_log_lines_;
++      REXAPU_INFO("XmaContext {}: end of input - last frame's tail played out", id());
++    }
++  }
++
++  while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
++    Consume(&output_rb, &data);
++    if (current_frame_remaining_subframes_ == 0) {
++      break;
++    }
++  }
++
+   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+     Decode(&data);
+     Consume(&output_rb, &data);
+@@ -177,7 +239,57 @@ void XmaContext::Clear() {
+   data.Store(context_ptr);
+ }
+ 
++// sst_rematch (cvar xma_log_buffers): every input buffer the game hands a context (address, size,
++// a hash of its first and last packets, the read offset), and when a context runs out of input, is
++// cleared or released - to see what the game feeds the decoder around a sound that repeats
++void XmaContext::LogBufferChanges(const XMA_CONTEXT_DATA& data) {
++  if (!REXCVAR_GET(xma_log_buffers) || buffer_log_lines_ >= 400) {
++    return;
++  }
++  for (uint8_t b = 0; b < 2; ++b) {
++    const bool valid = data.IsInputBufferValid(b);
++    const uint32_t address = data.GetInputBufferAddress(b);
++    const uint32_t packets = b == 0 ? data.input_buffer_0_packet_count : data.input_buffer_1_packet_count;
++    if (valid && (!seen_valid_[b] || seen_address_[b] != address || seen_packets_[b] != packets)) {
++      uint64_t first = 1469598103934665603ull, last = first;
++      const uint8_t* bytes = address ? memory()->TranslatePhysical(address) : nullptr;
++      if (bytes && packets) {
++        for (uint32_t i = 0; i < 64; ++i) {
++          first = (first ^ bytes[i]) * 1099511628211ull;
++          last = (last ^ bytes[(packets - 1) * kBytesPerPacket + i]) * 1099511628211ull;
++        }
++      }
++      ++buffer_log_lines_;
++      REXAPU_INFO(
++          "XmaContext {}: input buffer {} = {:08X}, {} packets (hash first {:016X} last {:016X}); "
++          "current buffer {}, read offset {}, other buffer valid {}; {} ch {} Hz, loop count {}",
++          id(), b, address, packets, first, last, static_cast<uint32_t>(data.current_buffer),
++          static_cast<uint32_t>(data.input_buffer_read_offset),
++          data.IsInputBufferValid(b ^ 1) ? 1 : 0, data.is_stereo ? 2 : 1,
++          GetSampleRate(data.sample_rate), static_cast<uint32_t>(data.loop_count));
++    }
++    seen_valid_[b] = valid;
++    seen_address_[b] = address;
++    seen_packets_[b] = packets;
++  }
++  const bool any = data.IsAnyInputBufferValid();
++  if (seen_any_ && !any) {
++    ++buffer_log_lines_;
++    REXAPU_INFO("XmaContext {}: out of input (read offset {}, output read {} write {} of {} blocks)",
++                id(), static_cast<uint32_t>(data.input_buffer_read_offset),
++                static_cast<uint32_t>(data.output_buffer_read_offset),
++                static_cast<uint32_t>(data.output_buffer_write_offset),
++                static_cast<uint32_t>(data.output_buffer_block_count));
++  }
++  seen_any_ = any;
++}
++
+ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
++  if (REXCVAR_GET(xma_log_buffers) && buffer_log_lines_ < 400) {
++    ++buffer_log_lines_;
++    REXAPU_INFO("XmaContext {}: cleared", id());
++  }
++  seen_valid_[0] = seen_valid_[1] = seen_any_ = false;
+   data->input_buffer_0_valid = 0;
+   data->input_buffer_1_valid = 0;
+   data->output_buffer_valid = 0;
+@@ -209,6 +321,97 @@ void XmaContext::ResetDecoderState() {
+   current_frame_remaining_subframes_ = 0;
+   loop_frame_output_limit_ = 0;
+   loop_start_skip_pending_ = false;
++  failed_frames_logged_ = 0;
++  consecutive_failures_ = 0;
++  in_bad_episode_ = false;
++  recent_count_ = 0;
++}
++
++// sst_rematch: a ring of the last frames decoded (where they were read and how it went), for the
++// "frames before it" line
++void XmaContext::NoteRecentFrame(const XMA_CONTEXT_DATA* data, uint32_t frame_bits, uint8_t result) {
++  RecentFrame& r = recent_[recent_count_ % recent_.size()];
++  r.buffer = static_cast<uint8_t>(data->current_buffer);
++  r.offset = data->input_buffer_read_offset;
++  r.bits = frame_bits;
++  r.result = result;
++  ++recent_count_;
++}
++
++std::string XmaContext::RecentFramesText() const {
++  std::string out;
++  const uint32_t n = std::min<uint32_t>(recent_count_, static_cast<uint32_t>(recent_.size()));
++  for (uint32_t i = recent_count_ - n; i < recent_count_; ++i) {
++    const RecentFrame& r = recent_[i % recent_.size()];
++    out += fmt::format(" {}:{}+{}{}", r.buffer, r.offset, r.bits,
++                       r.result == 1 ? "" : r.result == 2 ? "!" : "?");
++  }
++  return out;
++}
++
++// sst_rematch: the first bad frame of a run of them writes the context (as the guest holds it) and
++// both input buffers to xma_dump/ (cvar xma_dump_bad_frames: how many dumps a run may write), for
++// replaying the stream offline
++void XmaContext::DumpBadFrame(const XMA_CONTEXT_DATA* data, int packet_index, uint32_t bit,
++                              uint32_t frame_bits) {
++  static std::atomic<int32_t> dumps{0};
++  const int32_t limit = REXCVAR_GET(xma_dump_bad_frames);
++  if (limit <= 0 || dumps.load() >= limit) {
++    return;
++  }
++  const int32_t n = dumps.fetch_add(1);
++  if (n >= limit) {
++    return;
++  }
++
++  std::error_code ec;
++  std::filesystem::create_directories("xma_dump", ec);
++  const std::string stem = fmt::format("xma_dump/ctx{}_{}", id(), n);
++
++  std::ofstream bin(stem + ".bin", std::ios::binary);
++  if (!bin) {
++    REXAPU_WARN("XmaContext {}: could not write {}.bin", id(), stem);
++    return;
++  }
++
++  // Layout: the guest's context (sizeof(XMA_CONTEXT_DATA), big-endian as in memory), then input
++  // buffer 0 and input buffer 1 (packet count x 2048 bytes each, as in memory)
++  const auto* guest_context = memory()->TranslateVirtual(guest_ptr());
++  bin.write(reinterpret_cast<const char*>(guest_context), sizeof(XMA_CONTEXT_DATA));
++  uint32_t sizes[2] = {};
++  for (uint8_t b = 0; b < 2; ++b) {
++    const uint32_t address = data->GetInputBufferAddress(b);
++    const uint32_t packets =
++        b == 0 ? data->input_buffer_0_packet_count : data->input_buffer_1_packet_count;
++    if (address && packets) {
++      sizes[b] = packets * kBytesPerPacket;
++      bin.write(reinterpret_cast<const char*>(memory()->TranslatePhysical(address)), sizes[b]);
++    }
++  }
++  bin.close();
++
++  std::ofstream txt(stem + ".txt");
++  txt << fmt::format(
++      "context {}\ncontext bytes {}\nbuffer 0: address {:08X}, {} packets, valid {}, {} bytes in "
++      "the .bin\nbuffer 1: address {:08X}, {} packets, valid {}, {} bytes in the .bin\ncurrent "
++      "buffer {}\nread offset {} (packet {} bit {})\nframe bits {}\n{} ch, {} Hz\nloop count {}, "
++      "start {}, end {}, subframe end {}, subframe skip {}\nframes before it (buffer:offset+size, "
++      "ok / ? no output / ! ffmpeg complained):{}\n",
++      id(), sizeof(XMA_CONTEXT_DATA), data->GetInputBufferAddress(0),
++      static_cast<uint32_t>(data->input_buffer_0_packet_count),
++      static_cast<uint32_t>(data->input_buffer_0_valid), sizes[0], data->GetInputBufferAddress(1),
++      static_cast<uint32_t>(data->input_buffer_1_packet_count),
++      static_cast<uint32_t>(data->input_buffer_1_valid), sizes[1],
++      static_cast<uint32_t>(data->current_buffer),
++      static_cast<uint32_t>(data->input_buffer_read_offset), packet_index, bit, frame_bits,
++      data->is_stereo ? 2 : 1, GetSampleRate(data->sample_rate),
++      static_cast<uint32_t>(data->loop_count), static_cast<uint32_t>(data->loop_start),
++      static_cast<uint32_t>(data->loop_end), static_cast<uint32_t>(data->loop_subframe_end),
++      static_cast<uint32_t>(data->loop_subframe_skip), RecentFramesText());
++
++  REXAPU_WARN("XmaContext {}: bad frame - wrote {}.bin / .txt ({})", id(),
++              std::filesystem::absolute(stem, ec).string(),
++              "the input buffers and context, for replaying offline");
+ }
+ 
+ void XmaContext::Disable() {
+@@ -222,6 +425,11 @@ void XmaContext::Release() {
+ 
+   set_is_allocated(false);
+   ResetDecoderState();
++  if (REXCVAR_GET(xma_log_buffers) && buffer_log_lines_ < 400) {
++    ++buffer_log_lines_;
++    REXAPU_INFO("XmaContext {}: released", id());
++  }
++  seen_valid_[0] = seen_valid_[1] = seen_any_ = false;
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
+ }
+@@ -617,7 +825,31 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+ 
+     uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
+     if (frame_size == xma::kMaxFrameLength) {
+-      data->error_status = 4;
++      // sst_rematch: an all-ones length is padding - no more frames start in this packet (the end
++      // of a stream's data). Error 4 here left the context stuck on this offset for good: never
++      // out of input, its last frame never played out, and a game that waits for the stream's
++      // end (the superstar jingle) replayed its output ring meanwhile. Go on with the stream's
++      // next packet instead, as after a packet's last frame
++      if (REXCVAR_GET(xma_log_buffers) && buffer_log_lines_ < 400) {
++        ++buffer_log_lines_;
++        REXAPU_INFO("XmaContext {}: padding at read offset {} (packet {} of {}): end of this packet's frames",
++                    id(), static_cast<uint32_t>(data->input_buffer_read_offset), packet_index,
++                    current_input_packet_count);
++      }
++      uint32_t next_input_offset = GetNextPacketReadOffset(current_input_buffer, next_packet_index,
++                                                           current_input_packet_count);
++      if (next_input_offset == kBitsPerPacketHeader) {
++        SwapInputBuffer(data);
++        if (data->IsAnyInputBufferValid()) {
++          next_input_offset = xma::GetPacketFrameOffset(
++              memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
++          if (next_input_offset > kMaxFrameSizeinBits) {
++            SwapInputBuffer(data);
++            return;
++          }
++        }
++      }
++      data->input_buffer_read_offset = next_input_offset;
+       return;
+     }
+     packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
+@@ -635,11 +867,26 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     return;
+   }
+ 
+-  if (packet_info.isLastFrameInPacket()) {
++  // sst_rematch: a frame that runs past the end of its packet is the last one to start in it,
++  // whatever the packet info's frame count says. Taken as "not last", its tail would not be copied
++  // from the next packet and the next read offset would wrap around inside this packet: a
++  // misaligned read, then frame after frame of garbage (ffmpeg "Reserved bit") and an audible gap
++  const bool frame_spills = relative_offset + packet_info.current_frame_size_ > kBitsPerPacket;
++  const bool last_frame_in_packet = packet_info.isLastFrameInPacket() || frame_spills;
++
++  if (last_frame_in_packet) {
+     if (stream.BitsRemaining() < packet_info.current_frame_size_) {
+       const uint8_t* next_packet =
+           GetNextPacket(data, next_packet_index, current_input_packet_count);
+       if (!next_packet) {
++        if (data->error_status != 4 && REXCVAR_GET(xma_log_buffers) && buffer_log_lines_ < 400) {
++          ++buffer_log_lines_;
++          REXAPU_INFO("XmaContext {}: frame at read offset {} (packet {} of {}, {} bits) runs into "
++                      "packet {}, which isn't there: waiting for more input",
++                      id(), static_cast<uint32_t>(data->input_buffer_read_offset), packet_index,
++                      current_input_packet_count, packet_info.current_frame_size_,
++                      next_packet_index);
++        }
+         data->error_status = 4;
+         return;
+       }
+@@ -666,10 +913,39 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     carry_valid_ = false;
+   }
+   PreparePacket(packet_info.current_frame_size_, padding_start);
+-  const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
++  // sst_rematch: ffmpeg's warnings / errors while decoding this frame (counted by the log
++  // callback, same thread) mark it bad even when it returned samples: those are garbage.
++  // A bad frame still produces a frame of output, silent: past the end of a sound the input buffer
++  // goes on with another sound's packets, which the XMA hardware would decode too, frame by frame,
++  // while the game plays the voice out to its length. Producing nothing there left the game's voice
++  // short of its last samples, and it repeated the last bit of the sound (Eggman's superstar move).
++  // A silent frame also lets the last real frame's tail (held one frame behind) play out
++  const uint32_t complaints_before = g_xma_ffmpeg_complaints;
++  const bool decoder_output = DecodePacket(av_context_, av_packet_, av_frame_);
++  const bool complained = g_xma_ffmpeg_complaints != complaints_before;
++  const bool decoded = decoder_output || complained;
++  NoteRecentFrame(data, packet_info.current_frame_size_, !complained ? 1 : 2);
+   if (decoded) {
+-    ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
+-                 decoded_frame_.data());
++    consecutive_failures_ = 0;
++    if (complained) {
++      decoded_frame_.fill(0);
++      if (!in_bad_episode_) {
++        in_bad_episode_ = true;
++        DumpBadFrame(data, packet_index, relative_offset, packet_info.current_frame_size_);
++        if (failed_frames_logged_ < 16) {
++          ++failed_frames_logged_;
++          REXAPU_WARN(
++              "XmaContext {}: bad frames from read offset {} (packet {} bit {}, {} bits), output "
++              "silent until a good frame; frames before it (buffer:offset+size, ! = bad):{}",
++              id(), static_cast<uint32_t>(data->input_buffer_read_offset), packet_index,
++              relative_offset, packet_info.current_frame_size_, RecentFramesText());
++        }
++      }
++    } else {
++      in_bad_episode_ = false;
++      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
++                   decoded_frame_.data());
++    }
+ 
+     // Realign the decoder's output onto the bitstream's sample numbering: the
+     // samples of the frame just decoded run from kDecoderStartPadding into this
+@@ -707,6 +983,61 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     // A dropped frame breaks the carry's adjacency; re-prime rather than splice
+     // two blocks that are not neighbors.
+     carry_valid_ = false;
++
++    // sst_rematch: the xmaframes decoder reports a bad frame only as "no frame" (EAGAIN, with
++    // ffmpeg's own warning such as "Reserved bit"), the same as the one frame it holds back after
++    // opening. A second failure in a row is a bad bitstream position: log it, and resync
++    ++consecutive_failures_;
++    const bool bad_position = consecutive_failures_ >= 2;
++
++    if (bad_position && !in_bad_episode_) {
++      in_bad_episode_ = true;
++      DumpBadFrame(data, packet_index, relative_offset, packet_info.current_frame_size_);
++    }
++
++    if (bad_position && failed_frames_logged_ < 16) {
++      ++failed_frames_logged_;
++      REXAPU_WARN(
++          "XmaContext {}: frame not decoded (read offset {} = packet {} bit {}, frame {} of {} "
++          "{} bits, packet header: first frame {} bits, {} frames, xma2 {}, skip {}; {} ch {} Hz, "
++          "loop count {} {}-{}; buffer {} of {} packets){}",
++          id(), static_cast<uint32_t>(data->input_buffer_read_offset), packet_index, relative_offset,
++          packet_info.current_frame_, packet_info.frame_count_, packet_info.current_frame_size_,
++          packet_first_frame_offset, xma::GetPacketFrameCount(packet),
++          xma::IsPacketXma2Type(packet) ? 1 : 0, skip_count, data->is_stereo ? 2 : 1,
++          GetSampleRate(data->sample_rate), static_cast<uint32_t>(data->loop_count),
++          static_cast<uint32_t>(data->loop_start), static_cast<uint32_t>(data->loop_end),
++          static_cast<uint32_t>(data->current_buffer), current_input_packet_count,
++          failed_frames_logged_ == 16 ? " (no more of these for this context)" : "");
++      if (failed_frames_logged_ == 1) {
++        REXAPU_WARN("XmaContext {}: frames before it (buffer:offset+size, ok / no output / ffmpeg "
++                    "complained):{}",
++                    id(), RecentFramesText());
++      }
++    }
++
++    // The frame sizes read from here on in this packet can't be trusted (a misaligned read
++    // offset decodes as garbage frame after frame): go on from the next packet's first frame,
++    // which its header gives
++    if (bad_position && !is_loop_end_frame && !last_frame_in_packet) {
++      uint32_t next_input_offset = GetNextPacketReadOffset(current_input_buffer, next_packet_index,
++                                                           current_input_packet_count);
++
++      if (next_input_offset == kBitsPerPacketHeader) {
++        SwapInputBuffer(data);
++        if (data->IsAnyInputBufferValid()) {
++          next_input_offset = xma::GetPacketFrameOffset(
++              memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
++
++          if (next_input_offset > kMaxFrameSizeinBits) {
++            SwapInputBuffer(data);
++            return;
++          }
++        }
++      }
++      data->input_buffer_read_offset = next_input_offset;
++      return;
++    }
+   }
+ 
+   // Compute where to go next.
+@@ -715,7 +1046,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     return;
+   }
+ 
+-  if (!packet_info.isLastFrameInPacket()) {
++  if (!last_frame_in_packet) {
+     const uint32_t next_frame_offset =
+         (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;
+     data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + next_frame_offset;
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index a0a178d..9bcbdf4 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -59,7 +59,15 @@ XmaDecoder::XmaDecoder(runtime::FunctionDispatcher* function_dispatcher)
+ 
+ XmaDecoder::~XmaDecoder() = default;
+ 
++// sst_rematch: ffmpeg warnings / errors on this thread; XmaContext::Decode compares it around a
++// frame to tell a garbage frame from a good one
++thread_local uint32_t g_xma_ffmpeg_complaints = 0;
++
+ void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
++  if (level <= AV_LOG_WARNING) {
++    ++g_xma_ffmpeg_complaints;
++  }
++
+   if (!REXCVAR_GET(ffmpeg_verbose) && level > AV_LOG_WARNING) {
+     return;
+   }

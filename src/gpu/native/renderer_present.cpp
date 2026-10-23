@@ -14,10 +14,13 @@ namespace sst::native
                               "  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
                               "}\n";
 
-    static const char kPS[] = "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    // dither so we get smooth bloom gradients and not wonky banding
+    static const char kPS[] = "float Ign(float2 q) { return frac(52.9829189 * frac(dot(q, float2(0.06711056, 0.00583715)))); }\n"
+                              "float4 main(float4 p : SV_Position) : SV_Target {\n"
                               "  float4 c = src.Load(int3(int2(p.xy) + offset.xy, 0));\n"
                               "  if (offset.z & 1) c = c.bgra;\n"
                               "  if (offset.w != 0) c.rgb = pow(saturate(c.rgb), asfloat(offset.w));\n"
+                              "  if ((uint(offset.z) >> 17) & 1) c.rgb = saturate(c.rgb + (Ign(p.xy) + Ign(p.xy + float2(47.0, 17.0)) - 1.0) / 255.0);\n"
                               "  return c;\n"
                               "}\n";
 
@@ -119,7 +122,26 @@ namespace sst::native
                                   "  return col;\n"
                                   "}\n";
 
-    blit_ready_ = compile(kVS, L"vs_6_0", blit_vs_) && compile(kPS, L"ps_6_0", blit_ps_) && compile(kPSText, L"ps_6_0", blit_ps_text_) && compile(kPSMS, L"ps_6_0", blit_ps_ms_, true) && compile(kPSFxaa, L"ps_6_0", blit_ps_fxaa_);
+    // Smooth upscale (the game's final bloom image, sst_native_bloom_smooth): a cubic B-spline from 4 bilinear taps. offset.xy = destination top-left, offset.z bit 0 swap red / blue, offset.w = destination width | height << 16; rect = source rectangle (host pixels)
+    static const char kPSBspline[] = "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                                     "  uint w, h; src.GetDimensions(w, h);\n"
+                                     "  float2 rcp = 1.0 / float2(w, h);\n"
+                                     "  float2 dsz = float2(uint(offset.w) & 0xFFFF, uint(offset.w) >> 16);\n"
+                                     "  float2 sp = lerp(float2(rect.xy), float2(rect.zw), (p.xy - float2(offset.xy)) / dsz);\n"
+                                     "  float2 lo = (float2(rect.xy) + 0.5) * rcp, hi = (float2(rect.zw) - 0.5) * rcp;\n"
+                                     "  float2 tc = sp - 0.5, i0 = floor(tc), f = tc - i0, f2 = f * f, f3 = f2 * f;\n"
+                                     "  float2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0, w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;\n"
+                                     "  float2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0, w3 = f3 / 6.0;\n"
+                                     "  float2 g0 = w0 + w1, g1 = w2 + w3;\n"
+                                     "  float2 h0 = (i0 - 1.0 + w1 / g0 + 0.5) * rcp, h1 = (i0 + 1.0 + w3 / g1 + 0.5) * rcp;\n"
+                                     "  h0 = clamp(h0, lo, hi); h1 = clamp(h1, lo, hi);\n"
+                                     "  float4 c = g0.y * (g0.x * src.SampleLevel(lin, h0, 0) + g1.x * src.SampleLevel(lin, float2(h1.x, h0.y), 0))\n"
+                                     "          + g1.y * (g0.x * src.SampleLevel(lin, float2(h0.x, h1.y), 0) + g1.x * src.SampleLevel(lin, h1, 0));\n"
+                                     "  if (offset.z & 1) c = c.bgra;\n"
+                                     "  return c;\n"
+                                     "}\n";
+
+    blit_ready_ = compile(kVS, L"vs_6_0", blit_vs_) && compile(kPS, L"ps_6_0", blit_ps_) && compile(kPSText, L"ps_6_0", blit_ps_text_) && compile(kPSMS, L"ps_6_0", blit_ps_ms_, true) && compile(kPSFxaa, L"ps_6_0", blit_ps_fxaa_) && compile(kPSBspline, L"ps_6_0", blit_ps_bspline_);
     return blit_ready_;
   }
 
@@ -133,6 +155,7 @@ namespace sst::native
 
     const std::vector<uint8_t> &ps = kind == 1 ? blit_ps_ms_ : kind == 2 ? blit_ps_fxaa_
                                                            : kind == 3   ? blit_ps_text_
+                                                           : kind == 4   ? blit_ps_bspline_
                                                                          : blit_ps_;
     gfx::PipelineDesc d;
     d.layout = gfx::Layout::kBlit;
@@ -165,7 +188,7 @@ namespace sst::native
 
   void Renderer::Blit(uint32_t src_srv, int32_t src_x, int32_t src_y, uint32_t rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb, float gamma, uint32_t src_samples, bool fxaa)
   {
-    // src_samples: bits 0-7 MSAA samples of the source, 0x100 = depth source
+    // src_samples: bits 0-7 MSAA samples of the source, 0x100 = depth source, 0x200 = dither (single-sample, non-FXAA blits)
     const uint32_t samples = std::max(src_samples & 0xFF, 1u);
     const uint32_t kind = samples > 1 ? 1 : fxaa ? 2
                                                  : 0;
@@ -181,13 +204,37 @@ namespace sst::native
     if (gamma > 0 && gamma != 1.0f)
       std::memcpy(&gamma_bits, &gamma, 4);
 
-    const int32_t flags = (swap_rb ? 1 : 0) | int32_t(samples << 8) | int32_t((src_samples & 0x100) << 8);
+    const int32_t flags = (swap_rb ? 1 : 0) | int32_t(samples << 8) | int32_t((src_samples & 0x300) << 8);
     const int32_t offset[8] = {int32_t(src_x - dst.left), int32_t(src_y - dst.top), flags, gamma_bits, src_x, src_y, int32_t(src_x + (dst.right - dst.left)), int32_t(src_y + (dst.bottom - dst.top))};
     list_->SetBlitConstants(offset, 8);
     list_->SetBlitSource(src_srv);
     list_->SetTargets(rtv, gfx::CommandList::kNoView);
 
     // The triangle covers the whole viewport; viewport + scissor = destination
+    const D3D12_VIEWPORT vp = {float(dst.left), float(dst.top), float(dst.right - dst.left), float(dst.bottom - dst.top), 0, 1};
+    list_->SetViewport(vp);
+    list_->SetScissor(dst);
+    list_->SetTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    NoteDraw(0, 1);
+    list_->Draw(3, 0);
+    RestoreDrawState();
+  }
+
+  // A scaled copy with a smooth (cubic B-spline) filter: src_rect in source host pixels -> dst (host pixels of the target)
+  void Renderer::BlitSmooth(uint32_t src_srv, const D3D12_RECT &src_rect, uint32_t rtv, DXGI_FORMAT format, const D3D12_RECT &dst, bool swap_rb)
+  {
+    gfx::Pipeline *pso = GetBlitPipeline(format, 4);
+
+    if (!pso || dst.right <= dst.left || dst.bottom <= dst.top)
+      return;
+
+    list_->SetLayout(gfx::Layout::kBlit);
+    list_->SetPipeline(*pso);
+    const int32_t size = int32_t(uint32_t(dst.right - dst.left) | (uint32_t(dst.bottom - dst.top) << 16));
+    const int32_t c[8] = {int32_t(dst.left), int32_t(dst.top), swap_rb ? 1 : 0, size, int32_t(src_rect.left), int32_t(src_rect.top), int32_t(src_rect.right), int32_t(src_rect.bottom)};
+    list_->SetBlitConstants(c, 8);
+    list_->SetBlitSource(src_srv);
+    list_->SetTargets(rtv, gfx::CommandList::kNoView);
     const D3D12_VIEWPORT vp = {float(dst.left), float(dst.top), float(dst.right - dst.left), float(dst.bottom - dst.top), 0, 1};
     list_->SetViewport(vp);
     list_->SetScissor(dst);
@@ -231,7 +278,7 @@ namespace sst::native
         present_source_->state = kShaderRead;
       }
 
-      Blit(present_source_->srv, 0, 0, Rtv(target_), kOutputFormat, full, present_source_->rb_swapped, gamma_);
+      Blit(present_source_->srv, 0, 0, Rtv(target_), kOutputFormat, full, present_source_->rb_swapped, gamma_, REXCVAR_GET(sst_present_dither) ? 0x201u : 1u);
     }
     else if (last_color_rt_ && last_color_rt_->srv)
     {

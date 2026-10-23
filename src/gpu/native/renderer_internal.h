@@ -60,6 +60,10 @@ REXCVAR_DECLARE(int32_t, sst_native_capture_frame);
 REXCVAR_DECLARE(bool, sst_native_ui_fit);
 REXCVAR_DECLARE(bool, sst_native_ui_fit_skip_3d);
 REXCVAR_DECLARE(bool, sst_native_wide_targets);
+REXCVAR_DECLARE(bool, sst_native_frame_16bit);
+REXCVAR_DECLARE(bool, sst_present_dither);
+REXCVAR_DECLARE(bool, sst_native_bloom_smooth);
+REXCVAR_DECLARE(bool, sst_native_fringe_depth);
 REXCVAR_DECLARE(bool, sst_native_scissor);
 REXCVAR_DECLARE(std::string, sst_native_rt);
 

@@ -95,6 +95,7 @@ namespace sst::native
     uint32_t draw_count = 0;
     bool draw_indexed = false;
     gfx::GpuAddress vsc_gpu = 0, psc_gpu = 0, shared_gpu = 0;
+    const uint8_t *shared_cpu = nullptr;
     float half_x = 0, half_y = 0; // half-pixel offset (F9 capture)
   };
 }

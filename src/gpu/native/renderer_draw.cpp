@@ -36,7 +36,63 @@ namespace sst::native
       return;
 
     RecordDraw(d);
+    FringeDepthPass(d);
     DebugAfterDraw(d);
+  }
+
+  // Soft-edged see-through parts of models (such as eggman's moustache): the game draws them alpha-blended without writing depth, so a see-through surface behind them drawn later (like a waterfall) is blended over them and they look faded.
+  // After such a draw, its mostly-opaque pixels (alpha >= 0.5) also go into the depth buffer, with colour writes off, so later see-through draws behind them are hidden there. Only for blended, alpha-tested, depth-tested draws in the 3D scene by a vertex shader that drew solid (depth-writing) geometry earlier in the frame (parts of models, not particles or effects)...
+  void Renderer::FringeDepthPass(DrawContext &d)
+  {
+    const PipelineKey &key = d.key;
+
+    if (!d.rt_mode || !d.depth_rt || !d.ps || !d.vs_entry || !d.shared_cpu || !scene_surfaces_.count(d.rt0))
+      return;
+
+    const uint64_t vs_hash = d.vs_entry->hash;
+
+    if (key.depth_write && key.color_mask)
+    {
+      solid_vs_.insert(vs_hash);
+      return;
+    }
+
+    const bool alpha_test = ((d.colorcontrol >> 3) & 1) && (d.colorcontrol & 7) == 6; // GEQUAL
+    const bool alpha_blend = (key.blend & 0xFFFF) == 0x0706;                          // src alpha, inv src alpha
+
+    if (!REXCVAR_GET(sst_native_fringe_depth) || !key.depth_enable || key.depth_write || !key.color_mask || !alpha_test || !alpha_blend || !solid_vs_.count(vs_hash))
+      return;
+
+    PipelineKey depth_key = key;
+    depth_key.color_mask = 0;
+    depth_key.depth_write = 1;
+    gfx::Pipeline *pso = GetPipeline(depth_key, d.layout, d.vs, d.ps, false);
+
+    if (!pso)
+      return; // compiling in the background: from a later frame on
+
+    const Upload shared = Allocate(512);
+
+    if (!shared.cpu)
+      return;
+
+    std::memcpy(shared.cpu, d.shared_cpu, 80 * 4);
+    const float ref = 0.5f;
+    std::memcpy(shared.cpu + 68 * 4, &ref, 4);
+
+    if (LogOnce(0xB800000000000000ull ^ (d.ps_entry ? d.ps_entry->hash & 0x00FFFFFFFFFFFFFFull : 0)))
+      REXLOG_INFO("[sst-native] fringe depth: vs {:016X} ps {:016X} (blended model part) also writes depth where alpha >= 0.5", vs_hash, d.ps_entry ? d.ps_entry->hash : 0);
+
+    list_->SetPipeline(*pso);
+    list_->SetDrawConstants(d.vsc_gpu, d.psc_gpu, shared.gpu);
+    NoteDraw(vs_hash, d.ps_entry ? d.ps_entry->hash : 0);
+
+    if (d.draw_indexed)
+      list_->DrawIndexed(d.draw_count, 0, d.convert || d.rect_list ? 0 : -int32_t(d.vmin));
+    else
+      list_->Draw(d.draw_count, 0);
+
+    ++stats_.fringe_depth;
   }
 
   // The vertex shader, and memory-export (morph) passes: no rendering, they write vertices a later draw reads. Run them whatever the render target
@@ -648,6 +704,7 @@ namespace sst::native
       cap_half_x = half_x;
       cap_half_y = half_y;
       std::memcpy(shared.cpu, sc, sizeof(sc));
+      d.shared_cpu = shared.cpu;
       list_->SetViewport(vp);
 
       // Scissor: SetScissorRect (sub_822FD8D8) keeps PA_SC_WINDOW_SCISSOR_TL/BR at dev+0x28C4/+0x28C8 (x | y << 16): the viewport rectangle, intersected with the scissor rectangle when scissor testing is on (dev+0x2E50)
