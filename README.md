@@ -1,10 +1,10 @@
 # Sega Superstars Tennis ReMatch
 
-A native Windows port of the Xbox 360 version of Sega Superstars Tennis, recompiled with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) (v0.10.0). The game's code runs as native x64. Its graphics run on a native Direct3D 12 renderer that translates the game's Xbox 360 shaders, not an emulated GPU.
+A native Windows/Linux port of the Xbox 360 version of Sega Superstars Tennis, recompiled with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) (v0.10.0). The game's code runs as native x64. Its graphics run on a native Direct3D 12 renderer that translates the game's Xbox 360 shaders, not an emulated GPU.
 
 ## Features
 
-- **Native D3D12 renderer**: internal resolution up to 2160p, render scale, FXAA/MSAA, shadows resolution, bloom toggle, shader quality (ACCURATE, or FAST for weak GPUs), brightness, VSync, a 30/60 FPS limit toggle, and an FPS counter. All of these are set in a new **VIDEO** page in Settings and in the pause menu.
+- **Native D3D12/Vulkan renderer**: internal resolution up to 2160p, render scale, FXAA/MSAA, shadows resolution, bloom toggle, shader quality (ACCURATE, or FAST for weak GPUs), brightness, VSync, a 30/60 FPS limit toggle, and an FPS counter. All of these are set in a new **VIDEO** page in Settings and in the pause menu.
 - **Aspect ratios**: 4:3, 16:9, 16:10, 21:9 and 32:9. The 3D view is widened, and menu backgrounds fill the screen. The HUD adjust to each aspect ratio for a more natural look.
 - **Keyboard and mouse support**, with rebindable keys (**CONTROLS -> KEY BINDINGS**). Button prompts follow the device you're using (Xbox, PlayStation or keyboard icons).
 - **PlayStation controllers**: DualShock/DualSense prompts, a DualShock 3 diagram on the CONTROLS page, and an adaptive lightbar to distinguish which controller belongs to which player.
@@ -19,17 +19,21 @@ This project was developed with AI assistance and falls under Level 3 of PCGamin
 
 ## Setup
 
-1. Download the latest release zip from the Releases tab and extract it anywhere.
-2. Extract a legally obtained copy of Sega Superstars Tennis (Xbox 360) into the `assets` folder next to `sst_rematch.exe`, so that `assets/default.xex` exists.
-3. Run `sst_rematch.exe`.
+1. Download the latest release zip from the Releases tab for desired platform and extract it anywhere.
+2. Follow README instructions.
 
-Requirements:
+Requirements for Windows:
 
 - Windows 10/11 x64.
 - A GPU with Direct3D 12 support.
 - The [Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe), if Windows reports a missing `msvcp140.dll` or `vcruntime140.dll`.
 
-The game's shaders come precompiled inside `sst_rematch.exe`, so there's no shader compiling on first launch. The few shaders the game generates while running are compiled the first time they're needed (on-screen ones first) and cached in `cache/shaders` for later runs.
+Requirements for Linux:
+
+- 64-bit Linux with glibc 2.38 or newer (Ubuntu 24.04+, Debian 13, Fedora 39+)
+- A Vulkan 1.3 driver
+
+The game's shaders come precompiled, so there's no shader compiling on first launch. The few shaders the game generates while running are compiled the first time they're needed (on-screen ones first) and cached in `cache/shaders` for later runs.
 
 ## Controls (keyboard defaults)
 
