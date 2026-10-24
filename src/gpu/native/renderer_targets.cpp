@@ -42,7 +42,7 @@ namespace sst::native
     const uint32_t h = std::clamp(std::max(sh, min_height), 1u, 4096u);
     const uint32_t guest_format = (be32(base, surface + 0x1C) >> 16) & 0xF;
 
-    const bool frame_16 = !depth && guest_format == 0 && samples == 1 && sw >= width_ && sh >= height_ && REXCVAR_GET(sst_native_frame_16bit);
+    const bool frame_16 = !depth && guest_format == 0 && samples == 1 && sw >= width_ && sh >= height_ && REXCVAR_GET(sst_native_frame_16bit) && Frame16Supported();
     const DXGI_FORMAT color_format = frame_16 ? DXGI_FORMAT_R16G16B16A16_UNORM : ColorTargetFormat(guest_format);
     samples = UsableSamples(depth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : color_format, samples);
     auto it = map.find(surface);
@@ -514,6 +514,19 @@ namespace sst::native
     }
 
     return 1;
+  }
+
+  bool Renderer::Frame16Supported()
+  {
+    if (frame16_supported_ < 0)
+    {
+      frame16_supported_ = gfx_->SupportsSamples(DXGI_FORMAT_R16G16B16A16_UNORM, 1) ? 1 : 0;
+
+      if (!frame16_supported_)
+        REXLOG_INFO("[sst-native] the GPU can't render to 16-bit UNORM targets: the final image stays 8-bit");
+    }
+
+    return frame16_supported_ == 1;
   }
 
   // The quarter-size glow / bloom chain (320x180 down to 20x11, 16:9 targets that are neither the 3D scene nor the shadow map)

@@ -539,6 +539,8 @@ namespace sst::native
     uint32_t UsableSamples(DXGI_FORMAT format, uint32_t samples);
     bool BloomSurface(const HostRT &rt, uint32_t surface) const;
     bool BloomShape(uint32_t width, uint32_t height) const;
+    int frame16_supported_ = -1;
+    bool Frame16Supported();
     float gamma_ = 1;                // present: output = colour ^ gamma_ (sst_brightness)
     std::atomic<bool> fps30_{false}; // read by Acquire (plugin thread)
     std::unordered_set<uint32_t> scene_surfaces_, shadow_surfaces_;
