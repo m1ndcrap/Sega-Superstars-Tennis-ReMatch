@@ -12,6 +12,7 @@ A native Windows/Linux port of the Xbox 360 version of Sega Superstars Tennis, r
   - a **QUIT** option on the main menu
   - skippable boot intro
   - Xbox LIVE and Xbox profile pop-ups removed. **ONLINE PLAY** is greyed out for now.
+  - In-game achievement pop-ups and achievements menu
 
 ## AI disclosure
 
