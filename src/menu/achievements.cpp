@@ -82,6 +82,9 @@ namespace sst::ach
     constexpr uint32_t kPoolSize = 0x10000, kPopupText = 0x100;
     constexpr int kVisibleRows = 5;
 
+    // Rows kept shown around the scroll position because if we show all 45 rows at once, it fills the game's 0x50000-byte UI vertex buffer, and anything more that frame runs past its end over the next heap block's header which causes tthe allocator (sub_821503D8) to crash on the next big allocation (starting another mode)
+    constexpr int kWindowBefore = 2, kWindowAfter = kVisibleRows + 1;
+
     struct Entry
     {
       uint32_t id = 0;
@@ -111,6 +114,10 @@ namespace sst::ach
       std::unordered_map<std::string, Gpu> gpu;     // ".gpu" file name -> icon page
       bool list_ready = false, popup_ready = false;
       bool summary_alt = false;
+
+      // list rows: unlocked (the icon to show), shown now
+      std::vector<uint8_t> row_unlocked;
+      std::vector<int8_t> row_shown;
 
       // popups
       std::deque<uint32_t> queue;
@@ -521,6 +528,34 @@ namespace sst::ach
     bool Unlocked(uint32_t id)
     {
       return g.manager ? g.manager->IsUnlocked(id) : false;
+    }
+
+    // Shows the rows near scroll position 'pos' and hides the others. Showing a row's group shows both its icons, so the right one is hidden again. Under g.mutex...
+    void ApplyWindow(PPCContext &ctx, uint8_t *base, int pos)
+    {
+      const int rows = int(g.list.size());
+      g.row_shown.resize(size_t(rows), -1);
+      g.row_unlocked.resize(size_t(rows), 0);
+
+      for (int i = 0; i < rows; ++i)
+      {
+        const bool want = i >= pos - kWindowBefore && i < pos + kWindowAfter;
+
+        if (g.row_shown[size_t(i)] == int8_t(want))
+          continue;
+
+        const uint32_t r = uint32_t(i);
+        Show(ctx, base, kRowGroup + r, want);
+
+        if (want)
+        {
+          const bool on = g.row_unlocked[size_t(i)] != 0;
+          Show(ctx, base, kRowIcon + r, on);
+          Show(ctx, base, kRowIconLocked + r, !on);
+        }
+
+        g.row_shown[size_t(i)] = int8_t(want);
+      }
     }
 
     // "10/14/2026  12:49 PM" (local time, in the game's language's form) from the unlock's FILETIME; "UNLOCKED" when the time is unknown
@@ -1025,15 +1060,18 @@ namespace sst::ach
       uint32_t unlocked = 0, score = 0, total = 0;
       g.summary_alt = !g.summary_alt;
 
-      // Shown first: showing a group shows its children (both icons of every row)
+      // Shown first: showing a group shows its children (every row and both icons of each); ApplyWindow then hides the rows out of view
       Show(ctx, base, kList, true);
       Show(ctx, base, kSummary, true);
+      g.row_unlocked.assign(g.list.size(), 0);
+      g.row_shown.assign(g.list.size(), 1);
 
       for (size_t i = 0; i < g.list.size(); ++i)
       {
         const Entry &e = g.list[i];
         const bool on = Unlocked(e.id);
         const uint32_t r = uint32_t(i);
+        g.row_unlocked[i] = on ? 1 : 0;
         unlocked += on ? 1 : 0;
         score += on ? e.gamerscore : 0;
         total += e.gamerscore;
@@ -1054,6 +1092,7 @@ namespace sst::ach
       const uint32_t text = kTextSummary + (g.summary_alt ? 1 : 0);
       PutText(base, text, sst::text::Fit(base, fmt::format("{} / {} {}", unlocked, g.list.size(), sst::text::Tr("UNLOCKED")), "sstmainmenu"), 64);
       SetText(ctx, base, kSummary, text);
+      ApplyWindow(ctx, base, 0);
       const int steps = std::max(0, int(g.list.size()) - kVisibleRows);
       SetResult(base, out, uint32_t(steps), 2);
       REXLOG_INFO("[sst-ach] ACHIEVEMENTS page: {} / {} unlocked", unlocked, g.list.size());
@@ -1065,8 +1104,18 @@ namespace sst::ach
     case 1:
       Show(ctx, base, kList, false);
       Show(ctx, base, kSummary, false);
+      g.row_shown.assign(g.list.size(), 0);
       SetResult(base, out, 0, 2);
       break;
+
+    case 2:
+    {
+      // scroll(position): the rows around it shown, the rest hidden
+      const sst::menu::NativeCall call(ctx, base);
+      ApplyWindow(ctx, base, std::max(0, call.Int(0)));
+      SetResult(base, out, 0, 2);
+      break;
+    }
 
     default:
       SetResult(base, out, 0, 0);
