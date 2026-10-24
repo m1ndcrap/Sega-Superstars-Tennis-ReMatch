@@ -86,10 +86,6 @@ Requirements: Clang 18+, CMake 3.25+, Ninja, the Windows SDK (for `dxcompiler.dl
 
 3. Copy (or symlink) `assets/` next to `out/build/win-amd64-release/sst_rematch.exe` and run it.
 
-### Current Pre-Release v0.5 Zip Contents
-
-`sst_rematch.exe`, `rexruntime.dll`, `rexgpu-sst.dll`, `dxcompiler.dll`, `dxil.dll`, plus an empty `assets/` folder.
-
 ## Layout
 
 | Path                           | Purpose                                                                   |
