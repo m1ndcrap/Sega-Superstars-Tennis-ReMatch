@@ -568,9 +568,9 @@ namespace sst::input
 
     if (!tool_mode)
     {
-#if defined(_WIN32)
       const std::string backend = rex::cvar::Query<std::string>("input_backend");
 
+#if defined(_WIN32)
       if (backend == "xinput")
         Add(*system, std::make_unique<rex::input::xinput::XinputInputDriver>(nullptr, 0));
 #endif

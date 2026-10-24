@@ -2,7 +2,7 @@ SST Rematch - Linux build
 
 Needs: 64-bit Linux with glibc 2.38 or newer (Ubuntu 24.04+, Debian 13, Fedora 39+), a Vulkan 1.3 driver, and your own copy of the game files.
 
-1. Copy the game's files into a folder named "assets" next to sst_rematch (the same assets folder the Windows build uses)
+1. Copy the game's files into a folder named "assets" next to sst_rematch
 2. Start it with ./sst_rematch.sh (or ./sst_rematch from this folder)
 3. Optional: ./install-desktop-entry.sh adds it to your application menu
 
