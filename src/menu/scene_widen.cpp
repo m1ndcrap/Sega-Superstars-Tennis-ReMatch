@@ -192,6 +192,12 @@ namespace sst::menu::scenes
       return out;
     }
 
+    // Scenes whose solid rectangles never reach a side: a centered panel drawn over the match, with cursors and highlights laid out at the layout's origin (x, 0) that the script places at run time.
+    bool NoEdgeBars(const std::string &name)
+    {
+      return name == "nameentry.dat";
+    }
+
     // Solid bars / gradients: wider by `shift` on each side they touch
     int WidenBars(Scene &s, float shift)
     {
@@ -581,7 +587,8 @@ namespace sst::menu::scenes
     if (IsStarFieldScene(name))
       stats.stars = MoreStars(s, shift, log);
 
-    stats.bars = WidenBars(s, shift);
+    if (!NoEdgeBars(name))
+      stats.bars = WidenBars(s, shift);
 
     if (name != "starbg.dat")
       MirrorStrips(s, shift, stats, cache, log, IsCourtBackgroundScene(name));

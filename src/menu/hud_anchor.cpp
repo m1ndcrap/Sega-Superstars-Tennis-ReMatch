@@ -602,12 +602,12 @@ namespace sst::menu::hud
             {
               auto off_right = [&](float abs_x)
               {
-                return abs_x + e.lo >= 0.98f;
+                return abs_x + e.lo >= 0.98f && abs_x + 0.5f * (e.lo + e.hi) > 1.0f;
               };
 
               auto off_left = [&](float abs_x)
               {
-                return abs_x + e.hi <= 0.02f;
+                return abs_x + e.hi <= 0.02f && abs_x + 0.5f * (e.lo + e.hi) < 0.0f;
               };
 
               bool on_at_rest = false;
@@ -639,7 +639,11 @@ namespace sst::menu::hud
                   if (parent.Valid())
                     always &= dir > 0 ? parent.lo >= 0.98f : parent.hi <= 0.02f;
 
-                  if (on_at_rest || always)
+                  // An object waits off-screen moves only if it would show in the extra width for ultrawide displays
+                  const float lo_at = rest_x + x + e.lo, hi_at = rest_x + x + e.hi;
+                  const bool shows = dir > 0 ? lo_at < 1.0f + shift - 0.01f : hi_at > -shift + 0.01f;
+
+                  if (on_at_rest || (always && shows))
                   {
                     WrF(tr.keys + k * tr.KeySize() + 0xC, x + float(dir) * shift);
                     ++parked;
